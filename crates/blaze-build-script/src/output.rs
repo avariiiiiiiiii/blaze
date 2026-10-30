@@ -136,29 +136,35 @@ const DOCS: &str = "See https://doc.rust-lang.org/cargo/reference/build-scripts.
                     for more information about build script outputs.";
 
 /// The keys of the old syntax that are not metadata: no new one can be added, since
-/// `cargo:KEY=VALUE` is metadata for any other.
-const RESERVED_PREFIXES: &[&str] = &[
-    "rustc-flags=",
-    "rustc-link-lib=",
-    "rustc-link-search=",
-    "rustc-link-arg-cdylib=",
-    "rustc-cdylib-link-arg=",
-    "rustc-link-arg-bins=",
-    "rustc-link-arg-bin=",
-    "rustc-link-arg-tests=",
-    "rustc-link-arg-benches=",
-    "rustc-link-arg-examples=",
-    "rustc-link-arg=",
-    "rustc-cfg=",
-    "rustc-check-cfg=",
-    "rustc-env=",
-    "warning=",
-    "rerun-if-changed=",
-    "rerun-if-env-changed=",
-];
+/// `cargo:KEY=VALUE` is metadata for any other. A `match`, so the check is one comparison of
+/// the key's length and bytes, not a scan of every prefix.
+fn reserved(key: &str) -> bool {
+    matches!(
+        key,
+        "rustc-flags"
+            | "rustc-link-lib"
+            | "rustc-link-search"
+            | "rustc-link-arg-cdylib"
+            | "rustc-cdylib-link-arg"
+            | "rustc-link-arg-bins"
+            | "rustc-link-arg-bin"
+            | "rustc-link-arg-tests"
+            | "rustc-link-arg-benches"
+            | "rustc-link-arg-examples"
+            | "rustc-link-arg"
+            | "rustc-cfg"
+            | "rustc-check-cfg"
+            | "rustc-env"
+            | "warning"
+            | "rerun-if-changed"
+            | "rerun-if-env-changed"
+    )
+}
 
+/// Whether `flag` starts with a reserved key and its `=`: cargo's prefix check, the same as
+/// the first `=` ending a reserved key, since no key has an `=` in it.
 fn has_reserved_prefix(flag: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|it| flag.starts_with(it))
+    flag.split_once('=').is_some_and(|(key, _)| reserved(key))
 }
 
 /// `rust-version` as cargo reads it: one to three numbers.
@@ -172,17 +178,22 @@ fn rust_version(text: &str) -> Option<(u64, Option<u64>, Option<u64>)> {
     parts.next().is_none().then_some(version)
 }
 
-/// `cargo::` is from 1.77: a package whose `rust-version` is older cannot use it.
-fn check_new_syntax(cx: &Context<'_>, descr: &str, flag: &str) -> Result<(), Error> {
-    let Some(msrv) = cx.package.rust_version.as_deref() else { return Ok(()) };
-    let Some((major, minor, patch)) = rust_version(msrv) else { return Ok(()) };
+/// The package's `rust-version` as cargo shows it, when it is older than 1.77, which brought
+/// `cargo::`: then it cannot use that syntax.
+fn older_than_new_syntax(package: &Package) -> Option<String> {
+    let (major, minor, patch) = rust_version(package.rust_version.as_deref()?)?;
     let compatible = major == 1 && (minor.unwrap_or(0), patch.unwrap_or(0)) >= (77, 0);
     if compatible {
-        return Ok(());
+        return None;
     }
     let shown =
         [Some(major), minor, patch].iter().flatten().map(u64::to_string).collect::<Vec<_>>();
-    let msrv = shown.join(".");
+    Some(shown.join("."))
+}
+
+/// Why a `cargo::` line of a package whose `rust-version` is `msrv`
+/// ([`older_than_new_syntax`]) is refused.
+fn new_syntax_refused(descr: Descr<'_>, msrv: &str, flag: &str) -> Error {
     let suggestion = if has_reserved_prefix(flag) {
         format!("Switch to the old `cargo:{flag}` syntax (note the single colon).\n")
     } else if let Some(old) = flag.strip_prefix("metadata=") {
@@ -192,16 +203,16 @@ fn check_new_syntax(cx: &Context<'_>, descr: &str, flag: &str) -> Result<(), Err
     } else {
         String::new()
     };
-    Err(Error(format!(
+    Error(format!(
         "the `cargo::` syntax for build script output instructions was added in \
          Rust 1.77.0, but the minimum supported Rust version of `{descr}` is {msrv}.\n\
          {suggestion}{DOCS}"
-    )))
+    ))
 }
 
 /// `KEY=VALUE`, the value's end trimmed.
 fn key_value<'a>(
-    whence: &str,
+    package: &Package,
     line: &str,
     data: &'a str,
     syntax: &str,
@@ -209,46 +220,105 @@ fn key_value<'a>(
     match data.split_once('=') {
         Some((key, value)) => Ok((key, value.trim_end())),
         None => Err(Error(format!(
-            "invalid output in {whence}: `{line}`\n\
+            "invalid output in {}: `{line}`\n\
              Expected a line with `{syntax}KEY=VALUE` with an `=` character, \
              but none was found.\n\
-             {DOCS}"
+             {DOCS}",
+            Whence(package)
         ))),
     }
 }
 
-/// Reads what a script printed.
+/// The package as a message names it, made only when a message is.
+struct Descr<'a>(&'a Package);
+
+impl std::fmt::Display for Descr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.descr())
+    }
+}
+
+/// Where a message says a line came from, made only when a message is.
+struct Whence<'a>(&'a Package);
+
+impl std::fmt::Display for Whence<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "build script of `{}`", self.0.descr())
+    }
+}
+
+/// The bytes `str::trim` takes from a line's start that are ASCII: the ASCII characters of
+/// Unicode's `White_Space`.
+fn is_ascii_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// The line, trimmed, when it can be a directive: what `from_utf8` and `trim` make of it,
+/// for a line that then starts with `cargo:`. Every other line is the script's own, and most
+/// are known to be from their first bytes alone, without reading the rest as UTF-8: a line
+/// whose first byte past ASCII space is ASCII and does not start `cargo:` is trimmed to a
+/// start that does not either. A first byte past ASCII (a space of Unicode's, or none) takes
+/// the whole check.
+fn directive(line: &[u8]) -> Option<&str> {
+    let start = line.iter().position(|it| !is_ascii_space(*it))?;
+    if line[start].is_ascii() && !line[start..].starts_with(b"cargo:") {
+        return None;
+    }
+    let line = std::str::from_utf8(line).ok()?.trim();
+    line.starts_with("cargo:").then_some(line)
+}
+
+/// Reads what a script printed: one pass over the bytes for its line breaks (memchr's SIMD
+/// search), a directive's key matched by a `match`, and nothing allocated but what the
+/// [`Output`] keeps (and the text of a message).
 pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
     let package = cx.package;
-    let descr = package.descr();
-    let whence = format!("build script of `{descr}`");
     let mut out = Output::default();
     let (Some(generated), Some(out_dir_text)) =
         (cx.out_dir_when_generated.to_str(), cx.out_dir.to_str())
     else {
         return Err(Error("an `OUT_DIR` that is not UTF-8".to_owned()));
     };
-    for line in input.split(|b| *b == b'\n') {
-        let Ok(line) = std::str::from_utf8(line) else { continue };
-        let line = line.trim();
+    // A path the output names in the `OUT_DIR` it ran with is moved to the one it has now;
+    // when they are the same nothing moves, and nothing is copied for it.
+    let moved = !generated.is_empty() && generated != out_dir_text;
+    // Whether `cargo::` is refused, worked out at the first such line.
+    let mut new_syntax_msrv: Option<Option<String>> = None;
+    let mut rest = Some(input);
+    while let Some(bytes) = rest {
+        let line = match memchr::memchr(b'\n', bytes) {
+            Some(at) => {
+                rest = Some(&bytes[at + 1..]);
+                &bytes[..at]
+            }
+            None => {
+                rest = None;
+                bytes
+            }
+        };
+        let Some(line) = directive(line) else { continue };
         let old_syntax;
         let (key, value) = if let Some(data) = line.strip_prefix("cargo::") {
-            check_new_syntax(cx, &descr, data)?;
+            let refused = new_syntax_msrv.get_or_insert_with(|| older_than_new_syntax(package));
+            if let Some(msrv) = refused {
+                return Err(new_syntax_refused(Descr(package), msrv, data));
+            }
             old_syntax = false;
-            key_value(&whence, line, data, "cargo::")?
+            key_value(package, line, data, "cargo::")?
         } else if let Some(data) = line.strip_prefix("cargo:") {
             old_syntax = true;
-            match has_reserved_prefix(data) {
-                true => key_value(&whence, line, data, "cargo:")?,
-                false => ("metadata", data),
+            match data.split_once('=') {
+                Some((key, value)) if reserved(key) => (key, value.trim_end()),
+                _ => ("metadata", data),
             }
         } else {
             continue;
         };
-        let value = match generated.is_empty() {
-            true => value.to_owned(),
-            false => value.replace(generated, out_dir_text),
+        let value = match moved && value.contains(generated) {
+            true => value.replace(generated, out_dir_text),
+            false => value.to_owned(),
         };
+        let (descr, whence) = (Descr(package), Whence(package));
         let syntax = if old_syntax { "cargo:" } else { "cargo::" };
         let missing_target = |kind: &str| {
             Error(format!(
@@ -364,7 +434,7 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
             "rerun-if-env-changed" => out.rerun_if_env_changed.push(value),
             "metadata" => {
                 let syntax = if old_syntax { "cargo:" } else { "cargo::metadata=" };
-                let (key, value) = key_value(&whence, line, &value, syntax)?;
+                let (key, value) = key_value(package, line, &value, syntax)?;
                 out.metadata.push((key.to_owned(), value.to_owned()));
             }
             _ => {
@@ -380,7 +450,10 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
 }
 
 /// `rustc-flags`: only `-l` and `-L`, with or without a space before the value.
-pub fn parse_rustc_flags(value: &str, whence: &str) -> Result<(Vec<PathBuf>, Vec<String>), Error> {
+pub fn parse_rustc_flags(
+    value: &str,
+    whence: impl std::fmt::Display,
+) -> Result<(Vec<PathBuf>, Vec<String>), Error> {
     let mut flags = value.trim().split(char::is_whitespace).filter(|it| !it.trim().is_empty());
     let (mut paths, mut links) = (Vec::new(), Vec::new());
     while let Some(flag) = flags.next() {
@@ -405,7 +478,10 @@ pub fn parse_rustc_flags(value: &str, whence: &str) -> Result<(Vec<PathBuf>, Vec
 }
 
 /// `rustc-env=NAME=VALUE`.
-pub fn parse_rustc_env(value: &str, whence: &str) -> Result<(String, String), Error> {
+pub fn parse_rustc_env(
+    value: &str,
+    whence: impl std::fmt::Display,
+) -> Result<(String, String), Error> {
     match value.split_once('=') {
         Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
         None => Err(Error(format!("Variable rustc-env has no value in {whence}: {value}"))),

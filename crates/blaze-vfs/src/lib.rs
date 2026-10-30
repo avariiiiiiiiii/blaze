@@ -18,6 +18,7 @@
 mod journal;
 mod reader;
 mod rebase;
+mod store;
 mod tree;
 pub mod watch;
 
@@ -30,11 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     journal::{Journal, Loaded},
-    reader::Publisher,
     tree::{NodeId, Tree},
 };
 pub use crate::{
-    reader::Reader,
+    reader::{Pinned, Reader},
     watch::{Watched, Watcher},
 };
 
@@ -204,38 +204,22 @@ pub struct Vfs {
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,
-    /// Every node of `tree`, published after each change, for readers on other threads.
-    published: Publisher,
 }
 
 impl Vfs {
     /// A VFS recovered from its journal's bytes (empty for a new one), and what it found.
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
-        let Loaded { mut tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
-        let mut published = Publisher::new();
-        tree.publish(&mut published);
-        (Vfs { tree, heads, views: Vec::new(), journal, published }, found)
+        let Loaded { tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
+        (Vfs { tree, heads, views: Vec::new(), journal }, found)
     }
 
-    /// A handle that reads any root this tree has, from any thread, without the `Vfs`: what
-    /// the query database's `blaze_query::Tree` is over. A root is in it before any call that
-    /// gives its ID returns.
+    /// A handle that reads any root this tree has, from any thread, without the `Vfs` and
+    /// without a lock: what the query database's `blaze_query::Tree` is over. A root is in it
+    /// before any call that gives its ID returns. Memory a collection frees is reclaimed by
+    /// the `Vfs` itself once no reader can be in it; no caller has to say when.
     pub fn reader(&self) -> Reader {
-        self.published.reader()
-    }
-
-    /// Frees what collections and growth took out of the readers' table.
-    ///
-    /// # Safety
-    ///
-    /// Every call on a [`Reader`] of this `Vfs` begun before the last [`Vfs::collect`] (or
-    /// change) has returned, and nothing such a call lent of a root the tree no longer has is
-    /// still used: what the daemon knows once every worker has passed a task boundary. What
-    /// was read of a root a head, an open view or a collection's `keep` held is never freed.
-    pub unsafe fn reclaim(&mut self) {
-        // SAFETY: the caller's contract is the publisher's.
-        unsafe { self.published.reclaim() }
+        self.tree.reader()
     }
 
     /// The root `head` is at, if it was ever written.
@@ -285,7 +269,7 @@ impl Vfs {
             (Cow::Owned(rebase::rebase(&self.tree, base, at, ops)?), true)
         };
         let root = self.tree.apply(at, &ops)?;
-        self.tree.publish(&mut self.published);
+        self.tree.reclaim();
         self.heads.insert(head.into(), root);
         let ticket = self.journal.record_head(&self.tree, head, root);
         Ok(Commit { root: self.tree.id(root), rebased, ticket })
@@ -308,7 +292,7 @@ impl Vfs {
     pub fn apply(&mut self, base: ContentId, ops: &[Op]) -> Result<ContentId, OpError> {
         let base = self.root(base).ok_or(OpError::UnknownRoot(base))?;
         let root = self.tree.apply(base, ops)?;
-        self.tree.publish(&mut self.published);
+        self.tree.reclaim();
         Ok(self.tree.id(root))
     }
 
@@ -364,11 +348,8 @@ impl Vfs {
         let node = self.tree.lookup(self.open_root(view), path)?;
         let entries = self.tree.entries(node)?;
         Some(
-            entries
-                .iter()
-                .map(|&(name, child, _)| {
-                    (self.tree.name_str(name).to_owned(), self.tree.is_dir(child))
-                })
+            (0..entries.len())
+                .map(|at| (self.tree.name_str(entries.get(at).0).to_owned(), entries.is_dir(at)))
                 .collect(),
         )
     }
@@ -384,6 +365,7 @@ impl Vfs {
 
     /// Asks for what commits made since the last flush need to be durable.
     pub fn flush(&mut self, effects: &mut Vec<Effect>) {
+        self.tree.reclaim();
         self.journal.flush(&self.tree, &self.heads, effects);
     }
 
@@ -397,8 +379,9 @@ impl Vfs {
         self.journal.complete(&self.tree, &self.heads, completion, effects)
     }
 
-    /// Drops every node no head, open view or root in `keep` reaches. The next flush also
-    /// rewrites the journal as just what the heads reach.
+    /// Drops every node no head, open view or root in `keep` reaches. Readers move to the
+    /// nodes kept at once; the old ones are freed once no reader pinned before is still
+    /// reading them. The next flush also rewrites the journal as just what the heads reach.
     pub fn collect(&mut self, keep: &[ContentId]) {
         let names: Vec<Box<str>> = self.heads.keys().cloned().collect();
         let views: Vec<usize> = (0..self.views.len()).filter(|&at| self.views[at].is_some()).collect();
@@ -414,9 +397,6 @@ impl Vfs {
             self.views[at] = live.next();
         }
         self.journal.collected(&renumbered, self.tree.len());
-        let tree = &self.tree;
-        self.published.collect(|id| tree.node(id).is_some());
-        self.tree.publish(&mut self.published);
     }
 }
 

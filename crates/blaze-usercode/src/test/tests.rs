@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::{
     FORK_SERVER, Failure, Finished, Outcome, Reported, Trace, report,
-    wire::{End, Frame, Frames, LONGEST},
+    wire::{End, Frame, Frames, LONGEST, encode_ended},
 };
 
 fn frames() -> Vec<Frame> {
@@ -45,6 +45,75 @@ fn frames_come_whole_whatever_the_pieces() {
         }
         assert_eq!(got, frames(), "pieces of {piece}");
         assert_eq!(reader.waiting(), 0);
+    }
+}
+
+#[test]
+fn an_end_encoded_from_borrowed_parts_is_the_frame_s_bytes() {
+    for frame in frames() {
+        let Frame::Ended { id, end, output } = &frame else { continue };
+        let mut borrowed = b"before".to_vec();
+        encode_ended(&mut borrowed, *id, end, output);
+        let mut owned = b"before".to_vec();
+        frame.encode(&mut owned);
+        assert_eq!(borrowed, owned, "{frame:?}");
+    }
+}
+
+/// [`Frames`], which skips over what it read and takes owned pieces whole, against the plain
+/// reading of a stream (all of it, then frame after frame), over seeded piece sizes; and
+/// what it says it still needs is exactly what makes the next frame whole.
+#[test]
+fn frames_read_in_place_as_a_whole_stream_reads() {
+    let mut stream = Vec::new();
+    for _ in 0..5 {
+        for frame in frames() {
+            frame.encode(&mut stream);
+        }
+    }
+    let mut expected = Vec::new();
+    let mut at = 0;
+    while at < stream.len() {
+        let len = u32::from_le_bytes(stream[at..at + 4].try_into().unwrap()) as usize;
+        expected.push(Frame::decode(&stream[at + 4..at + 4 + len]).unwrap());
+        at += 4 + len;
+    }
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..200 {
+        let mut reader = Frames::new();
+        let mut got = Vec::new();
+        let mut at = 0;
+        while at < stream.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let needed = reader.needed();
+            let had_length = reader.waiting() >= 4;
+            assert!(needed > 0);
+            let take = match state % 3 {
+                0 => needed,
+                _ => 1 + (state >> 8) as usize % 40,
+            }
+            .min(stream.len() - at);
+            let piece = &stream[at..at + take];
+            match state % 2 {
+                0 => reader.push(piece),
+                _ => reader.push_owned(piece.to_vec()),
+            }
+            at += take;
+            let mut popped = 0;
+            while let Some(frame) = reader.pop().unwrap() {
+                got.push(frame);
+                popped += 1;
+            }
+            // What it needed, once it had the length, made the frame whole.
+            if had_length && take == needed {
+                assert!(popped > 0);
+            }
+        }
+        assert_eq!(got, expected);
+        assert_eq!(reader.waiting(), 0);
+        assert_eq!(reader.needed(), 4);
     }
 }
 

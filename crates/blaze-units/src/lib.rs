@@ -16,6 +16,8 @@
 //! `-Zdual-proc-macros`, multiple build scripts, per-package targets) is not ported: a
 //! workspace that needs one is an error naming it.
 
+#![forbid(unsafe_code)]
+
 mod graph;
 mod order;
 #[cfg(feature = "query")]

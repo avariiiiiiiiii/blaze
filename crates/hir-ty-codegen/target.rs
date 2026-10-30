@@ -322,8 +322,11 @@ impl Target {
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;
-        // Cranelift checks the IR of every function it is given unless told not to.
-        let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+        // Cranelift checks the IR of every function it is given unless told not to: a walk of
+        // all of it, with its dominator tree, before any code is made. Tests check it, and
+        // `BLAZE_VERIFY=1` asks for it elsewhere; the code made is the same either way.
+        let verify = cfg!(test) || std::env::var_os("BLAZE_VERIFY").is_some_and(|it| it == "1");
+        let verify = if verify { "true" } else { "false" };
         flags.set("enable_verifier", verify).map_err(|e| e.to_string())?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
         flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;

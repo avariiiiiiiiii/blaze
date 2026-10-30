@@ -2,17 +2,17 @@
 //! C dependencies) and archives of them, into the contract's [`Object`] and [`Archive`].
 //!
 //! An object's function becomes a [`Class::Text`] piece in the form blaze's codegen gives its
-//! own ([`Code`]: the header, then the body), so the writer reads every code piece one way.
+//! own ([`blaze_codegen::wasm::Code`]: the header, then the body), so the writer reads every code piece one way.
 //! Its data segments become pieces by their names (`.rodata.*`, `.data.*`, `.bss.*`, or a
 //! named section for `__start_`/`__stop_`), its custom sections custom-section pieces, its
 //! init functions [`Class::InitArray`] pieces of their priority holding the function's slot.
 //! The format: <https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md>.
 
-use std::collections::BTreeMap;
 use std::ops::Range;
 
-use blaze_codegen::wasm::{Code, Import, Signature, ValType};
+use blaze_codegen::wasm::{Import, Signature};
 
+use super::code::{self, Parts, Sig};
 use super::reader::{self, Reader};
 use super::reloc::{self, Kind};
 use crate::model::{
@@ -92,13 +92,14 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
         return Err("a thin archive, whose members are other files".to_owned());
     }
     let mut members = Vec::new();
-    let mut by_offset = BTreeMap::new();
+    // Where each member's bytes start, in file order and so sorted: found by binary search.
+    let mut by_offset: Vec<u64> = Vec::new();
     for member in file.members() {
         let member = member.map_err(|e| format!("an archive member: {e}"))?;
         let (offset, size) = member.file_range();
         let start = usize::try_from(offset).map_err(|_| "an archive past the address space")?;
         let end = usize::try_from(offset + size).map_err(|_| "an archive past the address space")?;
-        by_offset.insert(offset, members.len() as u32);
+        by_offset.push(offset);
         let name = String::from_utf8_lossy(member.name()).into_owned();
         members.push(Member { name, bytes: start..end });
     }
@@ -113,9 +114,9 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
                     format!("the archive's index names `{name}` in no member: {e}")
                 })?;
                 let member = by_offset
-                    .get(&member.file_range().0)
-                    .ok_or_else(|| format!("the archive's index names `{name}` in no member"))?;
-                index.push((name.to_owned(), *member));
+                    .binary_search(&member.file_range().0)
+                    .map_err(|_| format!("the archive's index names `{name}` in no member"))?;
+                index.push((name.to_owned(), member as u32));
             }
         }
         None if members.is_empty() || whole => {}
@@ -144,14 +145,15 @@ struct Custom<'a> {
 /// The sections of an object, read.
 struct Parsed<'a> {
     sections: Vec<reader::Section<'a>>,
-    types: Vec<Signature>,
+    /// Each type as the type section encodes it, checked: borrowed, never decoded.
+    types: Vec<Sig<'a>>,
     imported: Vec<Imported<'a>>,
     imported_globals: Vec<&'a str>,
     imported_tables: Vec<&'a str>,
     /// The type of each function with a body.
     functions: Vec<u32>,
-    /// Export names by function index.
-    exports: BTreeMap<u32, &'a str>,
+    /// Each function export: the function's index and the name.
+    exports: Vec<(u32, &'a str)>,
     code: Option<usize>,
     /// Where each body is in the file, after its size.
     bodies: Vec<Range<usize>>,
@@ -172,7 +174,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
         imported_globals: Vec::new(),
         imported_tables: Vec::new(),
         functions: Vec::new(),
-        exports: BTreeMap::new(),
+        exports: Vec::new(),
         code: None,
         bodies: Vec::new(),
         data: None,
@@ -200,12 +202,16 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     }
                 }
                 id::TYPE => {
-                    for _ in 0..r.count()? {
-                        parsed.types.push(signature(&mut r)?);
+                    let count = r.count()?;
+                    parsed.types.reserve_exact(count);
+                    for _ in 0..count {
+                        parsed.types.push(signature(&mut r, section.contents)?);
                     }
                 }
                 id::IMPORT => {
-                    for _ in 0..r.count()? {
+                    let count = r.count()?;
+                    parsed.imported.reserve(count);
+                    for _ in 0..count {
                         let module = r.name()?;
                         let field = r.name()?;
                         match r.u8()? {
@@ -232,16 +238,20 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     }
                 }
                 id::FUNCTION => {
-                    for _ in 0..r.count()? {
+                    let count = r.count()?;
+                    parsed.functions.reserve_exact(count);
+                    for _ in 0..count {
                         parsed.functions.push(r.u32()?);
                     }
                 }
                 id::EXPORT => {
-                    for _ in 0..r.count()? {
+                    let count = r.count()?;
+                    parsed.exports.reserve_exact(count);
+                    for _ in 0..count {
                         let name = r.name()?;
                         match (r.u8()?, r.u32()?) {
                             (0, function) => {
-                                parsed.exports.insert(function, name);
+                                parsed.exports.push((function, name));
                             }
                             (kind, _) => {
                                 return Err(format!(
@@ -254,7 +264,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 }
                 id::CODE => {
                     parsed.code = Some(index);
-                    for _ in 0..r.count()? {
+                    let count = r.count()?;
+                    parsed.bodies.reserve_exact(count);
+                    for _ in 0..count {
                         let len = r.u32()? as usize;
                         let start = at + r.at();
                         r.bytes(len)?;
@@ -263,7 +275,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 }
                 id::DATA => {
                     parsed.data = Some(index);
-                    for _ in 0..r.count()? {
+                    let count = r.count()?;
+                    parsed.segments.reserve_exact(count);
+                    for _ in 0..count {
                         match r.u32()? {
                             0 => {}
                             1 => {
@@ -321,22 +335,13 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
     Ok(parsed)
 }
 
-fn signature(r: &mut Reader<'_>) -> Result<Signature, String> {
-    match r.u8()? {
-        0x60 => {}
-        form => {
-            return Err(format!("a type of form {form:#04x} (GC types are not linked)"));
-        }
+/// One function type, checked, as the type section has it.
+fn signature<'a>(r: &mut Reader<'a>, contents: &'a [u8]) -> Result<Sig<'a>, String> {
+    match contents.get(r.at()) {
+        Some(0x60) => code::signature(r, contents),
+        Some(form) => Err(format!("a type of form {form:#04x} (GC types are not linked)")),
+        None => Err("a truncated type".to_owned()),
     }
-    let mut lists = [Vec::new(), Vec::new()];
-    for list in &mut lists {
-        for _ in 0..r.count()? {
-            let byte = r.u8()?;
-            list.push(ValType::from_byte(byte).ok_or_else(|| format!("the value type {byte:#04x}"))?);
-        }
-    }
-    let [params, results] = lists;
-    Ok(Signature { params, results })
 }
 
 fn limits(r: &mut Reader<'_>) -> Result<(), String> {
@@ -455,6 +460,7 @@ fn symbol<'a>(r: &mut Reader<'a>) -> Result<WasmSymbol<'a>, String> {
     Ok(symbol)
 }
 
+/// 24 bytes.
 struct Reloc {
     r_type: u32,
     /// From the start of the section's contents (after its id and size).
@@ -463,11 +469,14 @@ struct Reloc {
     addend: i64,
 }
 
+const _: () = assert!(size_of::<Reloc>() <= 24);
+
 fn relocs(contents: &[u8]) -> Result<(usize, Vec<Reloc>), String> {
     let mut r = Reader::new(contents);
     let section = r.u32()? as usize;
-    let mut relocs = Vec::new();
-    for _ in 0..r.count()? {
+    let count = r.count()?;
+    let mut relocs = Vec::with_capacity(count);
+    for _ in 0..count {
         let r_type = r.u32()?;
         let offset = r.u32()? as usize;
         let index = r.u32()?;
@@ -572,61 +581,79 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             }
         }
     }
-    // Each with its offset from the start of the body.
-    let mut code_relocs: Vec<Vec<(usize, &Reloc)>> = vec![Vec::new(); bodies];
+    // The code's relocations as one list sorted by body (CSR, 16 bytes each): the body, the
+    // offset in it, the relocation. LLVM lists them in offset order, which the adaptive sort
+    // takes in one pass.
+    let mut code_relocs: Vec<(u32, u32, &Reloc)> = Vec::new();
     if let Some(code) = parsed.code {
+        code_relocs.reserve_exact(by_section[code].len());
         for r in &by_section[code] {
             let at = start_of(code) + r.offset;
             let (body, offset) = within(&parsed.bodies, at, width(r.r_type)).ok_or_else(|| {
                 format!("{} at {:#x} of the code section, in no function body", named(r), r.offset)
             })?;
-            code_relocs[body].push((offset, r));
+            code_relocs.push((body as u32, offset as u32, r));
+        }
+        code_relocs.sort_by_key(|it| (it.0, it.1));
+    }
+    // The last export of each body wins, as the export section's order says.
+    let mut export_names: Vec<Option<&str>> = vec![None; bodies];
+    for &(function, name) in &parsed.exports {
+        if let Some(slot) = function.checked_sub(imported).and_then(|it| export_names.get_mut(it as usize)) {
+            *slot = Some(name);
         }
     }
-    let mut function_sections = Vec::new();
+    let mut function_sections = Vec::with_capacity(bodies);
+    // Reused by every function: the types its `call_indirect`s name and where.
+    let mut types: Vec<Sig<'_>> = Vec::new();
+    let mut type_fixups: Vec<(u32, u32)> = Vec::new();
+    let mut next = 0;
     for (body, range) in parsed.bodies.iter().enumerate() {
         let index = imported + body as u32;
         let ty = parsed.functions[body];
-        let ty = parsed.types.get(ty as usize).ok_or_else(|| format!("no type {ty}"))?.clone();
-        let mut code = Code {
-            ty,
-            export: parsed.exports.get(&index).copied().or(exported[body]).map(str::to_owned),
-            ..Code::default()
-        };
-        let mut fixups = Vec::new();
-        for &(at, r) in &code_relocs[body] {
+        let ty = *parsed.types.get(ty as usize).ok_or_else(|| format!("no type {ty}"))?;
+        let end = next + code_relocs[next..].partition_point(|it| it.0 as usize == body);
+        let relocs = &code_relocs[next..end];
+        next = end;
+        types.clear();
+        type_fixups.clear();
+        let mut fixups = Vec::with_capacity(relocs.len());
+        for &(_, at, r) in relocs {
             match reloc::kind(r.r_type)? {
                 Kind::Applied => fixups.push(NativeFixup {
-                    at: at as u64,
+                    at: at.into(),
                     apply: Apply::Native(r.r_type),
                     symbol: r.index,
                     addend: r.addend,
                     minus: None,
                 }),
                 Kind::Type => {
-                    let ty = parsed
+                    let ty = *parsed
                         .types
                         .get(r.index as usize)
                         .ok_or_else(|| format!("{}: no type {}", named(r), r.index))?;
-                    let which = match code.types.iter().position(|it| it == ty) {
+                    // A function names a few types: a scan beats a map.
+                    let which = match types.iter().position(|&it| it == ty) {
                         Some(which) => which,
                         None => {
-                            code.types.push(ty.clone());
-                            code.types.len() - 1
+                            types.push(ty);
+                            types.len() - 1
                         }
                     };
-                    code.type_fixups.push((at as u32, which as u32));
+                    type_fixups.push((at, which as u32));
                 }
                 Kind::Debug => {
                     return Err(format!("{} in the code of function {index}", named(r)));
                 }
             }
         }
-        let (data, start) = code.encode(&bytes[range.clone()]);
+        let export = export_names[body].or(exported[body]);
+        let parts = Parts { ty, types: &types, type_fixups: &type_fixups, export };
+        let (data, start) = parts.encode(&bytes[range.clone()]);
         for fixup in &mut fixups {
             fixup.at += u64::from(start);
         }
-        if code.export.is_some() {
+        if export.is_some() {
             retain.push(sections.len());
         }
         let mut name = String::with_capacity(6 + function_names[body].map_or(10, str::len));
@@ -700,7 +727,8 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     }
 
     // Custom sections.
-    let mut custom_sections = BTreeMap::new();
+    // The contract section of each custom section, by the custom section's index.
+    let mut custom_sections: Vec<Option<u32>> = vec![None; parsed.sections.len()];
     for custom in &parsed.customs {
         let dropped = custom.name.starts_with(".debug")
             || matches!(custom.name, "name" | "external_debug_info" | "sourceMappingURL");
@@ -711,7 +739,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 custom.name
             ));
         }
-        let mut fixups = Vec::new();
+        let mut fixups = Vec::with_capacity(by_section[custom.index].len());
         for r in &by_section[custom.index] {
             let at = start_of(custom.index) + r.offset;
             let offset = at
@@ -731,7 +759,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 }
             }
         }
-        custom_sections.insert(custom.index, sections.len() as u32);
+        custom_sections[custom.index] = Some(sections.len() as u32);
         if !dropped {
             retain.push(sections.len());
         }
@@ -786,7 +814,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     import: Some(Import {
                         module: import.module.to_owned(),
                         field: import.field.to_owned(),
-                        ty: ty.clone(),
+                        ty: Signature::decode(ty, &mut 0).map_err(|e| format!("symbol {at}: {e}"))?,
                     }),
                 }
             }
@@ -860,8 +888,10 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 ));
             }
             SYM_SECTION => {
-                let section = *custom_sections
-                    .get(&(s.index as usize))
+                let section = custom_sections
+                    .get(s.index as usize)
+                    .copied()
+                    .flatten()
                     .ok_or_else(|| format!("symbol {at} of section {}, no custom one", s.index))?;
                 Symbol {
                     name: sections[section as usize].name.clone(),
@@ -915,13 +945,15 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 COMDAT_FUNCTION => {
                     function_section(index).map_err(|e| format!("the COMDAT `{name}`: {e}"))?
                 }
-                COMDAT_SECTION => *custom_sections
-                    .get(&(index as usize))
+                COMDAT_SECTION => custom_sections
+                    .get(index as usize)
+                    .copied()
+                    .flatten()
                     .ok_or_else(|| format!("the COMDAT `{name}` has no custom section {index}"))?,
                 other => return Err(format!("the COMDAT `{name}` holds a thing of kind {other}")),
             });
         }
-        groups.push(Group { name: (*name).to_owned(), sections: members });
+        groups.push(Group { name: (*name).to_owned(), sections: members, largest: false });
     }
 
     for section in retain {
@@ -932,11 +964,13 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             return Err(format!("a relocation against symbol {}, which there is not", fixup.symbol));
         }
     }
-    Ok(Object { sections, symbols, groups, libraries: Vec::new() })
+    Ok(Object { sections, symbols, groups, libraries: Vec::new(), directives: Vec::new() })
 }
 
 #[cfg(test)]
 mod tests {
+    use blaze_codegen::wasm::{Code, ValType};
+
     use super::*;
     use crate::wasm::leb::{custom, name, section, sleb, uleb};
 
@@ -1196,7 +1230,7 @@ mod tests {
         assert_eq!(symbol("extern_data").def, SymbolDef::Undefined);
         assert_eq!(object.symbols[9].kind, SymbolKind::Section);
         assert_eq!(object.symbols[9].def, SymbolDef::Section { section: 7, value: 0, size: 0 });
-        assert_eq!(object.groups, [Group { name: "grp".to_owned(), sections: vec![1, 4] }]);
+        assert_eq!(object.groups, [Group { name: "grp".to_owned(), sections: vec![1, 4], largest: false }]);
     }
 
     #[test]

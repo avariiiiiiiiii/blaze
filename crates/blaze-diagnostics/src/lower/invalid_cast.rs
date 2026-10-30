@@ -11,6 +11,7 @@
 
 use hir::{CastError, InFile};
 use hir_ty::next_solver::TyKind;
+use intern::{Symbol, sym};
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, IntoKind as _};
 use syntax::{AstNode, TextRange, ast};
 
@@ -314,7 +315,7 @@ fn non_scalar<'db>(
         }
         diag.multipart_suggestion("consider borrowing the value", parts, Applicability::MachineApplicable);
     } else if !(d.cast_ty.is_fn() || d.cast_ty.is_closure()) {
-        if let Some(from) = core_trait(cx, "convert", "From")
+        if let Some(from) = core_trait(cx, sym::convert, sym::From)
             && d.cast_ty.impls_trait(cx.db, from, std::slice::from_ref(&d.expr_ty))
         {
             let to = match d.cast_ty.as_adt() {
@@ -476,25 +477,14 @@ fn symbol_list(items: &[String]) -> String {
     }
 }
 
-/// The trait `name` in `core`'s module `module`, as rustc's diagnostic items find it.
-fn core_trait(cx: &Cx<'_, '_>, module: &str, name: &str) -> Option<hir::Trait> {
-    let deps = cx.krate.dependencies(cx.db);
-    let core = deps
-        .iter()
-        .find(|it| it.name.as_str() == "core")
-        .map(|it| it.krate)
-        .or_else(|| {
-            deps.iter().find_map(|dep| {
-                dep.krate.dependencies(cx.db).into_iter().find(|it| it.name.as_str() == "core").map(|it| it.krate)
-            })
-        })
-        .or_else(|| (cx.krate.display_name(cx.db)?.to_string() == "core").then_some(cx.krate))?;
-    let module = core
-        .root_module(cx.db)
-        .children(cx.db)
-        .find(|it| it.name(cx.db).is_some_and(|it| it.as_str() == module))?;
-    module.declarations(cx.db).into_iter().find_map(|it| match it {
-        hir::ModuleDef::Trait(it) if it.name(cx.db).as_str() == name => Some(it),
+/// The trait `core::{module}::{name}`, as rustc's diagnostic items find it: core is the crate of
+/// the `Sized` lang item, and the path is two hashed scope lookups of interned names.
+fn core_trait(cx: &Cx<'_, '_>, module: Symbol, name: Symbol) -> Option<hir::Trait> {
+    let sized = hir_def::lang_item::lang_items(cx.db, cx.krate.base()).Sized?;
+    let core = hir::Trait::from(sized).module(cx.db).krate(cx.db);
+    let path = [hir::Name::new_symbol_root(module), hir::Name::new_symbol_root(name)];
+    core.root_module(cx.db).resolve_mod_path(cx.db, path)?.find_map(|it| match it {
+        hir::ItemInNs::Types(hir::ModuleDef::Trait(it)) => Some(it),
         _ => None,
     })
 }

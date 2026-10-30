@@ -11,7 +11,10 @@
 //! blocks and locals are numbered by a walk from the start block, and expression ids, binding
 //! ids and closure positions are positions in that body's own store.
 
-use std::{cell::RefCell, fmt::Debug};
+use std::{
+    cell::RefCell,
+    fmt::{Debug, Write as _},
+};
 
 use base_db::Crate;
 use blaze_ids::ContentId;
@@ -52,7 +55,7 @@ use hir_ty::{
         ValTree,
     },
     rpit_hidden_types,
-    traits::{ParamEnvAndCrate, implements_trait_unique},
+    traits::{ParamEnvAndCrate, implements_traits_unique},
 };
 use intern::Symbol;
 use rustc_abi::ReprOptions;
@@ -210,7 +213,11 @@ impl Form {
     /// For what holds no id: what one build of blaze writes of it is the same in every run, and
     /// the store's keys hash what blaze was built from.
     fn debug(&mut self, value: &dyn Debug) {
-        self.str(&format!("{value:?}"));
+        let at = self.digest.len();
+        self.u64(0);
+        write!(Text(&mut self.digest), "{value:?}").expect("`Debug` into a `Vec` does not fail");
+        let len = (self.digest.len() - at - 8) as u64;
+        self.digest[at..at + 8].copy_from_slice(&len.to_le_bytes());
     }
 
     /// The slot of `id`: the first item referred to is 0, the next other one 1.
@@ -253,6 +260,16 @@ impl Form {
     fn code(self) -> Code {
         let spans = ContentId::of(SPANS_DOMAIN, &self.spans);
         Code { sub: self.sub(), spans }
+    }
+}
+
+/// Text written into a preimage as it is formatted.
+struct Text<'a>(&'a mut Vec<u8>);
+
+impl std::fmt::Write for Text<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(text.as_bytes());
+        Ok(())
     }
 }
 
@@ -310,6 +327,24 @@ fn crate_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, Trait
         }
     }
     traits.into_boxed_slice()
+}
+
+/// The auto traits of the crates `krate` loads, in the order of their keys.
+#[salsa::tracked(returns(ref))]
+fn loaded_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
+    let mut traits: Vec<(ItemKey, TraitId)> = loaded_crates(db, krate)
+        .iter()
+        .flat_map(|&it| crate_auto_traits(db, it).iter().copied())
+        .collect();
+    traits.sort_unstable();
+    traits.dedup();
+    traits.into_boxed_slice()
+}
+
+/// What an item's visibility is resolved to, once per item.
+#[salsa::tracked(returns(copy))]
+fn item_visibility(db: &dyn HirDatabase, id: ItemId) -> Visibility {
+    item_visibility_uncached(db, id)
 }
 
 impl<'db> Cx<'db> {
@@ -510,17 +545,13 @@ impl<'db> Cx<'db> {
         };
         self.ty_in(&mut f, hidden);
         let krate = owner.krate(db);
-        let mut traits: Vec<(ItemKey, TraitId)> = loaded_crates(db, krate)
-            .iter()
-            .flat_map(|&it| crate_auto_traits(db, it).iter().copied())
-            .collect();
-        traits.sort_unstable();
-        traits.dedup();
+        let traits = loaded_auto_traits(db, krate);
         f.len(traits.len());
-        for (_, it) in traits {
+        let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate };
+        let ids: Vec<TraitId> = traits.iter().map(|&(_, it)| it).collect();
+        for (&it, holds) in ids.iter().zip(implements_traits_unique(hidden, db, env, &ids)) {
             f.item(ItemId::Trait(it));
-            let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate };
-            f.bool(implements_trait_unique(hidden, db, env, it));
+            f.bool(holds);
         }
         f
     }
@@ -553,7 +584,7 @@ impl<'db> Cx<'db> {
             None => f.error(Missed::ErrorType),
         }
         let flags = AttrFlags::query_field(db, FieldId { parent: variant, local_id: field });
-        f.u64(flags.difference(unobserved()).bits());
+        f.u128(flags.difference(unobserved()).bits());
         form
     }
 
@@ -597,14 +628,13 @@ impl<'db> Cx<'db> {
         self.fn_sig(f, sig.skip_binder());
         let data = FunctionSignature::of(db, func);
         f.u64(u64::from(data.flags.bits()));
-        self.attrs(f, func.into());
+        let flags = self.attrs(f, func.into());
         let features = AttrFlags::target_feature_list(db, func);
         f.len(features.len());
         for feature in &features {
             f.str(feature.as_str());
         }
-        f.bool(AttrFlags::is_rustc_nounwind(db, func));
-        let flags = AttrFlags::query(db, func.into());
+        f.bool(flags.contains(AttrFlags::RUSTC_NOUNWIND));
         let linked = flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME)
             || matches!(loc.container, ItemContainerId::ExternBlockId(_));
         self.linked_name(f, linked, data.name.as_str());
@@ -778,8 +808,7 @@ impl<'db> Cx<'db> {
         self.ty_in(f, db.type_for_static(it).skip_binder());
         let data = StaticSignature::of(db, it);
         f.u64(u64::from(data.flags.bits()));
-        self.attrs(f, it.into());
-        let flags = AttrFlags::query(db, it.into());
+        let flags = self.attrs(f, it.into());
         let linked = flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME)
             || matches!(loc.container, ItemContainerId::ExternBlockId(_));
         self.linked_name(f, linked, data.name.as_str());
@@ -975,16 +1004,35 @@ impl<'db> Cx<'db> {
         }
     }
 
-    fn attrs(&self, f: &mut Form, owner: AttrDefId) {
+    /// The flags are what the attribute pass found: a symbol query whose flag is not set
+    /// finds nothing, and asking it would make one memo per item for nothing.
+    fn attrs(&self, f: &mut Form, owner: AttrDefId) -> AttrFlags {
         let db = self.db;
         let flags = AttrFlags::query(db, owner);
-        f.u64(flags.difference(unobserved()).bits());
+        f.u128(flags.difference(unobserved()).bits());
         f.symbol(flags.lang_item_with_attrs(db, owner));
         f.symbol(flags.unstable_feature(db, owner));
-        f.symbol(AttrFlags::export_name(db, owner));
-        f.symbol(AttrFlags::link_name(db, owner));
-        f.symbol(AttrFlags::link_section(db, owner));
-        f.symbol(AttrFlags::linkage(db, owner));
+        f.symbol(if flags.contains(AttrFlags::HAS_EXPORT_NAME) {
+            AttrFlags::export_name(db, owner)
+        } else {
+            None
+        });
+        f.symbol(if flags.contains(AttrFlags::HAS_LINK_NAME) {
+            AttrFlags::link_name(db, owner)
+        } else {
+            None
+        });
+        f.symbol(if flags.contains(AttrFlags::HAS_LINK_SECTION) {
+            AttrFlags::link_section(db, owner)
+        } else {
+            None
+        });
+        f.symbol(if flags.contains(AttrFlags::HAS_LINKAGE) {
+            AttrFlags::linkage(db, owner)
+        } else {
+            None
+        });
+        flags
     }
 
     fn generics(&self, f: &mut Form, def: GenericDefId) {
@@ -2476,7 +2524,7 @@ fn variant_module(db: &dyn HirDatabase, variant: VariantId) -> ModuleId {
 
 /// The visibility of an item that is not associated: a function, constant or type alias has
 /// [`AssocItemId::assoc_visibility`] wherever it is.
-fn item_visibility(db: &dyn HirDatabase, id: ItemId) -> Visibility {
+fn item_visibility_uncached(db: &dyn HirDatabase, id: ItemId) -> Visibility {
     match id {
         ItemId::Function(it) => AssocItemId::FunctionId(it).assoc_visibility(db),
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),

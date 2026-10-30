@@ -301,7 +301,6 @@ fn everything() {
     // The structs are not recreated, and the queries are not re-executed.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillCheckCancellation",
             "WillCheckCancellation",
@@ -398,7 +397,6 @@ fn partial_query() {
     // The query was not re-executed.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
         ]"#]]);
 
@@ -410,7 +408,6 @@ fn partial_query() {
     // The query was re-executed afer the input was updated.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: query(Id(0)) }",
             "WillCheckCancellation",
@@ -546,7 +543,6 @@ fn partial_query_interned() {
     // The query was not re-executed.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
         ]"#]]);
 

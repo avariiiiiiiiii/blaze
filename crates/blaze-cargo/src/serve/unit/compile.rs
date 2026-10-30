@@ -89,6 +89,7 @@ fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
         .id(&identity)
         .part(&cbor(u, "unit", unit)?)
         .part(&cbor(plan, "plan", unit)?)
+        .part(&cbor(&runs(job, unit).env, "run environment", unit)?)
         .id(&toolchain.id)
         .update(&[goal, u8::from(job.input.color)]);
     Ok(Some(Key(hasher.finish())))
@@ -349,11 +350,40 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
         _ => None,
     };
     let artifact = match (&main, main_key) {
-        (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false)),
+        (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))),
         _ => None,
     };
     let natives = natives.into_iter().map(|(path, bytes): (String, Vec<u8>)| (path, ContentId::of(NATIVE, &bytes))).collect();
     Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact }, made, natives })
+}
+
+/// How `unit`'s program is run: its plan's runner, and cargo's variables of it, from the build
+/// scripts' runs it depends on (its package's script's `rustc-env`, every run's library search
+/// directories).
+fn runs(job: &Job, unit: usize) -> artifact::Runs {
+    let units = job.units();
+    let Some(plan) = units.plans.get(unit) else { return artifact::Runs::default() };
+    let pkg_id = units.graph.units.get(unit).map(|it| it.pkg_id.as_str());
+    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
+    let mut own = Vec::new();
+    let mut native = Vec::new();
+    for at in codegen::closure(job, unit) {
+        let Some(applied) = scripts.get(&at) else { continue };
+        if Some(applied.package_id.as_str()) == pkg_id {
+            own = applied.output.env.clone();
+        }
+        for path in &applied.output.library_paths {
+            let path = blaze_build_script::output::search_path_of(path.path()).to_string_lossy().into_owned();
+            if !native.contains(&path) {
+                native.push(path);
+            }
+        }
+    }
+    let cargo = job.shared.launcher.to_string_lossy();
+    artifact::Runs {
+        runner: plan.runner.clone(),
+        env: artifact::run_env(plan, &cargo, &own, &native, std::env::consts::OS),
+    }
 }
 
 /// What a test binary's behaviour depends on beside the code it reaches.

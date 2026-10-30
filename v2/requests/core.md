@@ -121,6 +121,21 @@ check on a warm build.
    CAS loop while `held + bytes <= limit`, with no lock. Keep `by_holder` per worker slot.
    Only an over-limit reserve takes the slow path, and it should hand the task back to the
    plane to park (return "would wait") instead of blocking the thread.
+
+   Status of 4: done by speed-runtime, another way. `held()` runs after every task's `Done`
+   (`exec.rs`, `blaze-cargo/src/serve/plane.rs`), so summing one slot per thread there costs a
+   cache line per thread per task. Instead, each thread's count reaches one padded total only
+   once it drifts 256 KiB (Linux's `percpu_counter`), and is flushed at thread exit. An
+   allocation does no atomic, and `held()` is one load, exact for the calling thread and within
+   256 KiB for each other one.
+
+   Status of 5: partly done by speed-runtime. `Bump::reset` now keeps its last chunk, so a
+   per-task arena reset between tasks reserves nothing from the cap in steady state: the lock
+   is taken once per new chunk (64 KiB or more), not per task. A `Grant` drop no longer wakes,
+   which is a futex syscall, unless someone waits. The wait itself stays: core.md section 4
+   says "a task that would pass the cap waits", and the cap cancels the newest waiter when
+   every holder waits. A lock-free reserve would need per-thread holder counts for that check.
+   Not done, because the lock is no longer on a per-task path.
 6. **`crates/blaze-core/src/kqueue.rs:202`, `:907-909` (the macOS driver) and
    `crates/blaze-core/src/threads.rs:50`, `:155-157`: the file-effect queue is an
    `Arc<Mutex<mpsc::Receiver<Effect>>>`.** An idle IO thread holds the mutex *while blocked
@@ -168,3 +183,79 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
     - io_uring: a plain `recv` into `buffer.spare_capacity_mut()`. Multishot recv with provided
       buffers (store's request 6) still suits small asks on the server side.
     - Sim: append the delivered prefix.
+
+> forwarded to core: `Effect::SendMapped` and `Effect::RecvInto` are lane core's (`crates/blaze-core/`); lane core is still running.
+
+## 6. Workspace dependency `windows-sys` and blaze-core's Windows line (one change)
+
+- What: in the root `Cargo.toml`'s `[workspace.dependencies]`, `windows-sys = { version =
+  "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security",
+  "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl",
+  "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes",
+  "Win32_System_SystemServices", "Win32_System_Threading"] }` (0.61.2 is in `Cargo.lock`), and in
+  the same change, in `crates/blaze-core/Cargo.toml` (core's, but it must land with the
+  workspace entry or every platform's manifest fails to parse):
+  `[target.'cfg(windows)'.dependencies]` / `windows-sys.workspace = true`.
+- Where: `Cargo.toml`, `crates/blaze-core/Cargo.toml`.
+- Why: the IOCP driver (`crates/blaze-core/src/iocp.rs`, `iocp/`) and `fs.rs` on Windows use
+  these modules. Until then a Windows build of `blaze-core` fails; Linux and macOS are not
+  touched.
+
+## 7. docs/v2/plan/lanes/core.md "Windows": how a process's end is heard
+
+- What: say "a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to
+  the port; the job's messages, which Windows does not promise to deliver, only say the job went
+  past its memory" and "a memory-limited job's peak is at most its limit: Windows refuses any
+  commit past it", in place of the job's `EXIT_PROCESS` message.
+- Where: `docs/v2/plan/lanes/core.md` (coordinator's).
+- Why: a lost `EXIT_PROCESS` would leave a spawn in flight forever; the wait always fires.
+
+## 8. For the daemon (cargo or ci): start every process through a driver
+
+- What: no `std::process::Command` in the daemon once the drivers run its processes.
+- Why: on Windows, a child's pipe ends are inheritable between their creation and
+  `CreateProcessW`; std's spawn inherits every inheritable handle, so a std spawn in that window
+  holds another spawn's pipe open until it exits. On Unix the same holds for any descriptor
+  without close-on-exec; the drivers set it on all of theirs.
+
+## From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, "Memory admission" (2026-10-29)
+
+- What: replace "`arena::Counting` is the daemon's global allocator (per-thread counts, sharded
+  totals, no lock)" with "`arena::Counting` is the daemon's global allocator, over the allocator
+  it uses (per-thread counts added to one total each time they drift 256 KiB and at thread
+  exit: no lock and no atomic per allocation; `held()` is one load, within 256 KiB per other
+  thread)". In "What others wire", the daemon line can say `Counting<Jemalloc>` (or mimalloc)
+  rather than `Counting<System>`.
+- Where: `docs/v2/plan/lanes/core/plane.md` (core's).
+- Why: `crates/blaze-graph/src/arena.rs` changed so (see `docs/v2/plan/lanes/core/speed-runtime.md`),
+  and the doc is `current`-kept by core.
+
+## From speed-runtime-plane: one output buffer per caller of the plane (2026-10-29)
+
+`Plane` gained `step_into(&mut self, PlaneInput, &mut Vec<PlaneOutput>) -> Result<(), Error>`
+and `cancel_into(&mut self, u64, RequestId, &mut Vec<PlaneOutput>) -> Result<(), Error>`: they
+append to the caller's buffer (nothing on an error). `step` and `cancel` are unchanged and still
+allocate one `Vec` a step. A caller that keeps one buffer and drains it allocates nothing per
+step.
+
+1. **`crates/blaze-graph/src/machine.rs` (core).** What: give `Machine` a field
+   `said: Vec<PlaneOutput>` (`Vec::new()` in `new`), and in `step` replace
+   `let outputs = self.plane.step(input)?;` with
+   `let mut said = std::mem::take(&mut self.said); let taken = self.plane.step_into(input, &mut said);`
+   then, on `Ok`, map `said.drain(..)` exactly as `outputs.into_iter()` is mapped now, and put
+   `self.said = said;` back before returning `taken` / the outputs. Why: one fewer allocation per
+   step of every build-script and name-resolution graph; outputs unchanged.
+2. **`crates/blaze-graph/src/exec.rs` (speed-runtime-pool, told in its window).** What: give the
+   owner a `said: Vec<PlaneOutput>`; in `Owner::step` call `self.plane.step_into(input, &mut said)`
+   on a buffer taken out of `self` (`std::mem::take`), and in place of `outputs(request, Result<Vec<_>>)`
+   take `Result<(), Error>` and `for output in said.drain(..) { self.output(output) }`, then put
+   the buffer back; the same for `Msg::Cancel` with `cancel_into`. Why: the scheduler's owner
+   thread steps the plane once per task; this takes its one remaining allocation per step.
+3. **`docs/v2/plan/lanes/core/plane.md` (core), "The plane".** What: add a item 7: "**Layout.**
+   Nodes and tasks are `u32` slots into hot rows (64 bytes a node, 32 a task) and colder columns,
+   reused through free lists; a request's deps are one edge array (a node's deps a range of it,
+   its dependents a list threaded through it); task members a list through the node rows; ready
+   sets 4-ary heaps whose nodes know their place; keys index the flight table by their own first
+   eight bytes. In steady state a task costs the plane no allocation; `Plane::step_into` appends
+   to the caller's buffer." Why: the doc is `current`-kept by core and now says nothing of how
+   the plane holds its state (see `docs/v2/plan/lanes/core/speed-runtime-plane.md`).

@@ -1,12 +1,19 @@
 // Shuttle doesn't like panics inside of its runtime.
 #![cfg(not(feature = "shuttle"))]
 
-use std::panic::catch_unwind;
+use std::cell::Cell;
+use std::panic::{catch_unwind, resume_unwind};
 
 use salsa::{Cancelled, Database};
 
 use crate::setup::{Knobs, KnobsDatabase};
-use crate::sync::thread;
+use crate::sync::{mpsc, thread};
+
+std::thread_local! {
+    /// Whether `cycle_query` abandons its work for a pending write, as a host does before it
+    /// writes.
+    static ABANDON: Cell<bool> = const { Cell::new(false) };
+}
 
 #[salsa::input]
 struct Input {
@@ -14,16 +21,18 @@ struct Input {
     value: u32,
 }
 
-/// A query with cycle recovery that will be interrupted by LRU eviction.
+/// A query with cycle recovery that will be abandoned for an LRU eviction.
 /// This uses `cycle_initial` which gives it `FallbackImmediate` cycle recovery strategy,
 /// meaning it goes through `execute_maybe_iterate` and has `PoisonProvisionalIfPanicking`.
 #[salsa::tracked(returns(copy), cycle_initial = cycle_initial)]
 fn cycle_query(db: &dyn KnobsDatabase, input: Input) -> u32 {
     // Signal that we've started the cycle query
     db.signal(1);
-    // Wait for signal that the cancellation flag has been set
+    // Wait for the go-ahead to continue
     db.wait_for(2);
-    // This fetch will check for cancellation and throw PendingWrite
+    if ABANDON.with(Cell::get) {
+        resume_unwind(Box::new(Cancelled::PendingWrite));
+    }
     inner_query(db, input)
 }
 
@@ -36,63 +45,33 @@ fn cycle_initial(_db: &dyn KnobsDatabase, _id: salsa::Id, _input: Input) -> u32 
     0
 }
 
-/// Test that `trigger_lru_eviction` during cycle iteration causes the query to recompute.
+/// Runs `cycle_query` until it abandons its work for a pending write.
+fn abandon_cycle_query(db: &Knobs, input: Input) {
+    // Single-threaded: let `cycle_query` through its waits.
+    db.signal(2);
+    ABANDON.with(|abandon| abandon.set(true));
+    let abandoned = catch_unwind(|| cycle_query(db, input));
+    ABANDON.with(|abandon| abandon.set(false));
+    let err = abandoned.expect_err("the query should have been abandoned");
+    assert!(
+        matches!(err.downcast_ref::<Cancelled>(), Some(Cancelled::PendingWrite)),
+        "the query should have been cancelled, got: {err:?}"
+    );
+}
+
+/// Test that `trigger_lru_eviction` after a cycle query was abandoned causes the query to
+/// recompute.
 #[test]
 fn lru_eviction_recomputes_cycle_query() {
-    let db = Knobs::default();
-
-    // Create clones BEFORE setting up signal handlers
-    let db_writer = db.clone();
-    let db_t1 = db.clone();
-    let db_waiter = db.clone();
-
-    // Create input before setting up signal handlers
+    let mut db = Knobs::default();
     let input = Input::new(&db, 42);
 
-    // Set up: when cancellation flag is set, signal stage 2 so thread 1 can continue
-    db.signal_on_did_cancel(2);
+    abandon_cycle_query(&db, input);
 
-    // Drop the original db so trigger_lru_eviction can complete
-    // (it waits for all snapshots to be dropped)
-    drop(db);
+    // Evict, which does NOT bump the revision.
+    db.trigger_lru_eviction();
 
-    // Thread 1: Start a cycle query that will be interrupted
-    let t1 = thread::spawn(move || catch_unwind(|| cycle_query(&db_t1, input)));
-
-    // Wait for thread 1 to enter the cycle query and signal stage 1
-    db_waiter.wait_for(1);
-
-    // Drop waiter so trigger_lru_eviction can proceed after t1 drops its handle
-    drop(db_waiter);
-
-    // Thread 2: Trigger LRU eviction, which will:
-    // 1. Set the cancellation flag (this signals stage 2, letting thread 1 continue)
-    // 2. Wait for thread 1 to drop its snapshot (thread 1 will check cancellation and panic)
-    // 3. NOT bump the revision
-    let t2 = thread::spawn({
-        let mut db_writer = db_writer;
-        move || {
-            db_writer.trigger_lru_eviction();
-            db_writer
-        }
-    });
-
-    // Thread 1 should have been cancelled with PendingWrite
-    let r1 = t1.join().unwrap();
-    assert!(
-        r1.is_err(),
-        "Thread 1 should have panicked due to PendingWrite cancellation"
-    );
-    let err = r1.unwrap_err();
-    assert!(
-        err.downcast_ref::<Cancelled>().is_some(),
-        "Thread 1 should have been cancelled, got: {err:?}"
-    );
-
-    // Thread 2 should complete successfully
-    let db_after = t2.join().unwrap();
-
-    assert_eq!(cycle_query(&db_after, input), 42);
+    assert_eq!(cycle_query(&db, input), 42);
 }
 
 /// Test that local cancellation via CancellationToken does NOT poison
@@ -101,95 +80,52 @@ fn lru_eviction_recomputes_cycle_query() {
 #[test]
 fn local_cancellation_does_not_poison_cycle_query() {
     let db = Knobs::default();
-
-    // Create clones BEFORE setting up signal handlers
-    let db_t1 = db.clone();
-
-    // Create input before setting up signal handlers
     let input = Input::new(&db, 42);
+    let db = &db;
 
-    // Get cancellation token for t1
-    let token = db_t1.cancellation_token();
-
-    // Set up: when thread 1 signals stage 1, we'll cancel it
-    // But this should NOT affect the cycle query because local cancellation
-    // is disabled during execute_maybe_iterate
-
-    // Thread 1: Start a cycle query
-    let t1 = thread::spawn({
-        let db = db_t1;
-        move || {
+    thread::scope(|scope| {
+        // Thread 1: Start a cycle query, handing out the token of its task
+        let (token_tx, token_rx) = mpsc::channel();
+        let t1 = scope.spawn(move || {
+            token_tx.send(db.cancellation_token()).unwrap();
             // This query has cycle recovery, so cancellation should be disabled
-            cycle_query(&db, input)
-        }
+            cycle_query(db, input)
+        });
+        let token = token_rx.recv().unwrap();
+
+        // Wait for thread 1 to enter the cycle query
+        db.wait_for(1);
+
+        // Try to cancel - but this should be ignored because cancellation is disabled
+        token.cancel();
+
+        // Let thread 1 continue
+        db.signal(2);
+
+        // Thread 1 should complete successfully despite cancellation request
+        // because local cancellation is disabled during cycle iteration
+        let r1 = t1.join().unwrap();
+        assert_eq!(
+            r1, 42,
+            "Query should complete successfully despite cancellation request"
+        );
     });
-
-    // Wait for thread 1 to enter the cycle query
-    db.wait_for(1);
-
-    // Try to cancel - but this should be ignored because cancellation is disabled
-    token.cancel();
-
-    // Let thread 1 continue
-    db.signal(2);
-
-    // Thread 1 should complete successfully despite cancellation request
-    // because local cancellation is disabled during cycle iteration
-    let r1 = t1.join().unwrap();
-    assert_eq!(
-        r1, 42,
-        "Query should complete successfully despite cancellation request"
-    );
 }
 
 /// Test that the recomputed query remains valid after a revision bump.
 #[test]
 fn revision_bump_after_cancellation_recomputes_cycle_query() {
-    let db = Knobs::default();
-
-    // Create clones BEFORE setting up signal handlers
-    let db_writer = db.clone();
-    let db_t1 = db.clone();
-    let db_waiter = db.clone();
-
-    // Create input before setting up signal handlers
+    let mut db = Knobs::default();
     let input = Input::new(&db, 42);
 
-    // Set up: when cancellation flag is set, signal stage 2 so thread 1 can continue
-    db.signal_on_did_cancel(2);
+    abandon_cycle_query(&db, input);
 
-    // Drop the original db so trigger_lru_eviction can complete
-    drop(db);
+    db.trigger_lru_eviction();
 
-    // Thread 1: Start a cycle query that will be interrupted
-    let t1 = thread::spawn(move || catch_unwind(|| cycle_query(&db_t1, input)));
-
-    // Wait for thread 1 to enter the cycle query
-    db_waiter.wait_for(1);
-
-    // Drop waiter so trigger_lru_eviction can proceed
-    drop(db_waiter);
-
-    // Thread 2: Trigger LRU eviction
-    let t2 = thread::spawn({
-        let mut db_writer = db_writer;
-        move || {
-            db_writer.trigger_lru_eviction();
-            db_writer
-        }
-    });
-
-    // Thread 1 should have been cancelled
-    let r1 = t1.join().unwrap();
-    assert!(r1.is_err());
-
-    // Thread 2 should complete
-    let mut db_after = t2.join().unwrap();
-
-    assert_eq!(cycle_query(&db_after, input), 42);
+    assert_eq!(cycle_query(&db, input), 42);
 
     // Trigger a synthetic write to bump the revision
-    db_after.synthetic_write(salsa::Durability::HIGH);
+    db.synthetic_write(salsa::Durability::HIGH);
 
-    assert_eq!(cycle_query(&db_after, input), 42);
+    assert_eq!(cycle_query(&db, input), 42);
 }

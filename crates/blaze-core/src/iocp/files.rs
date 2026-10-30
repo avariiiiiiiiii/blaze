@@ -1,6 +1,6 @@
 //! Files on Windows: the handles the port reads and appends through, and the calls of the
-//! effects that block (a whole-file write, a rename, a clone, a mapping, a mode), which the
-//! driver's threads make where [`crate::threads::run`] has no Windows call of its own to.
+//! effects that block (a whole-file write, a rename, a clone, a mapping, a mode), which are
+//! `crate::fs`'s on Windows, so `Threads` and `Iocp` do the same.
 
 use std::{
     io::{self, Write as _},
@@ -94,7 +94,7 @@ fn moved(from: &Path, to: &Path) -> io::Result<()> {
 
 /// `bytes` as the whole of `path`: a temporary file next to it, written and flushed, moved
 /// over it with the move written through, so a crash leaves the old contents or the new.
-pub(super) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::fs::make_parent(path)?;
     let temporary = crate::fs::temporary_next_to(path);
     let written = (|| {
@@ -111,7 +111,7 @@ pub(super) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// `from` renamed over `to`, the new name on the disk when it returns.
-pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     crate::fs::make_parent(to)?;
     moved(from, to)
 }
@@ -122,7 +122,7 @@ pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// the bits that let one run need nothing; group and others reading and running as the owner
 /// may (0o755, 0o644, 0o555, 0o444) is what the directory's access list already grants them.
 /// Any other mode asks for what Windows cannot keep, and is refused.
-pub(super) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     let owner = (mode >> 6) & 0o7;
     let shared = owner & 0o5;
     let keepable =
@@ -224,7 +224,7 @@ fn control<T, U>(handle: &OwnedHandle, code: u32, input: Option<&T>, output: Opt
 
 /// `to` made sharing `from`'s blocks (ReFS's block cloning), or an error naming the file
 /// system that cannot: nothing copies instead.
-pub(super) fn clone(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     crate::fs::make_parent(to)?;
     let source = plain(from, GENERIC_READ, OPEN_EXISTING)?;
     let (system, shares) = file_system(&source)?;
@@ -292,7 +292,7 @@ pub(super) fn clone(from: &Path, to: &Path) -> io::Result<()> {
 
 /// The whole file mapped read-only and shared. Windows refuses to replace or cut a file a
 /// view of which is open, so the pages under a mapping are never written while it lives.
-pub(super) fn map(path: &Path) -> io::Result<crate::Mapping> {
+pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
     let file = plain(path, GENERIC_READ, OPEN_EXISTING)?;
     let len = usize::try_from(size(&file)?)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;

@@ -13,10 +13,16 @@ use crate::{
 };
 
 /// Maps absolute text ranges for the corresponding file to the relevant span data.
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+///
+/// Two columns: where each piece of text ends, and its span. The span at an offset is a
+/// branch-free binary search of the ends alone (4 bytes each, 16 to a cache line), then one
+/// load of a 20-byte span.
+#[derive(PartialEq, Eq, Clone, Hash)]
 pub struct SpanMap {
-    /// The offset stored here is the *end* of the node.
-    spans: Vec<(TextSize, Span)>,
+    /// Where each piece of text ends, in order; it begins where the one before ends, or at 0.
+    ends: Vec<TextSize>,
+    /// The span of each piece of text.
+    spans: Vec<Span>,
     /// Index of the matched macro arm on successful expansion for declarative macros.
     // FIXME: Does it make sense to have this here?
     pub matched_arm: Option<u32>,
@@ -32,10 +38,22 @@ fn count_of(offsets: &[TextSize], offset: TextSize) -> usize {
     offsets[first..].partition_point(|&it| it == offset)
 }
 
+impl fmt::Debug for SpanMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpanMap")
+            .field("spans", &self.iter().collect::<Vec<_>>())
+            .field("matched_arm", &self.matched_arm)
+            .field("fragment_starts", &self.fragment_starts)
+            .field("fragment_ends", &self.fragment_ends)
+            .finish()
+    }
+}
+
 impl SpanMap {
     /// Creates a new empty [`SpanMap`].
     pub fn empty() -> Self {
         Self {
+            ends: Vec::new(),
             spans: Vec::new(),
             matched_arm: None,
             fragment_starts: Vec::new(),
@@ -46,10 +64,8 @@ impl SpanMap {
     /// Finalizes the [`SpanMap`], shrinking its backing storage and validating that the offsets are
     /// in order.
     pub fn finish(&mut self) {
-        always!(
-            self.spans.iter().array_windows().all(|[a, b]| a.0 < b.0),
-            "spans are not in order"
-        );
+        always!(self.ends.iter().array_windows().all(|[a, b]| a < b), "spans are not in order");
+        self.ends.shrink_to_fit();
         self.spans.shrink_to_fit();
         self.fragment_starts.sort_unstable();
         self.fragment_ends.sort_unstable();
@@ -58,14 +74,21 @@ impl SpanMap {
     /// Pushes a new span onto the [`SpanMap`].
     pub fn push(&mut self, offset: TextSize, span: Span) {
         if cfg!(debug_assertions)
-            && let Some(&(last_offset, _)) = self.spans.last()
+            && let Some(&last_offset) = self.ends.last()
         {
             assert!(
                 last_offset < offset,
                 "last_offset({last_offset:?}) must be smaller than offset({offset:?})"
             );
         }
-        self.spans.push((offset, span));
+        self.ends.push(offset);
+        self.spans.push(span);
+    }
+
+    /// Where piece `idx` of the text begins: where the one before ends.
+    #[inline]
+    fn start_of(&self, idx: usize) -> TextSize {
+        idx.checked_sub(1).map_or(TextSize::new(0), |prev| self.ends[prev])
     }
 
     /// Records that the tokens of `range` are one macro fragment.
@@ -91,12 +114,11 @@ impl SpanMap {
         &self,
         span: Span,
     ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
-        self.spans.iter().enumerate().filter_map(move |(idx, &(end, s))| {
+        self.spans.iter().enumerate().filter_map(move |(idx, &s)| {
             if !s.eq_ignoring_ctx(span) {
                 return None;
             }
-            let start = idx.checked_sub(1).map_or(TextSize::new(0), |prev| self.spans[prev].0);
-            Some((TextRange::new(start, end), s.ctx))
+            Some((TextRange::new(self.start_of(idx), self.ends[idx]), s.ctx))
         })
     }
 
@@ -107,35 +129,35 @@ impl SpanMap {
         &self,
         span: Span,
     ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
-        self.spans.iter().enumerate().filter_map(move |(idx, &(end, s))| {
+        self.spans.iter().enumerate().filter_map(move |(idx, &s)| {
             if s.anchor != span.anchor {
                 return None;
             }
             if !s.range.contains_range(span.range) {
                 return None;
             }
-            let start = idx.checked_sub(1).map_or(TextSize::new(0), |prev| self.spans[prev].0);
-            Some((TextRange::new(start, end), s.ctx))
+            Some((TextRange::new(self.start_of(idx), self.ends[idx]), s.ctx))
         })
     }
 
     /// Returns the span at the given position.
+    #[inline]
     pub fn span_at(&self, offset: TextSize) -> Span {
-        let entry = self.spans.partition_point(|&(it, _)| it <= offset);
-        self.spans[entry].1
+        let entry = self.ends.partition_point(|&it| it <= offset);
+        self.spans[entry]
     }
 
     /// Returns the spans associated with the given range.
     /// In other words, this will return all spans that correspond to all offsets within the given range.
     pub fn spans_for_range(&self, range: TextRange) -> impl Iterator<Item = Span> + '_ {
         let (start, end) = (range.start(), range.end());
-        let start_entry = self.spans.partition_point(|&(it, _)| it <= start);
-        let end_entry = self.spans[start_entry..].partition_point(|&(it, _)| it <= end); // FIXME: this might be wrong?
-        self.spans[start_entry..][..end_entry].iter().map(|&(_, s)| s)
+        let start_entry = self.ends.partition_point(|&it| it <= start);
+        let end_entry = self.ends[start_entry..].partition_point(|&it| it <= end); // FIXME: this might be wrong?
+        self.spans[start_entry..][..end_entry].iter().copied()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (TextSize, Span)> + '_ {
-        self.spans.iter().copied()
+        self.ends.iter().copied().zip(self.spans.iter().copied())
     }
 
     /// Merges this span map with another span map, where `other` is inserted at (and replaces) `other_range`.
@@ -163,22 +185,17 @@ impl SpanMap {
         //   1   3   5   6   8   12    15    16    <-- final offsets we store
         // 0-1 1-3 3-5 5-6 6-8 8-12 12-15 15-16    <-- final ranges
 
-        self.spans.retain_mut(|(offset, _)| {
-            if other_range.start() < *offset && *offset <= other_range.end() {
-                false
-            } else {
-                if *offset > other_range.end() {
-                    *offset += other_size;
-                    *offset -= other_range.len();
-                }
-                true
-            }
-        });
-
-        self.spans
-            .extend(other.spans.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
-
-        self.spans.sort_unstable_by_key(|&(offset, _)| offset);
+        // The ends are sorted, so what stays before, what is replaced and what is shifted are
+        // three runs, and the result is the first, `other`'s moved, then the third shifted:
+        // in order already, so it is spliced in place, not sorted.
+        let before = self.ends.partition_point(|&it| it <= other_range.start());
+        let after = self.ends.partition_point(|&it| it <= other_range.end());
+        for offset in &mut self.ends[after..] {
+            *offset += other_size;
+            *offset -= other_range.len();
+        }
+        self.ends.splice(before..after, other.ends.iter().map(|&it| it + other_range.start()));
+        self.spans.splice(before..after, other.spans.iter().copied());
 
         // A fragment that starts where the replaced text ends comes after it, one that ends
         // where it starts comes before it.
@@ -201,11 +218,9 @@ impl SpanMap {
             }
             true
         });
-        let moved = |offsets: &[TextSize]| {
-            offsets.iter().map(|&offset| offset + other_range.start()).collect::<Vec<_>>()
-        };
-        self.fragment_starts.extend(moved(&other.fragment_starts));
-        self.fragment_ends.extend(moved(&other.fragment_ends));
+        let start = other_range.start();
+        self.fragment_starts.extend(other.fragment_starts.iter().map(|&offset| offset + start));
+        self.fragment_ends.extend(other.fragment_ends.iter().map(|&offset| offset + start));
         self.fragment_starts.sort_unstable();
         self.fragment_ends.sort_unstable();
 
@@ -217,14 +232,14 @@ impl SpanMap {
 #[cfg(not(no_salsa_async_drops))]
 impl Drop for SpanMap {
     fn drop(&mut self) {
-        let spans = std::mem::take(&mut self.spans);
-        static SPAN_MAP_DROP_THREAD: std::sync::OnceLock<
-            std::sync::mpsc::Sender<Vec<(TextSize, Span)>>,
-        > = std::sync::OnceLock::new();
+        let spans = (std::mem::take(&mut self.ends), std::mem::take(&mut self.spans));
+        type Dropped = (Vec<TextSize>, Vec<Span>);
+        static SPAN_MAP_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Dropped>> =
+            std::sync::OnceLock::new();
 
         SPAN_MAP_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<Vec<(TextSize, Span)>>();
+                let (sender, receiver) = std::sync::mpsc::channel::<Dropped>();
                 std::thread::Builder::new()
                     .name("SpanMapDropper".to_owned())
                     .spawn(move || {
@@ -253,18 +268,37 @@ impl Drop for SpanMap {
 /// What it is (what is compared and hashed) is each anchor with the length of its text, not
 /// where that text is: no position in the file. The positions lookups take are summed from
 /// the lengths when the map is made.
-#[derive(Debug)]
+///
+/// The anchor of an offset is a branch-free binary search of the starts alone (4 bytes per
+/// anchor, 16 to a cache line: a file's few thousand anchors stay in L1 while its tokens are
+/// mapped), then one load of the anchor's id. 12 bytes per anchor.
 pub struct RealSpanMap {
     file_id: EditionedFileId,
-    /// Each anchor and the length of its text, in the order of the text; the first begins at 0.
-    anchors: Box<[(ErasedFileAstId, TextSize)]>,
+    /// Each anchor's raw ast id and the length of its text, in the order of the text; the first
+    /// begins at 0. With `file_id`, what the map is: compared as one `[u32]`, hashed with one
+    /// `write`.
+    anchors: Box<[[u32; 2]]>,
     /// Where each anchor's text begins: the lengths before it, summed.
-    starts: Box<[TextSize]>,
+    starts: Box<[u32]>,
+}
+
+impl fmt::Debug for RealSpanMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let anchors = self
+            .anchors
+            .iter()
+            .map(|&[ast_id, len]| (ErasedFileAstId::from_raw(ast_id), TextSize::new(len)));
+        f.debug_struct("RealSpanMap")
+            .field("file_id", &self.file_id)
+            .field("anchors", &anchors.collect::<Vec<_>>())
+            .field("starts", &self.starts)
+            .finish()
+    }
 }
 
 impl PartialEq for RealSpanMap {
     fn eq(&self, other: &RealSpanMap) -> bool {
-        self.file_id == other.file_id && self.anchors == other.anchors
+        self.file_id == other.file_id && self.anchors.as_flattened() == other.anchors.as_flattened()
     }
 }
 
@@ -273,15 +307,15 @@ impl Eq for RealSpanMap {}
 impl Hash for RealSpanMap {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.file_id.hash(state);
-        self.anchors.hash(state);
+        self.anchors.as_flattened().hash(state);
     }
 }
 
 impl fmt::Display for RealSpanMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "RealSpanMap({:?}):", self.file_id)?;
-        for (start, (ast_id, _)) in self.starts.iter().zip(&self.anchors) {
-            writeln!(f, "{}: {:#?}", u32::from(*start), ast_id)?;
+        for (start, &[ast_id, _]) in self.starts.iter().zip(&self.anchors) {
+            writeln!(f, "{}: {:#?}", start, ErasedFileAstId::from_raw(ast_id))?;
         }
         Ok(())
     }
@@ -292,8 +326,8 @@ impl RealSpanMap {
     pub fn absolute(file_id: EditionedFileId) -> Self {
         RealSpanMap {
             file_id,
-            anchors: Box::from([(ROOT_ERASED_FILE_AST_ID, TextSize::new(!0))]),
-            starts: Box::from([TextSize::new(0)]),
+            anchors: Box::from([[ROOT_ERASED_FILE_AST_ID.into_raw(), !0]]),
+            starts: Box::from([0]),
         }
     }
 
@@ -315,41 +349,47 @@ impl RealSpanMap {
             .enumerate()
             .map(|(i, &(start, ast_id))| {
                 let next = pairs.get(i + 1).map_or(end, |it| it.0);
-                (ast_id, next.checked_sub(start).unwrap_or_default())
+                [ast_id.into_raw(), u32::from(next.checked_sub(start).unwrap_or_default())]
             })
             .collect();
-        let starts = pairs.iter().map(|&(start, _)| start).collect();
+        let starts = pairs.iter().map(|&(start, _)| u32::from(start)).collect();
         RealSpanMap { file_id, anchors, starts }
     }
 
     /// Where the file ends: past the last anchor's text.
     fn end(&self) -> TextSize {
         let last = self.anchors.len() - 1;
-        self.starts[last].checked_add(self.anchors[last].1).unwrap_or(TextSize::new(!0))
+        TextSize::new(self.starts[last].checked_add(self.anchors[last][1]).unwrap_or(!0))
     }
 
     /// The number of the anchor of what begins at `offset`: the last to begin at or before it.
+    #[inline]
     fn index_at(&self, offset: TextSize) -> usize {
+        let offset = u32::from(offset);
         let after = self.starts.partition_point(|&it| it <= offset);
-        after.checked_sub(1).unwrap_or_else(|| panic!("no anchor begins at or before {offset:?}"))
+        after.checked_sub(1).unwrap_or_else(|| panic!("no anchor begins at or before {offset}"))
     }
 
     /// The anchor that the spans of what begins at `offset` are relative to, and where it begins.
+    #[inline]
     pub fn anchor_at(&self, offset: TextSize) -> (TextSize, ErasedFileAstId) {
         let idx = self.index_at(offset);
-        (self.starts[idx], self.anchors[idx].0)
+        (TextSize::new(self.starts[idx]), ErasedFileAstId::from_raw(self.anchors[idx][0]))
     }
 
     /// The map of `range` alone, as a file of its own: the spans it gives what is in `range`,
     /// moved to begin at 0, are those this map gives it where it is. `range` has to begin with
     /// an anchor ([`RealSpanMap::anchor_at`]).
     pub fn within(&self, range: TextRange) -> RealSpanMap {
-        let pairs = self
-            .starts
+        let (start, end) = (u32::from(range.start()), u32::from(range.end()));
+        let from = self.starts.partition_point(|&it| it < start);
+        let to = self.starts.partition_point(|&it| it < end);
+        let pairs = self.starts[from..to]
             .iter()
-            .zip(&self.anchors)
-            .filter(|(offset, _)| range.contains(**offset))
-            .map(|(&offset, &(ast_id, _))| (offset - range.start(), ast_id))
+            .zip(&self.anchors[from..to])
+            .map(|(&offset, &[ast_id, _])| {
+                (TextSize::new(offset - start), ErasedFileAstId::from_raw(ast_id))
+            })
             .collect::<Box<[_]>>();
         debug_assert_eq!(pairs.first().map(|it| it.0), Some(TextSize::new(0)));
         RealSpanMap::from_file(self.file_id, pairs, range.len())
@@ -400,11 +440,11 @@ impl RealSpanMap {
     /// Where anchor `ast_id` begins, at or before `offset`.
     fn start_of(&self, ast_id: ErasedFileAstId, offset: TextSize) -> TextSize {
         let last = self.index_at(offset);
-        let at = (0..=last).rev().find(|&it| self.anchors[it].0 == ast_id);
+        let at = (0..=last).rev().find(|&it| self.anchors[it][0] == ast_id.into_raw());
         let at = at.unwrap_or_else(|| {
             panic!("{ast_id:?} is no anchor at or before {offset:?} in {:?}", self.file_id)
         });
-        self.starts[at]
+        TextSize::new(self.starts[at])
     }
 }
 
@@ -479,5 +519,236 @@ mod tests {
     #[should_panic]
     fn a_span_before_its_anchor_is_refused() {
         map(10).write_spans(ContentId::default(), id(2), [range(12, 15)]);
+    }
+
+    /// splitmix64: the seeded inputs of the tests below.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `n` anchors with gaps of 0 to 7 bytes, and a text 5 past the last; ids from `ids`.
+    fn anchors(
+        state: &mut u64,
+        n: usize,
+        ids: u32,
+    ) -> (Box<[(TextSize, ErasedFileAstId)]>, u32) {
+        let mut start = 0;
+        let pairs = (0..n)
+            .map(|i| {
+                if i > 0 {
+                    start += (next(state) % 8) as u32;
+                }
+                (at(start), id((next(state) % u64::from(ids)) as u32))
+            })
+            .collect();
+        (pairs, start + 5)
+    }
+
+    /// The columns give what a search of the pairs they were made from gives (the layout
+    /// before kept `(ast id, length)` pairs and searched the same starts).
+    #[test]
+    fn anchors_agree_with_a_search_of_the_pairs() {
+        use std::hash::BuildHasher;
+        let mut state = 3;
+        for n in [1usize, 2, 3, 15, 16, 17, 100, 1000] {
+            let (pairs, end) = anchors(&mut state, n, 1 << 20);
+            let map = RealSpanMap::from_file(file(), pairs.clone(), at(end));
+            assert_eq!(map.end(), at(end));
+            for offset in 0..=end {
+                let want = *pairs.iter().rev().find(|it| it.0 <= at(offset)).expect("an anchor");
+                assert_eq!(map.anchor_at(at(offset)), want, "{n} anchors, at {offset}");
+            }
+            for &(start, ast_id) in pairs.iter().step_by(7) {
+                let range = TextRange::new(start, at(end));
+                let filtered = pairs
+                    .iter()
+                    .filter(|it| range.contains(it.0))
+                    .map(|&(offset, ast_id)| (offset - range.start(), ast_id))
+                    .collect::<Box<[_]>>();
+                let want = RealSpanMap::from_file(file(), filtered, range.len());
+                let within = map.within(range);
+                assert_eq!(within, want, "{n} anchors, within {range:?}");
+                let hash = |it: &RealSpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                assert_eq!(hash(&within), hash(&want));
+                assert_eq!(map.start_of(ast_id, start), want_start(&pairs, ast_id, start));
+            }
+        }
+
+        fn want_start(
+            pairs: &[(TextSize, ErasedFileAstId)],
+            ast_id: ErasedFileAstId,
+            offset: TextSize,
+        ) -> TextSize {
+            pairs.iter().rev().filter(|it| it.0 <= offset).find(|it| it.1 == ast_id).unwrap().0
+        }
+    }
+
+    /// Two maps are equal exactly when their anchors' ids and lengths are, and equal maps hash
+    /// the same.
+    #[test]
+    fn real_maps_are_equal_when_their_lengths_and_ids_are() {
+        use std::hash::BuildHasher;
+        let mut state = 4;
+        let maps: Vec<_> = (0..200)
+            .map(|_| {
+                let n = 1 + (next(&mut state) % 4) as usize;
+                let (pairs, end) = anchors(&mut state, n, 2);
+                let lengths: Vec<_> = pairs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(start, ast_id))| {
+                        (ast_id, pairs.get(i + 1).map_or(at(end), |it| it.0) - start)
+                    })
+                    .collect();
+                (RealSpanMap::from_file(file(), pairs, at(end)), lengths)
+            })
+            .collect();
+        for (a, a_lengths) in &maps {
+            for (b, b_lengths) in &maps {
+                assert_eq!(a == b, a_lengths == b_lengths);
+                if a == b {
+                    let hash = |it: &RealSpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                    assert_eq!(hash(a), hash(b));
+                }
+            }
+        }
+    }
+
+    /// The expansion map as it was kept before its ends and spans were columns: one
+    /// `(end, span)` pair each, with its lookups and merge as they were.
+    #[cfg(feature = "salsa")]
+    #[derive(Default, Clone)]
+    struct Pairs(Vec<(TextSize, Span)>);
+
+    #[cfg(feature = "salsa")]
+    impl Pairs {
+        fn span_at(&self, offset: TextSize) -> Span {
+            let entry = self.0.partition_point(|&(it, _)| it <= offset);
+            self.0[entry].1
+        }
+
+        fn spans_for_range(&self, range: TextRange) -> Vec<Span> {
+            let (start, end) = (range.start(), range.end());
+            let start_entry = self.0.partition_point(|&(it, _)| it <= start);
+            let end_entry = self.0[start_entry..].partition_point(|&(it, _)| it <= end);
+            self.0[start_entry..][..end_entry].iter().map(|&(_, s)| s).collect()
+        }
+
+        fn ranges_with(&self, span: Span, exact: bool) -> Vec<(TextRange, SyntaxContext)> {
+            let found = self.0.iter().enumerate().filter(|(_, (_, s))| match exact {
+                true => s.eq_ignoring_ctx(span),
+                false => s.anchor == span.anchor && s.range.contains_range(span.range),
+            });
+            found
+                .map(|(idx, &(end, s))| {
+                    let start = idx.checked_sub(1).map_or(TextSize::new(0), |prev| self.0[prev].0);
+                    (TextRange::new(start, end), s.ctx)
+                })
+                .collect()
+        }
+
+        fn merge(&mut self, other_range: TextRange, other_size: TextSize, other: &Pairs) {
+            self.0.retain_mut(|(offset, _)| {
+                if other_range.start() < *offset && *offset <= other_range.end() {
+                    false
+                } else {
+                    if *offset > other_range.end() {
+                        *offset += other_size;
+                        *offset -= other_range.len();
+                    }
+                    true
+                }
+            });
+            self.0.extend(other.0.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
+            self.0.sort_unstable_by_key(|&(offset, _)| offset);
+        }
+    }
+
+    /// A map of `n` spans over pieces of 1 to 4 bytes, with the same as [`Pairs`].
+    #[cfg(feature = "salsa")]
+    fn spans(state: &mut u64, n: usize) -> (SpanMap, Pairs) {
+        let ctx = SyntaxContext::root(crate::Edition::CURRENT);
+        let (mut map, mut pairs) = (SpanMap::empty(), Pairs::default());
+        let mut end = 0;
+        for _ in 0..n {
+            end += 1 + (next(state) % 4) as u32;
+            let ast_id = id((next(state) % 3) as u32);
+            let anchor = crate::SpanAnchor { file_id: file(), ast_id };
+            let start = (next(state) % 8) as u32;
+            let span = Span { range: range(start, start + (next(state) % 4) as u32), anchor, ctx };
+            map.push(at(end), span);
+            pairs.0.push((at(end), span));
+        }
+        map.finish();
+        (map, pairs)
+    }
+
+    #[cfg(feature = "salsa")]
+    fn check_same(map: &SpanMap, pairs: &Pairs, state: &mut u64) {
+        assert_eq!(map.iter().collect::<Vec<_>>(), pairs.0);
+        let Some(&(last, _)) = pairs.0.last() else { return };
+        for offset in 0..u32::from(last) {
+            assert_eq!(map.span_at(at(offset)), pairs.span_at(at(offset)), "at {offset}");
+        }
+        for _ in 0..50 {
+            let start = (next(state) % u64::from(last)) as u32;
+            let range = range(start, start + (next(state) % 12) as u32);
+            assert_eq!(map.spans_for_range(range).collect::<Vec<_>>(), pairs.spans_for_range(range));
+        }
+        for &(_, span) in pairs.0.iter().step_by(5) {
+            let exact = map.ranges_with_span_exact(span).collect::<Vec<_>>();
+            assert_eq!(exact, pairs.ranges_with(span, true));
+            let containing = map.ranges_with_span(span).collect::<Vec<_>>();
+            assert_eq!(containing, pairs.ranges_with(span, false));
+        }
+    }
+
+    /// The columns give the pairs' answers, before and after merging another map in.
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn expansion_maps_agree_with_the_pairs() {
+        let mut state = 5;
+        for n in [1usize, 2, 16, 17, 300] {
+            let (mut map, mut pairs) = spans(&mut state, n);
+            check_same(&map, &pairs, &mut state);
+            for _ in 0..8 {
+                let other_n = 1 + (next(&mut state) % 20) as usize;
+                let (other, other_pairs) = spans(&mut state, other_n);
+                let last = u32::from(pairs.0.last().expect("a span").0);
+                let start = (next(&mut state) % u64::from(last + 1)) as u32;
+                let end = start + (next(&mut state) % u64::from(last - start + 1)) as u32;
+                let size = other_pairs.0.last().expect("a span").0;
+                map.merge(range(start, end), size, &other);
+                pairs.merge(range(start, end), size, &other_pairs);
+                check_same(&map, &pairs, &mut state);
+            }
+        }
+    }
+
+    /// Two expansion maps are equal exactly when their pairs are, and equal ones hash the same.
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn expansion_maps_are_equal_when_their_pairs_are() {
+        use std::hash::BuildHasher;
+        let mut state = 6;
+        let maps: Vec<_> = (0..100)
+            .map(|_| {
+                let n = (next(&mut state) % 3) as usize;
+                spans(&mut state, n)
+            })
+            .collect();
+        for (a, a_pairs) in &maps {
+            for (b, b_pairs) in &maps {
+                assert_eq!(a == b, a_pairs.0 == b_pairs.0);
+                if a == b {
+                    let hash = |it: &SpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                    assert_eq!(hash(a), hash(b));
+                }
+            }
+        }
     }
 }

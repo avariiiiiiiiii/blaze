@@ -1,19 +1,34 @@
 //! Switching an image's jump table between generations, apart from how a platform writes
 //! its memory ([`Memory`]).
+//!
+//! A patch is checked whole, read in place from its message's bytes, with scratch buffers the
+//! switch keeps from patch to patch: once they have grown, taking a patch allocates nothing.
+//! Its cells go into one of [`POOL`] tables the switch owns, the one the cell left longest
+//! ago, brought to the new generation by storing only the slots that differ: undoing the
+//! generations it held down to where they meet the new one's, then redoing those up to it,
+//! from the [`Log`] of every generation's cells. One release store then points the cell at
+//! it. A rollback is the same towards an older generation, and only the cell's store when a
+//! table holds that generation still, or when it is the one the program started at (the
+//! loader's table).
 
 use std::{
-    collections::{HashSet, VecDeque},
     ops::Range,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{Outcome, hook};
 use crate::patch::{
-    ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, Message, Patch,
+    ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
+    PatchView,
 };
 
 /// How many generations are kept to roll back to, as Relax keeps.
 pub(crate) const KEPT: usize = 64;
+/// How many tables of its own a switch writes generations into, reused oldest first. A
+/// table is written while the cell points at another, and a thread that loaded the cell
+/// before it left this one reads each slot whole, of the generation it was in or the one
+/// it is brought to, both code that is written and stays mapped.
+pub(crate) const POOL: usize = 4;
 const MOST_SLOTS: u64 = 1 << 26;
 const MOST_DIR: u64 = 4096;
 
@@ -118,6 +133,99 @@ pub(crate) enum Dwarf {
     Not,
 }
 
+/// One write of a patch: `len` bytes of its message from `from`, to `at` in memory. 24 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Span {
+    pub(crate) at: u64,
+    from: usize,
+    len: usize,
+}
+
+const _: () = assert!(size_of::<Span>() == 24);
+
+impl Span {
+    pub(crate) fn end(&self) -> u64 {
+        self.at + self.len as u64
+    }
+
+    pub(crate) fn range(&self) -> Range<u64> {
+        self.at..self.end()
+    }
+}
+
+/// What a platform writes, every address in memory: spans of the message's bytes sorted by
+/// address, none empty and none overlapping, and the addresses within them of 8-byte fields
+/// holding an image address, to add the slide to (sorted, each inside one span).
+pub(crate) struct Writes<'a> {
+    message: &'a [u8],
+    pub(crate) spans: &'a [Span],
+    rebase: &'a [u64],
+    slide: u64,
+}
+
+impl<'a> Writes<'a> {
+    pub(crate) fn bytes(&self, span: &Span) -> &'a [u8] {
+        &self.message[span.from..span.from + span.len]
+    }
+
+    /// Writes what the spans have within `range` to `to`, which stands for `range.start`,
+    /// with the slide added to each field to rebase: the bytes go straight from the message
+    /// to where they run, once.
+    ///
+    /// # Safety
+    ///
+    /// `to` is valid for writes of `range.end - range.start` bytes, which nothing else reads
+    /// or writes while this runs.
+    pub(crate) unsafe fn put(&self, range: &Range<u64>, to: *mut u8) {
+        let first = self.spans.partition_point(|it| it.end() <= range.start);
+        for span in &self.spans[first..] {
+            if span.at >= range.end {
+                break;
+            }
+            let bytes = self.bytes(span);
+            let (from, until) = (span.at.max(range.start), span.end().min(range.end));
+            let part = &bytes[(from - span.at) as usize..(until - span.at) as usize];
+            // SAFETY: `from..until` is within `range`, which `to` stands for (the caller's).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    part.as_ptr(),
+                    to.add((from - range.start) as usize),
+                    part.len(),
+                )
+            };
+            let lowest = span.at.max(from.saturating_sub(7));
+            let first = self.rebase.partition_point(|it| *it < lowest);
+            for &field in self.rebase[first..].iter().take_while(|it| **it < until) {
+                let value = le64(&bytes[(field - span.at) as usize..])
+                    .wrapping_add(self.slide)
+                    .to_le_bytes();
+                let (start, end) = (field.max(from), (field + 8).min(until));
+                let part = &value[(start - field) as usize..(end - field) as usize];
+                // SAFETY: as above: `start..end` is within `range`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        part.as_ptr(),
+                        to.add((start - range.start) as usize),
+                        part.len(),
+                    )
+                };
+            }
+        }
+    }
+
+    /// Writes every span where it goes.
+    ///
+    /// # Safety
+    ///
+    /// Every span's memory is writable, and nothing else reads or writes it while this runs.
+    pub(crate) unsafe fn put_in_place(&self) {
+        for span in self.spans {
+            // SAFETY: the caller's.
+            unsafe { self.put(&span.range(), span.at as *mut u8) };
+        }
+    }
+}
+
 /// What a platform does to the memory of a running image. Every address is in memory
 /// (slid), and the switch has checked each is where the descriptor allows.
 pub(crate) trait Memory {
@@ -125,10 +233,10 @@ pub(crate) trait Memory {
     /// Whether the unwinder takes Windows `RUNTIME_FUNCTION`s.
     const SEH: bool;
     /// Writes into the patch code region and makes it runnable again.
-    fn code(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String>;
+    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String>;
     /// Writes data anywhere in the image, making read-only pages writable for the write and
     /// back.
-    fn data(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String>;
+    fn data(&mut self, writes: &Writes<'_>) -> Result<(), String>;
     /// Registers with the unwinder what [`Memory::DWARF`] says it takes, at each address.
     fn frames(&mut self, starts: &[u64]) -> Result<(), String>;
     /// Adds `RUNTIME_FUNCTION`s (begin, end, unwind information).
@@ -138,41 +246,104 @@ pub(crate) trait Memory {
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String>;
 }
 
-enum Table {
-    /// The table the loader slid, in the image.
-    Image(u64),
-    Own(Box<[u64]>),
+/// Every generation the program ran, by index (0 the one it started at), in columns: 29 bytes
+/// each, 20 per cell its patch set and 16 per write of code. Lookups by index are direct.
+struct Log {
+    number: Vec<u64>,
+    /// The generation it was applied on; its own index for the first.
+    parent: Vec<u32>,
+    depth: Vec<u32>,
+    /// Whether it is kept to roll back to.
+    kept: Vec<bool>,
+    /// Generation `g`'s cells are `cells[g]..cells[g + 1]` of `slot`, `new` and `old`.
+    cells: Vec<u32>,
+    slot: Vec<u32>,
+    /// A slot's target in memory in the generation, and in its parent.
+    new: Vec<u64>,
+    old: Vec<u64>,
+    /// Generation `g`'s code is `code_at[g]..code_at[g + 1]` of `code`, in memory.
+    code_at: Vec<u32>,
+    code: Vec<Range<u64>>,
 }
 
-impl Table {
-    fn address(&self) -> u64 {
-        match self {
-            Table::Image(address) => *address,
-            Table::Own(table) => table.as_ptr() as u64,
+impl Log {
+    fn new(number: u64) -> Log {
+        Log {
+            number: vec![number],
+            parent: vec![0],
+            depth: vec![0],
+            kept: vec![true],
+            cells: vec![0, 0],
+            slot: Vec::new(),
+            new: Vec::new(),
+            old: Vec::new(),
+            code_at: vec![0, 0],
+            code: Vec::new(),
         }
+    }
+
+    fn cells(&self, generation: u32) -> Range<usize> {
+        let g = generation as usize;
+        self.cells[g] as usize..self.cells[g + 1] as usize
+    }
+
+    fn code(&self, generation: u32) -> &[Range<u64>] {
+        let g = generation as usize;
+        &self.code[self.code_at[g] as usize..self.code_at[g + 1] as usize]
+    }
+
+    /// Ends a generation whose cells and code were pushed after the last one's; its index.
+    fn finish(&mut self, number: u64, parent: u32) -> u32 {
+        let generation = self.number.len() as u32;
+        self.number.push(number);
+        self.parent.push(parent);
+        self.depth.push(self.depth[parent as usize] + 1);
+        self.kept.push(false);
+        self.cells.push(self.slot.len() as u32);
+        self.code_at.push(self.code.len() as u32);
+        generation
     }
 }
 
-struct Generation {
-    number: u64,
-    /// The generation it was applied on; its own number for the one the program started at.
-    base: u64,
-    table: Table,
-    /// The code it added, as linked.
-    code: Vec<Range<u64>>,
+/// A table of the switch's own: the generation whose slots it holds, and the count of
+/// publishes when the cell last pointed at it.
+struct Pooled {
+    table: Box<[AtomicU64]>,
+    holds: u32,
+    at: u64,
+}
+
+/// Buffers a patch is checked and written with, kept from one to the next.
+#[derive(Default)]
+struct Scratch {
+    code: Vec<Span>,
+    data: Vec<Span>,
+    rebase: Vec<u64>,
+    slots: Vec<u32>,
+    fdes: Vec<(u64, u64)>,
+    starts: Vec<u64>,
+    functions: Vec<(u64, u64, u64)>,
+    lineage: Vec<u32>,
+    dropped: Vec<u32>,
+    path: Vec<u32>,
 }
 
 /// The generations of a running image and which one its table cell points at.
 pub(crate) struct Switch<M: Memory> {
     pub(crate) memory: M,
     layout: Layout,
-    current: u64,
-    /// The oldest applied first.
-    kept: Vec<Generation>,
-    /// Tables no generation has any more, with the count of tables published when they were
-    /// let go of: each is freed once [`KEPT`] more have been.
-    retired: VecDeque<(u64, Box<[u64]>)>,
+    /// The generation the cell points at.
+    current: u32,
+    log: Log,
+    /// The generations kept, the oldest applied first.
+    kept: Vec<u32>,
+    /// The loader's table, which holds generation 0.
+    image: u64,
+    pool: Vec<Pooled>,
+    /// The table the cell points at: the image's, or one of the pool.
+    on: Option<usize>,
     published: u64,
+    scratch: Scratch,
 }
 
 impl<M: Memory> Switch<M> {
@@ -184,32 +355,34 @@ impl<M: Memory> Switch<M> {
         if table == 0 || !table.is_multiple_of(8) {
             return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
         }
-        let start = layout.generation;
+        let log = Log::new(layout.generation);
         Ok(Switch {
             memory,
             layout,
-            current: start,
-            kept: vec![Generation {
-                number: start,
-                base: start,
-                table: Table::Image(table),
-                code: Vec::new(),
-            }],
-            retired: VecDeque::new(),
+            current: 0,
+            log,
+            kept: vec![0],
+            image: table,
+            pool: Vec::with_capacity(POOL),
+            on: None,
             published: 0,
+            scratch: Scratch::default(),
         })
     }
 
     pub(crate) fn current(&self) -> u64 {
-        self.current
+        self.log.number[self.current as usize]
     }
 
     /// Takes one message: what became of it, and what to answer the linker, if anything.
-    pub(crate) fn handle(&mut self, message: Message) -> (Outcome, Option<Answer>) {
-        match message {
-            Message::Patch(patch) => {
+    pub(crate) fn take(&mut self, message: &MessageView<'_>) -> (Outcome, Option<Answer>) {
+        match *message {
+            MessageView::Patch(patch) => {
                 let generation = patch.generation;
-                match self.apply(&patch) {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                let applied = self.apply(patch, &mut scratch);
+                self.scratch = scratch;
+                match applied {
                     Ok(()) => (
                         Outcome::Applied {
                             generation,
@@ -221,11 +394,11 @@ impl<M: Memory> Switch<M> {
                     Err(why) => declined(generation, why),
                 }
             }
-            Message::RollBack { id, to } => {
+            MessageView::RollBack { id, to } => {
                 if let Err(why) = self.ours(&id) {
                     return declined(to, why);
                 }
-                let from = self.current;
+                let from = self.current();
                 match self.roll_back(to) {
                     Ok(()) => {
                         let why = "the linker took it back".to_owned();
@@ -237,11 +410,19 @@ impl<M: Memory> Switch<M> {
                     Err(why) => declined(to, why),
                 }
             }
-            Message::Restart { id, generation, why } => match self.ours(&id) {
-                Ok(()) => (Outcome::Restart { generation, why }, None),
+            MessageView::Restart { id, generation, why } => match self.ours(&id) {
+                Ok(()) => (Outcome::Restart { generation, why: why.to_owned() }, None),
                 Err(other) => declined(generation, other),
             },
         }
+    }
+
+    /// [`Switch::take`] of an owned message, as the linker writes it.
+    #[cfg(test)]
+    pub(crate) fn handle(&mut self, message: crate::patch::Message) -> (Outcome, Option<Answer>) {
+        let bytes = message.encode();
+        let view = crate::patch::Message::view(&bytes).expect("an encoded message reads back");
+        self.take(&view)
     }
 
     fn ours(&self, id: &[u8; 16]) -> Result<(), String> {
@@ -252,33 +433,32 @@ impl<M: Memory> Switch<M> {
         }
     }
 
-    fn find(&self, number: u64) -> Option<&Generation> {
-        self.kept.iter().find(|it| it.number == number)
+    /// The kept generation numbered `number`.
+    fn find(&self, number: u64) -> Option<u32> {
+        self.kept.iter().copied().find(|&it| self.log.number[it as usize] == number)
     }
 
     /// The current generation and the kept ones it was applied on, down to the first or the
     /// first no longer kept.
-    fn lineage(&self) -> Vec<u64> {
-        let mut lineage = Vec::new();
-        let mut at = self.current;
-        while let Some(generation) = self.find(at) {
-            lineage.push(at);
-            if generation.base >= generation.number {
-                break;
-            }
-            at = generation.base;
-        }
-        lineage
+    fn lineage(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut at = Some(self.current);
+        std::iter::from_fn(move || {
+            let generation = at.filter(|it| self.log.kept[*it as usize])?;
+            let parent = self.log.parent[generation as usize];
+            at = (parent != generation).then_some(parent);
+            Some(generation)
+        })
     }
 
     /// Checks the whole patch, then writes it and switches the table to it. A patch that
     /// fails a check leaves the program as it was.
-    fn apply(&mut self, patch: &Patch) -> Result<(), String> {
+    fn apply(&mut self, patch: PatchView<'_>, s: &mut Scratch) -> Result<(), String> {
         self.ours(&patch.id)?;
-        if patch.base != self.current {
+        let current = self.current();
+        if patch.base != current {
             return Err(format!(
-                "a patch on generation {}, where this program is at {}",
-                patch.base, self.current
+                "a patch on generation {}, where this program is at {current}",
+                patch.base
             ));
         }
         if patch.generation <= patch.base {
@@ -291,233 +471,299 @@ impl<M: Memory> Switch<M> {
             return Err(format!("generation {} was applied already", patch.generation));
         }
         let layout = &self.layout;
-        let code_ranges: Vec<Range<u64>> = patch
-            .code
-            .iter()
-            .map(|(at, bytes)| span(*at, bytes.len()))
-            .collect::<Result<_, _>>()?;
-        for range in &code_ranges {
-            if !inside(range, &layout.code) {
+        let slide = layout.slide;
+        let message = patch.message;
+        s.code.clear();
+        for (at, bytes) in patch.code {
+            let range = span(at, bytes.len())?;
+            if !inside(&range, &layout.code) {
                 return Err(format!(
                     "code at {:#x}..{:#x}, outside the patch code region {:#x}..{:#x}",
                     range.start, range.end, layout.code.start, layout.code.end
                 ));
             }
+            if !bytes.is_empty() {
+                s.code.push(place(message, at, bytes, slide)?);
+            }
         }
-        let data_ranges: Vec<Range<u64>> = patch
-            .data
-            .iter()
-            .map(|(at, bytes)| span(*at, bytes.len()))
-            .collect::<Result<_, _>>()?;
-        let cell = layout.table..layout.table + 8;
-        for range in &data_ranges {
-            if overlap(range, &layout.code) {
+        let cell = layout.table..layout.table.saturating_add(8);
+        s.data.clear();
+        for (at, bytes) in patch.data {
+            let range = span(at, bytes.len())?;
+            if overlap(&range, &layout.code) {
                 return Err(format!(
                     "data at {:#x}..{:#x}, in the patch code region",
                     range.start, range.end
                 ));
             }
-            if overlap(range, &cell) {
+            if overlap(&range, &cell) {
                 return Err(format!("data over the jump table's cell at {:#x}", cell.start));
             }
-        }
-        let mut all: Vec<Range<u64>> =
-            code_ranges.iter().chain(&data_ranges).filter(|it| !it.is_empty()).cloned().collect();
-        all.sort_by_key(|it| it.start);
-        for pair in all.windows(2) {
-            if pair[1].start < pair[0].end {
-                return Err(format!("two writes at {:#x}", pair[1].start));
+            if !bytes.is_empty() {
+                s.data.push(place(message, at, bytes, slide)?);
             }
         }
-        let lineage = self.lineage();
-        for generation in self.kept.iter().filter(|it| lineage.contains(&it.number)) {
-            for range in &generation.code {
-                if code_ranges.iter().any(|it| overlap(it, range)) {
-                    return Err(format!(
-                        "code over generation {}'s at {:#x}..{:#x}, which the program can be \
-                         running",
-                        generation.number, range.start, range.end
-                    ));
-                }
+        // Code is inside the code region and data outside it, so only writes of one kind can
+        // overlap.
+        for spans in [&mut s.code, &mut s.data] {
+            spans.sort_unstable_by_key(|it| it.at);
+            if let Some(pair) = spans.windows(2).find(|it| it[1].at < it[0].end()) {
+                return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
             }
         }
-        let mut slots = HashSet::new();
-        for &(slot, _) in &patch.cells {
+        s.lineage.clear();
+        s.lineage.extend(self.lineage());
+        for &generation in &s.lineage {
+            if let Some(range) = self.log.code(generation).iter().find(|it| hits(&s.code, it)) {
+                return Err(format!(
+                    "code over generation {}'s at {:#x}..{:#x}, which the program can be running",
+                    self.log.number[generation as usize],
+                    range.start.wrapping_sub(slide),
+                    range.end.wrapping_sub(slide)
+                ));
+            }
+        }
+        s.slots.clear();
+        for (slot, _) in patch.cells() {
             if u64::from(slot) >= layout.slots {
                 return Err(format!("slot {slot}, where the table has {}", layout.slots));
             }
-            if !slots.insert(slot) {
-                return Err(format!("slot {slot} set twice"));
+            s.slots.push(slot);
+        }
+        s.slots.sort_unstable();
+        if let Some(pair) = s.slots.windows(2).find(|it| it[0] == it[1]) {
+            return Err(format!("slot {} set twice", pair[0]));
+        }
+        s.rebase.clear();
+        s.rebase.extend(patch.rebase().map(|it| it.wrapping_add(slide)));
+        s.rebase.sort_unstable();
+        if let Some(pair) = s.rebase.windows(2).find(|it| it[0] == it[1]) {
+            return Err(format!(
+                "the address at {:#x} rebased twice",
+                pair[0].wrapping_sub(slide)
+            ));
+        }
+        for &at in &s.rebase {
+            if find(message, &s.code, at, 8).is_none() && find(message, &s.data, at, 8).is_none() {
+                return Err(format!(
+                    "an address to rebase at {:#x}, in none of the patch's writes",
+                    at.wrapping_sub(slide)
+                ));
             }
         }
-
-        let mut code = patch.code.clone();
-        let mut data = patch.data.clone();
-        let mut rebased = HashSet::new();
-        for &at in &patch.rebase {
-            if !rebased.insert(at) {
-                return Err(format!("the address at {at:#x} rebased twice"));
-            }
-            let field = match find_mut(&mut code, at, 8) {
-                Some(field) => field,
-                None => find_mut(&mut data, at, 8).ok_or_else(|| {
-                    format!("an address to rebase at {at:#x}, in none of the patch's writes")
-                })?,
-            };
-            let mut value = [0; 8];
-            value.copy_from_slice(field);
-            let value = u64::from_le_bytes(value).wrapping_add(layout.slide);
-            field.copy_from_slice(&value.to_le_bytes());
-        }
-        let frames = frames::<M>(patch, &code, &data)?;
-        if !patch.windows.is_empty() && !M::SEH {
+        frames::<M>(patch, message, &s.code, &s.data, slide, &mut s.fdes, &mut s.starts)?;
+        if patch.windows().len() != 0 && !M::SEH {
             return Err("RUNTIME_FUNCTIONs, which this platform's unwinder doesn't take".to_owned());
         }
-        for &(begin, end, unwind) in &patch.windows {
-            if begin >= end || !code_ranges.iter().any(|it| inside(&(begin..end), it)) {
+        s.functions.clear();
+        for (begin, end, unwind) in patch.windows() {
+            let (slid_begin, slid_unwind) = (begin.wrapping_add(slide), unwind.wrapping_add(slide));
+            if begin >= end || find(message, &s.code, slid_begin, end - begin).is_none() {
                 return Err(format!("a RUNTIME_FUNCTION of {begin:#x}..{end:#x}, not in the code"));
             }
-            if !all.iter().any(|it| inside(&(unwind..unwind.saturating_add(4)), it)) {
+            if find(message, &s.code, slid_unwind, 4)
+                .or_else(|| find(message, &s.data, slid_unwind, 4))
+                .is_none()
+            {
                 return Err(format!("unwind information at {unwind:#x}, in none of the writes"));
             }
+            s.functions.push((slid_begin, end.wrapping_add(slide), slid_unwind));
+        }
+        let cells = patch.cells();
+        if u32::try_from(self.log.slot.len() + cells.len()).is_err()
+            || u32::try_from(self.log.code.len() + s.code.len()).is_err()
+            || u32::try_from(self.log.number.len()).is_err()
+        {
+            return Err("more generations, cells or code than this program counts".to_owned());
         }
 
         // What was rolled back and this overwrites can't be gone back to, nor what was
-        // applied on it.
-        let mut dropped: Vec<u64> = self
-            .kept
-            .iter()
-            .filter(|it| !lineage.contains(&it.number))
-            .filter(|it| it.code.iter().any(|old| code_ranges.iter().any(|new| overlap(new, old))))
-            .map(|it| it.number)
-            .collect();
-        loop {
-            let more: Vec<u64> = self
-                .kept
-                .iter()
-                .filter(|it| it.base < it.number && dropped.contains(&it.base))
-                .filter(|it| !dropped.contains(&it.number))
-                .map(|it| it.number)
-                .collect();
-            if more.is_empty() {
-                break;
+        // applied on it. Kept generations are in the order applied, a parent before its
+        // children, so one pass finds the descendants too.
+        s.dropped.clear();
+        for &generation in &self.kept {
+            if s.lineage.contains(&generation) {
+                continue;
             }
-            dropped.extend(more);
+            let parent = self.log.parent[generation as usize];
+            if self.log.code(generation).iter().any(|it| hits(&s.code, it))
+                || (parent != generation && s.dropped.contains(&parent))
+            {
+                s.dropped.push(generation);
+            }
         }
-        for number in dropped {
-            self.forget(number);
+        for &generation in &s.dropped {
+            self.forget(generation);
         }
 
-        let slide = self.layout.slide;
-        let slid = |writes: Vec<(u64, Vec<u8>)>| -> Vec<(u64, Vec<u8>)> {
-            writes.into_iter().map(|(at, bytes)| (at.wrapping_add(slide), bytes)).collect()
-        };
-        self.memory.code(&slid(code))?;
-        self.memory.data(&slid(data))?;
-        let frames: Vec<u64> = frames.iter().map(|it| it.wrapping_add(slide)).collect();
-        self.memory.frames(&frames)?;
-        let functions: Vec<(u64, u64, u64)> = patch
-            .windows
-            .iter()
-            .map(|&(begin, end, unwind)| {
-                (begin.wrapping_add(slide), end.wrapping_add(slide), unwind.wrapping_add(slide))
-            })
-            .collect();
-        self.memory.functions(&functions)?;
+        let rebase = &s.rebase;
+        self.memory.code(&Writes { message, spans: &s.code, rebase, slide })?;
+        self.memory.data(&Writes { message, spans: &s.data, rebase, slide })?;
+        self.memory.frames(&s.starts)?;
+        self.memory.functions(&s.functions)?;
 
-        let mut table: Box<[u64]> = self.entries(self.current).into();
-        for &(slot, target) in &patch.cells {
-            table[slot as usize] = target.wrapping_add(slide);
+        for (slot, target) in cells {
+            let old = self.value(slot);
+            self.log.slot.push(slot);
+            self.log.new.push(target.wrapping_add(slide));
+            self.log.old.push(old);
         }
-        if let Err(why) = self.publish(table.as_ptr() as u64) {
-            // The cell may point at it: it is never freed.
-            Box::leak(table);
-            return Err(why);
-        }
-        self.kept.push(Generation {
-            number: patch.generation,
-            base: patch.base,
-            table: Table::Own(table),
-            code: code_ranges,
-        });
-        self.current = patch.generation;
+        self.log.code.extend(s.code.iter().map(Span::range));
+        let generation = self.log.finish(patch.generation, self.current);
+        let at = self.standby(generation, &mut s.path);
+        self.publish(Some(at))?;
+        self.log.kept[generation as usize] = true;
+        self.kept.push(generation);
+        self.current = generation;
         while self.kept.len() > KEPT {
-            let Some(oldest) = self.kept.iter().position(|it| it.number != self.current) else {
+            let Some(oldest) = self.kept.iter().position(|it| *it != self.current) else {
                 break;
             };
-            let generation = self.kept.remove(oldest);
-            self.retire(generation.table);
+            let evicted = self.kept.remove(oldest);
+            self.log.kept[evicted as usize] = false;
         }
         Ok(())
     }
 
-    /// The entries of the table of a kept generation.
-    fn entries(&self, number: u64) -> &[u64] {
-        let slots = self.layout.slots as usize;
-        match self.find(number).map(|it| &it.table) {
-            Some(Table::Own(table)) => table,
+    /// The target of `slot` in the table the cell points at.
+    fn value(&self, slot: u32) -> u64 {
+        match self.on {
             // SAFETY: the loader's table, which the cell pointed at when the program started:
-            // `slots` code addresses (the descriptor's count), 8-aligned (`Switch::new`
-            // checked), in the image, mapped as long as it is. Nothing writes it.
-            Some(Table::Image(address)) => unsafe {
-                std::slice::from_raw_parts(*address as *const u64, slots)
-            },
-            None => &[],
+            // `slots` code addresses (the descriptor's count, which `slot` is below), 8-aligned
+            // (`Switch::new` checked), in the image, mapped as long as it is. Nothing writes it.
+            None => unsafe { (self.image as *const u64).add(slot as usize).read() },
+            Some(at) => self.pool[at].table[slot as usize].load(Ordering::Relaxed),
         }
+    }
+
+    /// A table of the pool brought to `target`: one holding it already, a new one while the
+    /// pool isn't full, else the one the cell left longest ago.
+    fn standby(&mut self, target: u32, path: &mut Vec<u32>) -> usize {
+        if let Some(at) = self.pool.iter().position(|it| it.holds == target) {
+            return at;
+        }
+        let at = if self.pool.len() < POOL {
+            let table: Box<[AtomicU64]> = match self.on {
+                None => {
+                    let slots = self.layout.slots as usize;
+                    // SAFETY: as in `value`: the loader's table of `slots` entries.
+                    let image = unsafe { std::slice::from_raw_parts(self.image as *const u64, slots) };
+                    image.iter().map(|it| AtomicU64::new(*it)).collect()
+                }
+                Some(on) => {
+                    let table = &self.pool[on].table;
+                    table.iter().map(|it| AtomicU64::new(it.load(Ordering::Relaxed))).collect()
+                }
+            };
+            self.pool.push(Pooled { table, holds: self.current, at: self.published });
+            self.pool.len() - 1
+        } else {
+            (0..self.pool.len())
+                .filter(|it| Some(*it) != self.on)
+                .min_by_key(|it| self.pool[*it].at)
+                .expect("a pool of more than one table")
+        };
+        self.retarget(at, target, path);
+        at
+    }
+
+    /// Brings the pool's table `at` from the generation it holds to `to`: the generations
+    /// from the one it holds down to where the two meet are undone, the newest first, and
+    /// those from there up to `to` redone, the oldest first. Each slot is one relaxed store,
+    /// which the release store of the cell publishes.
+    fn retarget(&mut self, at: usize, to: u32, path: &mut Vec<u32>) {
+        let log = &self.log;
+        let table = &self.pool[at].table;
+        let undo = |generation: u32| {
+            for cell in log.cells(generation) {
+                table[log.slot[cell] as usize].store(log.old[cell], Ordering::Relaxed);
+            }
+        };
+        let depth = |generation: u32| log.depth[generation as usize];
+        let parent = |generation: u32| log.parent[generation as usize];
+        let (mut from, mut onto) = (self.pool[at].holds, to);
+        path.clear();
+        while depth(from) > depth(onto) {
+            undo(from);
+            from = parent(from);
+        }
+        while depth(onto) > depth(from) {
+            path.push(onto);
+            onto = parent(onto);
+        }
+        while from != onto {
+            undo(from);
+            from = parent(from);
+            path.push(onto);
+            onto = parent(onto);
+        }
+        for &generation in path.iter().rev() {
+            for cell in log.cells(generation) {
+                table[log.slot[cell] as usize].store(log.new[cell], Ordering::Relaxed);
+            }
+        }
+        self.pool[at].holds = to;
+    }
+
+    /// Points the cell at the image's table (`None`) or the pool's table `on`.
+    fn publish(&mut self, on: Option<usize>) -> Result<(), String> {
+        let table = match on {
+            None => self.image,
+            Some(at) => self.pool[at].table.as_ptr() as u64,
+        };
+        let stored = self.memory.publish(self.layout.cell(), table);
+        self.published += 1;
+        if let Some(at) = on {
+            // After a failed store the cell may point at it: as the one used last, it is the
+            // last of the pool to be written again.
+            self.pool[at].at = self.published;
+        }
+        stored?;
+        self.on = on;
+        Ok(())
     }
 
     /// Points the cell at the table of `to`, a kept generation.
     pub(crate) fn roll_back(&mut self, to: u64) -> Result<(), String> {
-        let Some(table) = self.find(to).map(|it| it.table.address()) else {
-            let kept: Vec<String> = self.kept.iter().map(|it| it.number.to_string()).collect();
+        let Some(target) = self.find(to) else {
+            let kept: Vec<String> =
+                self.kept.iter().map(|it| self.log.number[*it as usize].to_string()).collect();
             return Err(format!("generation {to} is not kept; kept are {}", kept.join(", ")));
         };
-        if to == self.current {
+        if target == self.current {
             return Ok(());
         }
-        self.publish(table)?;
-        self.current = to;
+        let on = if target == 0 {
+            None
+        } else {
+            let mut path = std::mem::take(&mut self.scratch.path);
+            let at = self.standby(target, &mut path);
+            self.scratch.path = path;
+            Some(at)
+        };
+        self.publish(on)?;
+        self.current = target;
         Ok(())
     }
 
-    fn publish(&mut self, table: u64) -> Result<(), String> {
-        self.memory.publish(self.layout.cell(), table)?;
-        self.published += 1;
-        while self.retired.front().is_some_and(|(at, _)| self.published >= at + KEPT as u64) {
-            // SAFETY of the free: a call loads the cell and then one slot of the table it
-            // found, a few instructions apart. This table left the cell at least `KEPT`
-            // publishes ago, each in a separate `poll` or `guard` of the program's.
-            self.retired.pop_front();
-        }
-        Ok(())
-    }
-
-    fn forget(&mut self, number: u64) {
-        if let Some(at) = self.kept.iter().position(|it| it.number == number) {
-            let generation = self.kept.remove(at);
-            self.retire(generation.table);
-        }
-    }
-
-    fn retire(&mut self, table: Table) {
-        if let Table::Own(table) = table {
-            self.retired.push_back((self.published, table));
+    fn forget(&mut self, generation: u32) {
+        if let Some(at) = self.kept.iter().position(|it| *it == generation) {
+            self.kept.remove(at);
+            self.log.kept[generation as usize] = false;
         }
     }
 
     /// The newest generation of the current lineage with code at one of `pcs` (in memory),
     /// and its base, when that is kept to go back to.
     pub(crate) fn tie(&self, pcs: &[u64]) -> Option<(u64, u64)> {
-        let slide = self.layout.slide;
+        let log = &self.log;
         self.lineage()
-            .into_iter()
-            .filter_map(|number| self.find(number))
-            .filter(|it| it.base < it.number && self.find(it.base).is_some())
             .filter(|it| {
-                let unslid = |pc: &u64| pc.wrapping_sub(slide);
-                it.code.iter().any(|range| pcs.iter().any(|pc| range.contains(&unslid(pc))))
+                let parent = log.parent[*it as usize];
+                parent != *it && log.kept[parent as usize]
             })
-            .map(|it| (it.number, it.base))
+            .filter(|it| log.code(*it).iter().any(|range| pcs.iter().any(|pc| range.contains(pc))))
+            .map(|it| (log.number[it as usize], log.number[log.parent[it as usize] as usize]))
             .max()
     }
 
@@ -548,25 +794,32 @@ impl<M: Memory> Switch<M> {
 
     #[cfg(test)]
     pub(crate) fn kept(&self) -> Vec<u64> {
-        self.kept.iter().map(|it| it.number).collect()
+        self.kept.iter().map(|it| self.log.number[*it as usize]).collect()
     }
 
+    /// How many tables of its own the switch has.
     #[cfg(test)]
-    pub(crate) fn retired(&self) -> usize {
-        self.retired.len()
+    pub(crate) fn pooled(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// The address of the table of the generation numbered `number`, if one holds it.
+    #[cfg(test)]
+    pub(crate) fn table_of(&self, number: u64) -> Option<u64> {
+        let generation = self.find(number)?;
+        if generation == 0 {
+            return Some(self.image);
+        }
+        let at = self.pool.iter().position(|it| it.holds == generation)?;
+        Some(self.pool[at].table.as_ptr() as u64)
     }
 }
 
 impl<M: Memory> Drop for Switch<M> {
     fn drop(&mut self) {
         // The cell points at one of them and calls keep going through it: none is freed.
-        for generation in self.kept.drain(..) {
-            if let Table::Own(table) = generation.table {
-                Box::leak(table);
-            }
-        }
-        for (_, table) in self.retired.drain(..) {
-            Box::leak(table);
+        for pooled in self.pool.drain(..) {
+            Box::leak(pooled.table);
         }
     }
 }
@@ -575,52 +828,68 @@ fn declined(generation: u64, why: String) -> (Outcome, Option<Answer>) {
     (Outcome::Declined { generation, why: why.clone() }, Some(Answer::Declined { generation, why }))
 }
 
-/// Checks the FDEs of `patch` against the bytes it writes (`code` and `data`, as linked) and
-/// says what to register at: each FDE, or the start of each run of entries that ends in a
-/// zero length.
+/// The span of `bytes`, a slice of `message`, written at `at` as linked.
+fn place(message: &[u8], at: u64, bytes: &[u8], slide: u64) -> Result<Span, String> {
+    let slid = at.wrapping_add(slide);
+    if slid.checked_add(bytes.len() as u64).is_none() {
+        return Err(format!("a write at {at:#x} of {} bytes, past the end of memory", bytes.len()));
+    }
+    let from = bytes.as_ptr() as usize - message.as_ptr() as usize;
+    Ok(Span { at: slid, from, len: bytes.len() })
+}
+
+/// Checks the FDEs of `patch` against the bytes it writes (`code` and `data`) and puts in
+/// `starts` what to register at, in memory: each FDE, or the start of each run of entries
+/// that ends in a zero length.
 fn frames<M: Memory>(
-    patch: &Patch,
-    code: &[(u64, Vec<u8>)],
-    data: &[(u64, Vec<u8>)],
-) -> Result<Vec<u64>, String> {
-    if patch.frames.is_empty() {
-        return Ok(Vec::new());
+    patch: PatchView<'_>,
+    message: &[u8],
+    code: &[Span],
+    data: &[Span],
+    slide: u64,
+    fdes: &mut Vec<(u64, u64)>,
+    starts: &mut Vec<u64>,
+) -> Result<(), String> {
+    fdes.clear();
+    starts.clear();
+    if patch.frames().len() == 0 {
+        return Ok(());
     }
     if M::DWARF == Dwarf::Not {
         return Err("DWARF unwind entries, which this platform's unwinder doesn't take".to_owned());
     }
-    let bytes = |at: u64, len: u64| find(code, at, len).or_else(|| find(data, at, len));
+    let linked = |at: u64| at.wrapping_sub(slide);
+    let bytes = |at: u64, len: u64| find(message, code, at, len).or_else(|| find(message, data, at, len));
     let length = |at: u64| -> Result<u32, String> {
         let field = bytes(at, 4).ok_or_else(|| {
-            format!("unwind entries reach {at:#x}, in none of the patch's writes")
+            format!("unwind entries reach {:#x}, in none of the patch's writes", linked(at))
         })?;
-        let mut value = [0; 4];
-        value.copy_from_slice(field);
-        Ok(u32::from_le_bytes(value))
+        Ok(le32(field))
     };
-    let mut fdes = patch.frames.clone();
+    fdes.extend(patch.frames().map(|(at, len)| (at.wrapping_add(slide), len)));
     fdes.sort_unstable();
-    for pair in fdes.windows(2) {
-        if pair[1].0 < pair[0].0.saturating_add(pair[0].1) {
-            return Err(format!("two unwind entries at {:#x}", pair[1].0));
-        }
+    if let Some(pair) = fdes.windows(2).find(|it| it[1].0 < it[0].0.saturating_add(it[0].1)) {
+        return Err(format!("two unwind entries at {:#x}", linked(pair[1].0)));
     }
-    for &(at, len) in &fdes {
+    for &(at, len) in fdes.iter() {
         let field = length(at)?;
         if field == 0 || field == u32::MAX || u64::from(field) + 4 != len {
             return Err(format!(
-                "the unwind entry at {at:#x} is {len} bytes by the patch, and its length says {}",
+                "the unwind entry at {:#x} is {len} bytes by the patch, and its length says {}",
+                linked(at),
                 u64::from(field) + 4
             ));
         }
         if bytes(at, len).is_none() {
-            return Err(format!("the unwind entry at {at:#x} runs past the patch's writes"));
+            return Err(format!(
+                "the unwind entry at {:#x} runs past the patch's writes",
+                linked(at)
+            ));
         }
     }
     match M::DWARF {
-        Dwarf::Entries | Dwarf::Not => Ok(fdes.iter().map(|it| it.0).collect()),
+        Dwarf::Entries | Dwarf::Not => starts.extend(fdes.iter().map(|it| it.0)),
         Dwarf::Sections => {
-            let mut starts = Vec::new();
             let mut next = 0;
             while next < fdes.len() {
                 let start = fdes[next].0;
@@ -631,42 +900,40 @@ fn frames<M: Memory>(
                         break;
                     }
                     if field == u32::MAX {
-                        return Err(format!("a 64-bit unwind entry at {at:#x}"));
+                        return Err(format!("a 64-bit unwind entry at {:#x}", linked(at)));
                     }
                     if next < fdes.len() && fdes[next].0 == at {
                         next += 1;
                     } else if next < fdes.len() && fdes[next].0 < at {
                         return Err(format!(
                             "the unwind entry at {:#x} is not where the entries before it end",
-                            fdes[next].0
+                            linked(fdes[next].0)
                         ));
                     }
-                    at = at
-                        .checked_add(4 + u64::from(field))
-                        .ok_or_else(|| format!("unwind entries from {start:#x} overflow"))?;
+                    at = at.checked_add(4 + u64::from(field)).ok_or_else(|| {
+                        format!("unwind entries from {:#x} overflow", linked(start))
+                    })?;
                 }
                 starts.push(start);
             }
-            Ok(starts)
         }
     }
+    Ok(())
 }
 
-/// The `len` bytes at `at` of whichever of `writes` has all of them.
-fn find(writes: &[(u64, Vec<u8>)], at: u64, len: u64) -> Option<&[u8]> {
-    writes.iter().find_map(|(start, bytes)| {
-        let offset = at.checked_sub(*start)?;
-        let end = offset.checked_add(len)?;
-        (end <= bytes.len() as u64).then(|| &bytes[offset as usize..end as usize])
-    })
+/// The `len` bytes at `at` of whichever of `spans` (sorted) has all of them: a binary search.
+fn find<'m>(message: &'m [u8], spans: &[Span], at: u64, len: u64) -> Option<&'m [u8]> {
+    let span = spans.get(spans.partition_point(|it| it.end() <= at))?;
+    let offset = at.checked_sub(span.at)?;
+    let end = offset.checked_add(len)?;
+    (end <= span.len as u64).then(|| &message[span.from + offset as usize..span.from + end as usize])
 }
 
-fn find_mut(writes: &mut [(u64, Vec<u8>)], at: u64, len: u64) -> Option<&mut [u8]> {
-    writes.iter_mut().find_map(|(start, bytes)| {
-        let offset = at.checked_sub(*start)?;
-        let end = offset.checked_add(len)?;
-        (end <= bytes.len() as u64).then(|| &mut bytes[offset as usize..end as usize])
-    })
+/// Whether any of `spans` (sorted, not overlapping) overlaps `range`: a binary search.
+fn hits(spans: &[Span], range: &Range<u64>) -> bool {
+    spans
+        .get(spans.partition_point(|it| it.end() <= range.start))
+        .is_some_and(|it| it.at < range.end)
 }
 
 fn span(at: u64, len: usize) -> Result<Range<u64>, String> {
@@ -681,6 +948,18 @@ fn inside(range: &Range<u64>, region: &Range<u64>) -> bool {
 
 fn overlap(a: &Range<u64>, b: &Range<u64>) -> bool {
     a.start < b.end && b.start < a.end
+}
+
+fn le32(bytes: &[u8]) -> u32 {
+    let mut value = [0; 4];
+    value.copy_from_slice(&bytes[..4]);
+    u32::from_le_bytes(value)
+}
+
+fn le64(bytes: &[u8]) -> u64 {
+    let mut value = [0; 8];
+    value.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(value)
 }
 
 fn hex(bytes: &[u8]) -> String {

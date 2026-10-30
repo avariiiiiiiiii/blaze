@@ -293,7 +293,7 @@ fn trie_finds_every_export() {
     assert_eq!(trie_lookup(&trie, b"_"), None);
     let mut twice = vec![(b"_a".to_vec(), 0, 1), (b"_a".to_vec(), 0, 2)];
     assert!(linkedit::trie(&mut twice).is_err());
-    assert!(linkedit::trie(&mut Vec::new()).unwrap().is_empty());
+    assert!(linkedit::trie(&mut Vec::<(Vec<u8>, u64, u64)>::new()).unwrap().is_empty());
 }
 
 #[test]
@@ -321,10 +321,10 @@ fn rebases_in_runs() {
 
 #[test]
 fn binds_decode_to_the_imports() {
-    let bind = |addr, ordinal, name: &str, weak, addend| linkedit::Bind {
+    let bind = |addr, ordinal, name: &'static str, weak, addend| linkedit::Bind {
         addr,
         ordinal,
-        name: name.as_bytes().to_vec(),
+        name: name.as_bytes(),
         weak,
         addend,
     };
@@ -341,7 +341,7 @@ fn binds_decode_to_the_imports() {
     let mut want: Vec<(u64, i64, Vec<u8>, u8, i64)> = (binds.iter())
         .map(|it| {
             let flags = if it.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT } else { 0 };
-            (it.addr, it.ordinal, it.name.clone(), flags, it.addend)
+            (it.addr, it.ordinal, it.name.to_vec(), flags, it.addend)
         })
         .collect();
     want.sort();
@@ -369,7 +369,8 @@ fn function_starts_are_distances() {
 #[test]
 fn signature_hashes_every_page() {
     let file: Vec<u8> = (0..3 * sign::PAGE + 100).map(|it| (it * 31 % 251) as u8).collect();
-    let signature = sign::signature(&file, "hello", 0, 0x4000, true);
+    let mut signature = Vec::new();
+    sign::signature(&sign::View::whole(&file), "hello", 0, 0x4000, true, None, &mut signature);
     assert_eq!(signature.len() as u64, sign::len("hello", file.len() as u64));
     check_signature(&signature, &file, "hello");
 }
@@ -569,8 +570,13 @@ impl Parts {
             tls: self.tls,
             id: [7; 16],
             debug: &self.debug,
+            symbol: &no_symbol,
         }
     }
+}
+
+fn no_symbol(_: &str) -> Option<u64> {
+    None
 }
 
 const BASE: u64 = 0x1_0000_0000;
@@ -581,7 +587,7 @@ const DATA: u64 = BASE + 0xc000;
 const VARS: u64 = DATA + 16;
 
 fn import(name: &str, library: Option<u32>, weak: bool) -> Import {
-    Import { name: name.to_owned(), library, version: None, kind: SymbolKind::Function, weak }
+    Import { name: name.to_owned(), library, version: None, kind: SymbolKind::Function, weak, wasm: None }
 }
 
 /// An arm64 executable: code, a GOT of an import and a local, an initializer, data with a
@@ -1031,6 +1037,7 @@ fn reads_universal_slices() {
         subtype: 0,
         page: 0x4000,
         platform: Platform { platform: 1, minimum: 0, sdk: 0 },
+        cache: None,
     };
     assert_eq!(machine.thin("fat", &file).unwrap(), (72, &b"armslice"[..]));
     let ppc = super::MachO { cpu: 18, ..machine };
@@ -1048,4 +1055,170 @@ fn misaligned_inputs_are_read_aligned() {
         it.to_vec()
     });
     assert_eq!(seen, want);
+}
+
+/// The trie as it was first built, one name at a time with an edge label copied per edge:
+/// the reference the one-pass builder must match byte for byte.
+fn trie_by_insertion(exports: &mut [(Vec<u8>, u64, u64)]) -> Vec<u8> {
+    #[derive(Default)]
+    struct Node {
+        edges: Vec<(Vec<u8>, usize)>,
+        terminal: Option<(u64, u64)>,
+        offset: u64,
+    }
+    let uleb_len = |value: u64| u64::from((64 - value.leading_zeros()).max(1).div_ceil(7));
+    let info_len = |node: &Node| node.terminal.map_or(0, |(f, a)| uleb_len(f) + uleb_len(a));
+    exports.sort_unstable();
+    let mut nodes = vec![Node::default()];
+    for (name, flags, addr) in exports.iter() {
+        let (mut node, mut name) = (0, &name[..]);
+        loop {
+            if name.is_empty() {
+                nodes[node].terminal = Some((*flags, *addr));
+                break;
+            }
+            let Some(edge) = nodes[node].edges.iter().position(|it| it.0[0] == name[0]) else {
+                nodes.push(Node { terminal: Some((*flags, *addr)), ..Node::default() });
+                let child = nodes.len() - 1;
+                nodes[node].edges.push((name.to_vec(), child));
+                break;
+            };
+            let (label, child) = nodes[node].edges[edge].clone();
+            let common = label.iter().zip(name).take_while(|(a, b)| a == b).count();
+            if common < label.len() {
+                nodes.push(Node { edges: vec![(label[common..].to_vec(), child)], ..Node::default() });
+                let middle = nodes.len() - 1;
+                nodes[node].edges[edge] = (label[..common].to_vec(), middle);
+                node = middle;
+            } else {
+                node = child;
+            }
+            name = &name[common..];
+        }
+    }
+    for node in &mut nodes {
+        node.edges.sort_unstable();
+    }
+    let mut order = Vec::new();
+    let mut stack = vec![0];
+    while let Some(node) = stack.pop() {
+        order.push(node);
+        stack.extend(nodes[node].edges.iter().rev().map(|it| it.1));
+    }
+    loop {
+        let (mut offset, mut moved) = (0, false);
+        for &node in &order {
+            moved |= nodes[node].offset != offset;
+            nodes[node].offset = offset;
+            let info = info_len(&nodes[node]);
+            let mut len = uleb_len(info) + info + 1;
+            for (label, child) in &nodes[node].edges {
+                len += label.len() as u64 + 1 + uleb_len(nodes[*child].offset);
+            }
+            offset += len;
+        }
+        if !moved {
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    for &node in &order {
+        let node = &nodes[node];
+        linkedit::uleb(&mut out, info_len(node));
+        if let Some((flags, addr)) = node.terminal {
+            linkedit::uleb(&mut out, flags);
+            linkedit::uleb(&mut out, addr);
+        }
+        out.push(node.edges.len() as u8);
+        for (label, child) in &node.edges {
+            out.extend_from_slice(label);
+            out.push(0);
+            linkedit::uleb(&mut out, nodes[*child].offset);
+        }
+    }
+    out.resize(out.len().next_multiple_of(8), 0);
+    out
+}
+
+#[test]
+fn trie_is_the_insertion_trie() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..200 {
+        // Names over a small alphabet, so prefixes are shared, split and ended often.
+        let count = 1 + (next() % 300) as usize;
+        let mut names = std::collections::BTreeSet::new();
+        while names.len() < count {
+            let len = 1 + (next() % 12) as usize;
+            names.insert((0..len).map(|_| b"_abc$Z"[(next() % 6) as usize]).collect::<Vec<u8>>());
+        }
+        let mut exports: Vec<(Vec<u8>, u64, u64)> = (names.into_iter())
+            .map(|name| (name, next() % 3, next() % (1 << (next() % 40))))
+            .collect();
+        // Out of order, as the builder must sort them itself.
+        exports.reverse();
+        let want = trie_by_insertion(&mut exports.clone());
+        assert_eq!(linkedit::trie(&mut exports).unwrap(), want, "round {round}");
+        let mut borrowed: Vec<(&[u8], u64, u64)> =
+            exports.iter().map(|it| (&it.0[..], it.1, it.2)).collect();
+        assert_eq!(linkedit::trie(&mut borrowed).unwrap(), want, "round {round}, borrowed");
+    }
+}
+
+#[test]
+fn names_sort_as_their_mach_o_spelling() {
+    let names = ["main", "\x01main", "\x01_main", "_main", "\x01", "a", "\x01a", "\x01`", "Z", "\x01Z"];
+    for a in names {
+        for b in names {
+            let want = macho_name(a).into_bytes().cmp(&macho_name(b).into_bytes());
+            assert_eq!(super::macho_order(a, b), want, "{a:?} {b:?}");
+        }
+    }
+}
+
+#[test]
+fn rebases_and_starts_sorted_or_not_are_the_same() {
+    let sorted: Vec<u64> = (0..50).map(|it| 0x1_0000_8000 + it * 8 + (it / 7) * 0x40).collect();
+    let mut shuffled = sorted.clone();
+    shuffled.reverse();
+    shuffled.swap(3, 30);
+    assert_eq!(linkedit::rebases(&sorted, &spans()).unwrap(), linkedit::rebases(&shuffled, &spans()).unwrap());
+    assert_eq!(
+        linkedit::function_starts(0x1_0000_0000, &sorted),
+        linkedit::function_starts(0x1_0000_0000, &shuffled)
+    );
+    let mut twice = sorted.clone();
+    twice.push(sorted[10]);
+    assert_eq!(linkedit::function_starts(0x1_0000_0000, &twice), linkedit::function_starts(0x1_0000_0000, &sorted));
+}
+
+/// A writer that keeps the last signature's pages writes the same file as one that doesn't,
+/// link after link, as the code and the data change.
+#[test]
+fn the_signing_cache_writes_the_same_file() {
+    let mut incremental = executable(Arch::Aarch64);
+    incremental.incremental = true;
+    let cached = super::writer(&incremental).unwrap();
+    let mut parts = hello(executable(Arch::Aarch64));
+    for round in 0..4u8 {
+        match round {
+            1 => parts.contents[0][0] ^= 0x10,
+            2 => parts.contents[4][3] = 0x42,
+            3 => parts.exports[0].name = "main2".to_owned(),
+            _ => {}
+        }
+        let fresh = super::writer(&parts.output).unwrap();
+        let slices = parts.slices();
+        let placed = parts.placed(&slices);
+        let file = written(&*cached, &placed);
+        assert_eq!(file, written(&*fresh, &placed), "round {round}");
+        let read = read(&file);
+        let (at, len) = read.signature.unwrap();
+        check_signature(range(&file, (at, len)), &file[..at as usize], "hello");
+    }
 }

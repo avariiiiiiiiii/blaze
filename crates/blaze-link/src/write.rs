@@ -94,6 +94,10 @@ impl Stage<'_> {
                 let sym = self.symbols.find(&SymKey::Descriptor).ok_or("an image with no live descriptor")?;
                 self.value(regions, sym)?
             }
+            Special::Got(name) => {
+                let sym = self.symbols.find(&SymKey::Name(name.as_str().into())).ok_or_else(|| format!("`{name}` is not defined"))?;
+                Value::Image(self.got_cell(GotKind::Address, sym)?)
+            }
         })
     }
 
@@ -108,21 +112,21 @@ impl Stage<'_> {
             .ok_or_else(|| format!("no GOT cell of {}", describe(self.symbols.key(target))))
     }
 
-    /// The function and table indexes of wasm code: imports first, then by address.
-    fn wasm_indexes(&self) -> FxHashMap<u64, u64> {
-        let imports = self.new.resolved.imports.iter().filter(|it| it.kind == SymbolKind::Function).count();
+    /// The function indexes of wasm code by code address: the imports first (every wasm
+    /// import is a function), then the pieces of the code space and the functions the
+    /// writer synthesizes (one at the start of each of its code regions), by address.
+    fn wasm_indexes(&self, regions: &[Region]) -> FxHashMap<u64, u64> {
+        let imports = self.new.resolved.imports.len();
         let mut code: Vec<u64> = self
             .new
             .live_pieces()
-            .filter(|(_, it)| it.class == Class::Text)
+            .filter(|(_, it)| regions.get(it.region as usize).is_some_and(|r| r.prot.exec))
             .map(|(_, it)| it.addr)
+            .chain(regions.iter().filter(|it| it.prot.exec && matches!(it.class, Class::Synthetic(_))).map(|it| it.addr))
             .collect();
         code.sort_unstable();
+        code.dedup();
         code.into_iter().enumerate().map(|(at, addr)| (addr, (imports + at) as u64)).collect()
-    }
-
-    fn wasm_import_index(&self, import: u32) -> u64 {
-        self.new.resolved.imports[..import as usize].iter().filter(|it| it.kind == SymbolKind::Function).count() as u64
     }
 
     /// Applies a piece's fixups to `field`, its bytes placed at `piece.addr`.
@@ -182,12 +186,31 @@ impl Stage<'_> {
             };
             if let Apply::Native(r_type) = fixup.apply {
                 let s = match (self.output.format, r_type, value) {
-                    (Format::Wasm, reloc::WASM_FUNCTION | reloc::WASM_TABLE, Value::Import(at)) => {
-                        self.wasm_import_index(at) + u64::from(r_type == reloc::WASM_TABLE)
-                    }
-                    (Format::Wasm, reloc::WASM_FUNCTION | reloc::WASM_TABLE, _) => {
-                        let index = *wasm.get(&s).ok_or_else(|| fail(fixup, "not a function's start".into()))?;
-                        index + u64::from(r_type == reloc::WASM_TABLE)
+                    (
+                        Format::Wasm,
+                        reloc::WASM_FUNCTION_INDEX_LEB
+                        | reloc::WASM_FUNCTION_INDEX_I32
+                        | reloc::WASM_TABLE_INDEX_SLEB
+                        | reloc::WASM_TABLE_INDEX_I32,
+                        _,
+                    ) => {
+                        let slot = u64::from(matches!(r_type, reloc::WASM_TABLE_INDEX_SLEB | reloc::WASM_TABLE_INDEX_I32));
+                        match value {
+                            Value::Import(at) => u64::from(at) + slot,
+                            Value::Image(s) => {
+                                *wasm.get(&s).ok_or_else(|| fail(fixup, "not a function's start".into()))? + slot
+                            }
+                            Value::Absolute(0) if slot == 1 => 0,
+                            _ => {
+                                return Err(fail(
+                                    fixup,
+                                    format!(
+                                        "{} is not defined, and a call by index has no null function to go to",
+                                        describe(self.symbols.key(fixup.target))
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     (_, _, Value::Import(_)) => {
                         return Err(fail(fixup, "a format relocation to an import".into()));
@@ -203,10 +226,23 @@ impl Stage<'_> {
                 }
                 None => 0,
             };
+            let mut slid = matches!(value, Value::Image(_));
             let s = match value {
-                Value::Import(_) if reloc::is_branch(fixup.apply) => self
-                    .at_of(SymKey::Plt(Box::new(self.symbols.key(fixup.target).clone())))
-                    .ok_or_else(|| fail(fixup, "no PLT stub".into()))?,
+                Value::Import(_) if self.through_plt(fixup) => {
+                    slid = true;
+                    self.at_of(SymKey::Plt(Box::new(self.symbols.key(fixup.target).clone())))
+                        .ok_or_else(|| fail(fixup, "no PLT stub".into()))?
+                }
+                Value::Import(_) if self.plan.got_by_library && reloc::got_kind(fixup.apply).is_none() => {
+                    return Err(fail(
+                        fixup,
+                        format!(
+                            "{} is imported data, which is reached only through its import address table \
+                             cell (`__imp_`)",
+                            describe(self.symbols.key(fixup.target))
+                        ),
+                    ));
+                }
                 Value::Import(at) if fixup.apply == Apply::Abs64 => {
                     binds.push((fixup.at, at, fixup.addend));
                     place[..8].fill(0);
@@ -225,7 +261,7 @@ impl Stage<'_> {
                 }
                 _ => s,
             };
-            if fixup.apply == Apply::Abs64 && matches!(value, Value::Image(_)) {
+            if fixup.apply == Apply::Abs64 && slid {
                 rebase.push(fixup.at);
             }
             let ctx = Ctx {
@@ -248,7 +284,7 @@ impl Stage<'_> {
     pub fn relocate_all(&mut self) -> Result<(), LinkError> {
         let regions = self.new.regions();
         let tls = self.new.tls;
-        let wasm = if self.output.format == Format::Wasm { self.wasm_indexes() } else { FxHashMap::default() };
+        let wasm = if self.output.format == Format::Wasm { self.wasm_indexes(&regions) } else { FxHashMap::default() };
         let mut ids: Vec<PieceId> = self.write.iter().copied().filter(|it| self.new.piece(*it).is_some()).collect();
         ids.sort_by_key(|id| {
             let piece = self.new.piece(*id).expect("live");
@@ -412,6 +448,15 @@ impl Stage<'_> {
                         name: self.new.debug_names.get(&info.key).map(|it| it.to_string()),
                     });
                 }
+                What::Native { unwind: false, .. }
+                    if self.plan.indexed_code && regions.get(piece.region as usize).is_some_and(|it| it.prot.exec) =>
+                {
+                    let name = piece.defines.iter().find_map(|sym| match self.symbols.key(*sym) {
+                        SymKey::Name(name) => Some(name.to_string()),
+                        _ => None,
+                    });
+                    functions.push(Function { addr: piece.addr, size: piece.size, fde: None, windows: None, name });
+                }
                 _ => {}
             }
         }
@@ -420,8 +465,8 @@ impl Stage<'_> {
         binds.sort_by_key(|it| it.addr);
         functions.sort_by_key(|it| it.addr);
         let mut exports = Vec::new();
-        for name in self.exports() {
-            let Some(sym) = self.symbols.find(&SymKey::Name(name.as_str().into())) else {
+        for (name, symbol, data) in self.exports() {
+            let Some(sym) = self.symbols.find(&SymKey::Name(symbol.as_str().into())) else {
                 return Err(error(None, format!("the export `{name}` is not defined")));
             };
             let value = self.value(&regions, sym).map_err(|it| error(None, format!("the export `{name}`: {it}")))?;
@@ -440,6 +485,7 @@ impl Stage<'_> {
                 }
                 None => (SymbolKind::Other, 0),
             };
+            let kind = if data { SymbolKind::Data } else { kind };
             exports.push(Export { name, addr, size, kind });
         }
         let image = |name: &str| -> Option<u64> {
@@ -450,10 +496,14 @@ impl Stage<'_> {
             }
         };
         let entry = match &self.output.kind {
-            OutputKind::Executable { entry } => Some(
+            OutputKind::Executable { entry } => Some(entry.as_str()),
+            OutputKind::Shared { .. } => self.writer.shared_entry(),
+        };
+        let entry = match entry {
+            Some(entry) => Some(
                 image(entry).ok_or_else(|| error(None, format!("the entry point `{entry}` is not in the image")))?,
             ),
-            OutputKind::Shared { .. } => None,
+            None => None,
         };
         let generation = self.new.generation.to_le_bytes();
         let full = blaze_ids::ContentId::of("blaze v2 link image 1", &[&self.new.lineage[..], &generation].concat());
@@ -507,8 +557,24 @@ impl Stage<'_> {
     }
 }
 
+impl Stage<'_> {
+    /// The address of a name the image defines, among `regions`: [`Placed::symbol`].
+    pub fn address_of(&self, regions: &[Region], name: &str) -> Option<u64> {
+        let sym = self.symbols.find(&SymKey::Name(name.into()))?;
+        match self.value(regions, sym) {
+            Ok(Value::Image(addr)) => Some(addr),
+            _ => None,
+        }
+    }
+}
+
 impl Parts {
-    pub fn placed<'a>(&'a self, stage: &'a Stage<'_>, contents: &'a [&'a [u8]]) -> Placed<'a> {
+    pub fn placed<'a>(
+        &'a self,
+        stage: &'a Stage<'_>,
+        contents: &'a [&'a [u8]],
+        symbol: &'a dyn Fn(&str) -> Option<u64>,
+    ) -> Placed<'a> {
         Placed {
             output: stage.output,
             name: stage.name,
@@ -528,6 +594,7 @@ impl Parts {
             tls: stage.new.tls,
             id: self.id,
             debug: &self.debug,
+            symbol,
         }
     }
 }

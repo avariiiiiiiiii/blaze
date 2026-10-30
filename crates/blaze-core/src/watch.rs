@@ -5,7 +5,6 @@
 //! its own and the ring driver through the ring.
 
 use std::{
-    collections::BTreeSet,
     ffi::CString,
     io,
     os::{
@@ -89,8 +88,7 @@ impl Inotify {
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut watch = Inotify { fd, root: root.to_owned(), dirs: FxHashMap::default() };
-        let mut found = BTreeSet::new();
-        watch.add_tree(dir.as_str(), &mut found)?;
+        watch.add_tree(dir.as_str(), &mut Vec::new())?;
         Ok(watch)
     }
 
@@ -100,7 +98,7 @@ impl Inotify {
 
     /// Watches `rel` and the directories under it, adding each file in them to `found`: a file
     /// made in a directory before its watch was added has no event of its own.
-    fn add_tree(&mut self, rel: &str, found: &mut BTreeSet<FileName>) -> io::Result<()> {
+    fn add_tree(&mut self, rel: &str, found: &mut Vec<FileName>) -> io::Result<()> {
         let mut todo = vec![rel.to_owned()];
         while let Some(rel) = todo.pop() {
             let path = self.root.join(&rel);
@@ -124,7 +122,7 @@ impl Inotify {
                 if entry.file_type().is_ok_and(|it| it.is_dir()) {
                     todo.push(child);
                 } else if let Some(file) = FileName::new(&child) {
-                    found.insert(file);
+                    found.push(file);
                 }
             }
         }
@@ -133,7 +131,8 @@ impl Inotify {
 
     /// What the events in `bytes` say, watching each directory they say was made.
     fn take(&mut self, bytes: &[u8]) -> Done {
-        let mut files = BTreeSet::new();
+        let mut files = Vec::with_capacity(bytes.len() / HEAD);
+        let mut rel = String::new();
         let mut lost = false;
         let mut at = 0;
         while at + HEAD <= bytes.len() {
@@ -151,10 +150,17 @@ impl Inotify {
                 self.dirs.remove(&wd);
                 continue;
             }
-            let Some(dir) = self.dirs.get(&wd).cloned() else { continue };
+            let Some(dir) = self.dirs.get(&wd) else { continue };
             let end = name_bytes.iter().position(|&it| it == 0).unwrap_or(name_bytes.len());
             let name = String::from_utf8_lossy(&name_bytes[..end]);
-            let rel = if name.is_empty() { dir } else { join(&dir, &name) };
+            rel.clear();
+            rel.push_str(dir);
+            if !name.is_empty() {
+                if !rel.is_empty() {
+                    rel.push('/');
+                }
+                rel.push_str(&name);
+            }
             if mask & libc::IN_ISDIR != 0
                 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
                 && self.add_tree(&rel, &mut files).is_err()
@@ -162,10 +168,12 @@ impl Inotify {
                 lost = true;
             }
             if let Some(file) = FileName::new(&rel) {
-                files.insert(file);
+                files.push(file);
             }
         }
-        Done::Changed { files: files.into_iter().collect(), lost }
+        files.sort_unstable();
+        files.dedup();
+        Done::Changed { files, lost }
     }
 }
 

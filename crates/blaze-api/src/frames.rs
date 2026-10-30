@@ -34,6 +34,20 @@ impl Frames {
         }
     }
 
+    /// [`Frames::push`] of a buffer that is the caller's no more: kept as it is, uncopied, when
+    /// nothing is held before it.
+    pub(crate) fn push_vec(&mut self, bytes: Vec<u8>) {
+        if self.broken.is_some() {
+            return;
+        }
+        if self.held() == 0 {
+            self.bytes = bytes;
+            self.at = 0;
+        } else {
+            self.push(&bytes);
+        }
+    }
+
     /// The next whole item; `Ok(None)` until one is here. An error for a length over
     /// [`LONGEST_REQUEST`], after which the stream is unusable (the peer is hung up on).
     pub fn next(&mut self) -> Result<Option<Vec<u8>>, ApiError> {
@@ -160,18 +174,59 @@ fn undecodable(error: &cbor::Error) -> ApiError {
 
 /// `envelope` in deterministic CBOR, framed (4-byte big-endian length, then the item).
 pub fn encode<T: Serialize>(envelope: &Envelope<T>) -> Result<Vec<u8>, ApiError> {
-    let item = cbor::to_vec(envelope)
-        .map_err(|error| ApiError::new(format!("an envelope with no encoding: {error}"), None))?;
-    let len = u32::try_from(item.len()).ok().filter(|&len| len <= blaze_protocol::LONGEST_FRAME);
-    let Some(len) = len else {
-        let said =
-            format!("a frame of {} bytes, longer than {}", item.len(), blaze_protocol::LONGEST_FRAME);
-        return Err(ApiError::new(said, None));
-    };
-    let mut frame = Vec::with_capacity(4 + item.len());
-    frame.extend(len.to_be_bytes());
-    frame.extend(item);
+    let mut frame = Vec::new();
+    encode_into(&mut cbor::Writer::new(), &mut frame, envelope)?;
     Ok(frame)
+}
+
+/// [`encode`] onto the end of `out`, a buffer the caller reuses, the item written where it goes
+/// and its length put before it after; on an error `out` is left as it was.
+pub fn encode_into<T: Serialize>(
+    writer: &mut cbor::Writer,
+    out: &mut Vec<u8>,
+    envelope: &Envelope<T>,
+) -> Result<(), ApiError> {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    item_into(writer, out, envelope)?;
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+/// An envelope's keys as they are encoded, in the order of their encoding (the order
+/// [`cbor`] sorts a map's keys in), the first after the head of a map of three.
+const ENVELOPE_ID: [u8; 4] = [0xa3, 0x62, b'i', b'd'];
+const ENVELOPE_BODY: [u8; 5] = [0x64, b'b', b'o', b'd', b'y'];
+const ENVELOPE_SCHEMA: [u8; 7] = [0x66, b's', b'c', b'h', b'e', b'm', b'a'];
+
+/// `envelope`'s item, unframed, onto the end of `out`: the bytes [`cbor::to_vec`] gives it,
+/// written in order with nothing to sort. On an error `out` is left as it was.
+pub(crate) fn item_into<T: Serialize>(
+    writer: &mut cbor::Writer,
+    out: &mut Vec<u8>,
+    envelope: &Envelope<T>,
+) -> Result<(), ApiError> {
+    let start = out.len();
+    let written = (|| {
+        out.extend_from_slice(&ENVELOPE_ID);
+        writer.append(out, &envelope.id)?;
+        out.extend_from_slice(&ENVELOPE_BODY);
+        writer.append(out, &envelope.body)?;
+        out.extend_from_slice(&ENVELOPE_SCHEMA);
+        writer.append(out, &envelope.schema)
+    })();
+    if let Err(error) = written {
+        out.truncate(start);
+        return Err(ApiError::new(format!("an envelope with no encoding: {error}"), None));
+    }
+    let len = out.len() - start;
+    if len > blaze_protocol::LONGEST_FRAME as usize {
+        out.truncate(start);
+        let said = format!("a frame of {len} bytes, longer than {}", blaze_protocol::LONGEST_FRAME);
+        return Err(ApiError::new(said, None));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

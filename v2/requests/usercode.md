@@ -63,6 +63,34 @@ writes `blaze_usercode::trace` lines and reports. (usercode-sandbox may ask the 
 
 > applied: `crates/blaze-cargo/Cargo.toml` has `blaze-usercode.workspace = true` (line 131).
 
+## 6. cargo: blaze's std says when it walks the environment (library/std/src/sys/env/unix.rs)
+
+What: in `env()` (behind `env::vars`/`vars_os`) and wherever std reads `environ` whole
+(`process::Command`'s spawn with the environment not cleared), call a weak, undefined,
+dynamically resolved C symbol before the walk, when it resolves:
+
+```rust
+unsafe extern "C" {
+    #[linkage = "extern_weak"]
+    static __blaze_environ_walked: Option<unsafe extern "C" fn()>;
+}
+```
+
+and export a marker the executable is built with, `#[unsafe(no_mangle)] pub static
+__blaze_std_says_walks: u8 = 1;`. Neither changes what a program does: unresolved, the call is
+skipped. Why: a traced run is keyed by every variable it could have seen. A process can walk
+`environ` with no call the sandbox sees, so the launcher now records `E *` (the whole
+environment) for every traced run (`crates/blaze-cargo/src/sandbox/v2.rs`, its module doc). That
+is sound, but it puts every passed-through variable (`SHLVL`, `OLDPWD`, `_`, a terminal's own)
+in every build script's and proc macro's key, which undoes #805 and much of #1450. With the hook,
+the interposers (`linux_interpose.c`, `macos_interpose.c`, usercode's) define
+`__blaze_environ_walked` to append `E <scope> *`, and record `E *` at load only for a process
+whose executable lacks `__blaze_std_says_walks` (a C program or a toolchain-built one), so a
+blaze-built build script is keyed by the variables it read by name. usercode makes the
+interposer and launcher change when this lands.
+
+> forwarded to cargo: `library/` is lane cargo's (crates.md); lane cargo is still running.
+
 ## From concurrency: lock audit (2026-10-29)
 
 Read-only audit of `crates/blaze-expand/`, `proc-macro-api/`, `proc-macro-srv/`,
@@ -178,3 +206,21 @@ Off the hot path, so nothing to change (hits read, one line per group):
   console's interrupt reaches at most the last one. Please check.
 - **`proc-macro-api/src/warm.rs:482`–`:484`, `process.rs:143`–`:145`, `blaze-expand/src/native/tests.rs`:**
   tests only.
+
+> forwarded to usercode: findings 1-10 are in lane usercode's crates (`blaze-expand`, `blaze-macro-wasm`, `proc-macro-api`, `blaze-usercode`, the sandbox); finding 9's database callback is in `crates/load-cargo/` (cargo's). Lane usercode is still running.
+
+## From speed-link-edge-usercode (2026-10-29): `trace::assemble` over any lines
+
+Where: `crates/blaze-usercode/src/trace.rs`, `pub fn assemble`. What: take
+`lines: impl IntoIterator<Item = &'l Line>` (with `<'l, I: Inputs>`) in place of `&[Line]`; the body
+already only iterates them (`lines.iter().filter(..)` becomes `lines.into_iter().filter(..)`).
+Every caller compiles unchanged (`&Vec<Line>` and `&[Line]` are such iterators): `proc-macro-api/src/warm.rs:447`,
+the tests in `trace.rs`, and `test::queue::Trace::traced`.
+
+Why: the test queue gives every test of a fork server the server's own lines (scope empty: the
+libraries and files it read as it started) plus the test's. Today that is a `Vec<Line>` cloned
+per test, two `String`s per shared line per test. With `assemble` over an iterator, `Trace::Lines`
+becomes `{ common: Arc<[Line]>, own: Vec<Line> }` and `traced` chains the two, so a test costs
+nothing for the shared lines but their hashing (and `Disk` caches that by stat). I have already
+cut the clone to each shared line once (they were repeated per child); this takes it to zero.
+I will make the `Trace` change in `test/queue.rs` once this is in; nothing of mine needs it to compile.

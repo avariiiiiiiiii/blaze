@@ -27,11 +27,16 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    ops::Range,
+};
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
 use blaze_ids::ContentId;
 use blaze_vfs::View;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -145,8 +150,8 @@ pub enum Output {
     /// Create the check run; answered with [`Input::Created`].
     Create { run: RunId, job: JobId, check: CheckRun },
     Update { run: RunId, id: u64, check: CheckRun },
-    /// Write the state file.
-    Save(State),
+    /// Write the state file, [`Service::state`]: once for any number of these together.
+    Save,
     /// [`Request::Snapshot`], then the snapshot command with `name`; answered with
     /// [`Input::Snapshotted`].
     Snapshot { name: String },
@@ -177,11 +182,13 @@ struct Job {
     commit: String,
     kind: JobKind,
     phase: Phase,
-    runs: Vec<RunId>,
+    /// Its check runs, made together: ids `first..first + count`, so walking them clones nothing.
+    first: u64,
+    count: u32,
     /// A newer event replaced it: its check runs are posted cancelled.
     replaced: bool,
-    /// Runs whose request is sent and not ended.
-    pending: BTreeSet<RunId>,
+    /// How many of its runs have a request sent and not ended ([`Run::pending`]).
+    pending: u32,
     /// [`Output::Checkout`] was given: the runtime has a worker to end.
     worker: bool,
     root: Option<ContentId>,
@@ -191,11 +198,23 @@ struct Job {
     base: Option<ContentId>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+impl Job {
+    /// The ids of its runs, as numbers: `.map(RunId)` them.
+    fn runs(&self) -> Range<u64> {
+        self.first..self.first + u64::from(self.count)
+    }
+}
+
+/// What a run asks the daemon: 8 bytes, copied, not a clone of its [`Check`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Work {
-    Check(Check),
+    /// The check at `at` in [`Settings::checks`], or in [`Settings::release_checks`] when
+    /// `release`.
+    Check { kind: CheckKind, release: bool, at: u32 },
     Oracle,
 }
+
+const _: () = assert!(size_of::<Work>() == 8);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GitHubId {
@@ -211,19 +230,26 @@ struct Run {
     check: CheckRun,
     work: Work,
     github: GitHubId,
-    /// What GitHub was last sent.
-    posted: CheckRun,
+    /// `check` changed while its creation waits for an id: sent once the id comes. Once it has
+    /// one, each change is sent as it is made, so what GitHub has is `check`.
+    unposted: bool,
+    /// Its request is sent and not ended.
+    pending: bool,
     report: Report,
     /// Completed: nothing changes it again.
     done: bool,
 }
 
+/// No map here is iterated, so none decides an order: each is a hash table on an id, two
+/// multiply-and-shift hashes and no string compare per lookup.
 pub struct Service {
     settings: Settings,
+    /// `branch/<default>`, the default branch's ref, made once.
+    default_ref: String,
     state: State,
     now: u64,
-    jobs: BTreeMap<JobId, Job>,
-    runs: BTreeMap<RunId, Run>,
+    jobs: FxHashMap<JobId, Job>,
+    runs: FxHashMap<RunId, Run>,
     /// Each branch's and pull request's newest job.
     latest: BTreeMap<String, JobId>,
     /// The job whose checkout of a ref is in flight.
@@ -244,11 +270,12 @@ impl Service {
             out.push(Output::Pin { root: held.checkout.root });
         }
         Service {
+            default_ref: format!("branch/{}", settings.default_branch),
             settings,
             state,
             now: 0,
-            jobs: BTreeMap::new(),
-            runs: BTreeMap::new(),
+            jobs: FxHashMap::default(),
+            runs: FxHashMap::default(),
             latest: BTreeMap::new(),
             checking_out: BTreeMap::new(),
             train: Train::default(),
@@ -303,15 +330,13 @@ impl Service {
         if let Some(old) = self.latest.get(&reference).copied() {
             self.replace(old, &format!("Cancelled: replaced by {commit}."), out);
         }
-        let checks = self.settings.checks.clone();
-        let job = self.new_job(reference.clone(), commit, kind, &checks, out);
+        let job = self.new_job(reference.clone(), commit, kind, false, out);
         self.latest.insert(reference, job);
         self.try_start(job, out);
     }
 
     fn tag(&mut self, name: String, commit: String, out: &mut Vec<Output>) {
-        let checks = self.settings.release_checks.clone();
-        let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.clone() }, &checks, out);
+        let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.clone() }, true, out);
         let idle = self.train.running.is_none();
         let replaced = self.train.arrive(name.clone());
         if idle {
@@ -323,52 +348,47 @@ impl Service {
         if let (Some(old), Some(_)) = (old, replaced) {
             self.replace(old, &format!("Cancelled: replaced by {name}."), out);
         }
-        let running = self.train.running.clone().unwrap_or_default();
+        let running = self.train.running.as_deref().unwrap_or_default();
         let summary = format!("Queued: waiting for release {running} to finish.");
-        for run in self.jobs[&job].runs.clone() {
+        for run in self.jobs[&job].runs().map(RunId) {
             self.set(run, CheckStatus::Queued, summary.clone(), out);
         }
     }
 
+    /// A job running each of the configured checks (the release checks when `release`), and the
+    /// oracle when the commit is sampled: its runs posted queued.
     fn new_job(
         &mut self,
         reference: String,
         commit: String,
         kind: JobKind,
-        checks: &[Check],
+        release: bool,
         out: &mut Vec<Output>,
     ) -> JobId {
         let job = JobId(self.next_job);
         self.next_job += 1;
-        let mut works: Vec<(String, Work)> =
-            checks.iter().map(|check| (check.name.clone(), Work::Check(check.clone()))).collect();
-        if oracle::sampled(&commit, self.settings.oracle_one_in) {
-            works.push((oracle::CHECK.to_owned(), Work::Oracle));
-        }
-        let mut runs = Vec::with_capacity(works.len());
-        for (name, work) in works {
-            let run = RunId(self.next_run);
-            self.next_run += 1;
-            let check = CheckRun {
-                name,
-                commit: commit.clone(),
-                status: CheckStatus::Queued,
-                summary: format!("Queued: waiting for the checkout of {commit}."),
+        let checks = if release { &self.settings.release_checks } else { &self.settings.checks };
+        let sampled = oracle::sampled(&commit, self.settings.oracle_one_in);
+        let count = checks.len() + usize::from(sampled);
+        let first = self.next_run;
+        self.next_run += count as u64;
+        let queued = format!("Queued: waiting for the checkout of {commit}.");
+        self.runs.reserve(count);
+        for at in 0..count {
+            let run = RunId(first + at as u64);
+            let (name, work) = match checks.get(at) {
+                Some(check) => {
+                    (check.name.clone(), Work::Check { kind: check.kind, release, at: at as u32 })
+                }
+                None => (oracle::CHECK.to_owned(), Work::Oracle),
             };
+            let check =
+                CheckRun { name, commit: commit.clone(), status: CheckStatus::Queued, summary: queued.clone() };
             out.push(Output::Create { run, job, check: check.clone() });
-            self.runs.insert(
-                run,
-                Run {
-                    job,
-                    posted: check.clone(),
-                    check,
-                    work,
-                    github: GitHubId::Creating,
-                    report: Report::default(),
-                    done: false,
-                },
-            );
-            runs.push(run);
+            let github = GitHubId::Creating;
+            let report = Report::default();
+            let run_of = Run { job, check, work, github, unposted: false, pending: false, report, done: false };
+            self.runs.insert(run, run_of);
         }
         self.jobs.insert(
             job,
@@ -377,9 +397,10 @@ impl Service {
                 commit,
                 kind,
                 phase: Phase::Queued,
-                runs,
+                first,
+                count: count as u32,
                 replaced: false,
-                pending: BTreeSet::new(),
+                pending: 0,
                 worker: false,
                 root: None,
                 owns_root: false,
@@ -395,8 +416,8 @@ impl Service {
         let Some(it) = self.jobs.get_mut(&job) else { return };
         it.replaced = true;
         let phase = it.phase;
-        let pending = !it.pending.is_empty();
-        for run in it.runs.clone() {
+        let pending = it.pending > 0;
+        for run in it.runs().map(RunId) {
             self.conclude(run, CheckStatus::Cancelled, summary.to_owned(), out);
         }
         match phase {
@@ -410,7 +431,6 @@ impl Service {
     /// Where the job's checkout diffs from: the nearest tree already held.
     fn from(&self, job: &Job) -> Option<Checkout> {
         let held = |reference: &str| self.state.checkouts.get(reference).map(|it| it.checkout.clone());
-        let default_ref = format!("branch/{}", self.settings.default_branch);
         if job.kind == (JobKind::Branch { default: true }) {
             // The head `ci/<branch>` is at this ref's checkout; its commit moves from there.
             return held(&job.reference);
@@ -429,7 +449,7 @@ impl Service {
         {
             return Some(base);
         }
-        held(&default_ref)
+        held(&self.default_ref)
     }
 
     fn try_start(&mut self, job: JobId, out: &mut Vec<Output>) {
@@ -501,7 +521,7 @@ impl Service {
                         "The checkout of {} failed, so nothing ran: {what}",
                         it.commit
                     );
-                    for run in it.runs.clone() {
+                    for run in it.runs().map(RunId) {
                         self.conclude(run, CheckStatus::Failure, summary.clone(), out);
                     }
                 }
@@ -521,55 +541,62 @@ impl Service {
         if let Some(old) = self.state.checkouts.insert(reference, held) {
             out.push(Output::Unpin { root: old.checkout.root });
         }
-        let default_ref = format!("branch/{}", self.settings.default_branch);
-        while self.state.checkouts.keys().filter(|it| **it != default_ref).count() > MOST_CHECKOUTS {
-            let oldest = self
-                .state
-                .checkouts
+        let checkouts = &mut self.state.checkouts;
+        let default_ref = &self.default_ref;
+        let mut others = checkouts.len() - usize::from(checkouts.contains_key(default_ref));
+        while others > MOST_CHECKOUTS {
+            let oldest = checkouts
                 .iter()
-                .filter(|(reference, _)| **reference != default_ref)
-                .min_by_key(|(reference, held)| (held.at, (*reference).clone()))
+                .filter(|(reference, _)| *reference != default_ref)
+                .min_by_key(|&(reference, held)| (held.at, reference))
                 .map(|(reference, _)| reference.clone())
                 .expect("more than none");
-            let held = self.state.checkouts.remove(&oldest).expect("it is there");
+            let held = checkouts.remove(&oldest).expect("it is there");
             out.push(Output::Unpin { root: held.checkout.root });
+            others -= 1;
         }
-        out.push(Output::Save(self.state.clone()));
+        out.push(Output::Save);
     }
 
     /// Sends each check's request on the job's view.
     fn run(&mut self, job: JobId, root: ContentId, out: &mut Vec<Output>) {
         let it = self.jobs.get_mut(&job).expect("the job is there");
         it.phase = Phase::Running;
-        let runs = it.runs.clone();
-        let commit = it.commit.clone();
+        let runs = it.runs();
         let view = ViewRef::Root(View { root });
-        for run in runs {
-            let Some(it) = self.runs.get(&run) else { continue };
+        let mut pending = 0;
+        for run in runs.map(RunId) {
+            let Some(it) = self.runs.get_mut(&run) else { continue };
             if it.done {
                 continue;
             }
-            let (request, what) = match &it.work {
-                Work::Check(check) => (check.request(view.clone()), kind_name(check.kind)),
+            let (request, what) = match it.work {
+                Work::Check { kind, release, at } => {
+                    let checks = if release { &self.settings.release_checks } else { &self.settings.checks };
+                    (checks[at as usize].request(view.clone()), kind_name(kind))
+                }
                 Work::Oracle => (
                     Request::Verify { view: view.clone(), targets: self.settings.oracle_targets.clone() },
                     "verify",
                 ),
             };
-            self.jobs.get_mut(&job).expect("the job is there").pending.insert(run);
+            it.pending = true;
+            pending += 1;
             out.push(Output::Send { job, run, request });
+            let commit = &self.jobs[&job].commit;
             let summary = format!("Running `{what}` on the tree of {commit} (root {root:x}).");
             self.set(run, CheckStatus::InProgress, summary, out);
         }
-        if self.jobs[&job].pending.is_empty() {
+        self.jobs.get_mut(&job).expect("the job is there").pending = pending;
+        if pending == 0 {
             self.finish(job, out);
         }
     }
 
     fn response(&mut self, job: JobId, run: RunId, response: Response) {
-        let sent = self.jobs.get(&job).is_some_and(|it| it.pending.contains(&run));
         if let Some(it) = self.runs.get_mut(&run)
-            && sent
+            && it.job == job
+            && it.pending
             && !it.done
         {
             it.report.add(response);
@@ -577,14 +604,14 @@ impl Service {
     }
 
     fn ended(&mut self, job: JobId, run: RunId, ok: bool, out: &mut Vec<Output>) {
-        let Some(it) = self.jobs.get_mut(&job) else { return };
-        if !it.pending.remove(&run) {
+        let (Some(it), Some(of)) = (self.runs.get_mut(&run), self.jobs.get_mut(&job)) else { return };
+        if it.job != job || !it.pending {
             return;
         }
-        let over = it.pending.is_empty() && it.phase == Phase::Running;
-        if let Some(it) = self.runs.get(&run)
-            && !it.done
-        {
+        it.pending = false;
+        of.pending -= 1;
+        let over = of.pending == 0 && of.phase == Phase::Running;
+        if !it.done {
             let (status, summary) = it.outcome(ok);
             self.conclude(run, status, summary, out);
         }
@@ -611,17 +638,19 @@ impl Service {
         {
             out.push(Output::Unpin { root });
         }
-        for run in &it.runs {
-            if self.runs.get(run).is_some_and(|it| !it.done) {
-                self.conclude(*run, CheckStatus::Failure, "The job ended without a result.".to_owned(), out);
+        for run in it.runs().map(RunId) {
+            let Some(of) = self.runs.get_mut(&run) else { continue };
+            of.pending = false;
+            if !of.done {
+                self.conclude(run, CheckStatus::Failure, "The job ended without a result.".to_owned(), out);
             }
         }
         let green = !it.replaced
-            && it.runs.iter().all(|run| {
-                self.runs.get(run).is_some_and(|it| it.check.status == CheckStatus::Success)
+            && it.runs().map(RunId).all(|run| {
+                self.runs.get(&run).is_some_and(|it| it.check.status == CheckStatus::Success)
             });
-        for run in &it.runs {
-            self.collect(*run);
+        for run in it.runs().map(RunId) {
+            self.collect(run);
         }
         if self.release_waiting == Some(job) {
             self.release_waiting = None;
@@ -659,15 +688,20 @@ impl Service {
         self.set(run, status, summary, out);
     }
 
+    /// The run's status and summary; sent to GitHub when they changed, or kept to be sent once
+    /// the run has an id. A change back to what was sent can't come while it waits: the only
+    /// summary it was created with is never made again.
     fn set(&mut self, run: RunId, status: CheckStatus, summary: String, out: &mut Vec<Output>) {
         let Some(it) = self.runs.get_mut(&run) else { return };
+        if it.check.status == status && it.check.summary == summary {
+            return;
+        }
         it.check.status = status;
         it.check.summary = summary;
-        if let GitHubId::Id(id) = it.github
-            && it.posted != it.check
-        {
-            it.posted = it.check.clone();
-            out.push(Output::Update { run, id, check: it.check.clone() });
+        match it.github {
+            GitHubId::Id(id) => out.push(Output::Update { run, id, check: it.check.clone() }),
+            GitHubId::Creating => it.unposted = true,
+            GitHubId::Failed => {}
         }
     }
 
@@ -679,8 +713,7 @@ impl Service {
         match result {
             Ok(id) => {
                 it.github = GitHubId::Id(id);
-                if it.posted != it.check {
-                    it.posted = it.check.clone();
+                if std::mem::take(&mut it.unposted) {
                     out.push(Output::Update { run, id, check: it.check.clone() });
                 }
             }
@@ -714,7 +747,7 @@ impl Service {
              checkout diffs from another tree",
             lost.join(", ")
         )));
-        out.push(Output::Save(self.state.clone()));
+        out.push(Output::Save);
     }
 
     fn maybe_snapshot(&mut self, commit: &str, out: &mut Vec<Output>) {
@@ -732,7 +765,7 @@ impl Service {
         match result {
             Ok(kept) => {
                 self.state.snapshots.push(kept);
-                out.push(Output::Save(self.state.clone()));
+                out.push(Output::Save);
                 for id in snapshot::beyond(&self.state.snapshots, self.settings.snapshot_keep) {
                     if self.removing.insert(id.clone()) {
                         out.push(Output::RemoveSnapshot { id });
@@ -750,7 +783,7 @@ impl Service {
         match result {
             Ok(()) => {
                 self.state.snapshots.retain(|it| it.id != id);
-                out.push(Output::Save(self.state.clone()));
+                out.push(Output::Save);
             }
             Err(what) => out.push(Output::Log(format!(
                 "removing snapshot {id} failed, and it is tried again after the next snapshot: {what}"
@@ -771,7 +804,7 @@ impl Run {
     /// The run's status and summary once its request ended with `ok`.
     fn outcome(&self, ok: bool) -> (CheckStatus, String) {
         let report = &self.report;
-        match &self.work {
+        match self.work {
             Work::Oracle => match &report.verified {
                 Some(mismatches) if ok && mismatches.is_empty() => {
                     (CheckStatus::Success, oracle::summary(mismatches))
@@ -784,14 +817,14 @@ impl Run {
                     report.with_errors("The verification ended without a result.".to_owned()),
                 ),
             },
-            Work::Check(check) => {
+            Work::Check { kind, .. } => {
                 let green = ok
                     && report.errors == 0
                     && report.failed == 0
                     && report.said.is_empty()
                     && report.unexpected.is_empty();
                 let status = if green { CheckStatus::Success } else { CheckStatus::Failure };
-                (status, report.summary(check.kind, ok))
+                (status, report.summary(kind, ok))
             }
         }
     }
@@ -840,7 +873,11 @@ impl Report {
                 }
             },
             Response::Built { artifacts, .. } => self.artifacts += artifacts.len(),
-            Response::Unit(_) | Response::BuildScript(_) | Response::Work(_) => {}
+            Response::Unit(_)
+            | Response::UnitEnded(_)
+            | Response::Fetched { .. }
+            | Response::BuildScript(_)
+            | Response::Work(_) => {}
             Response::Verified { mismatches } => self.verified = Some(mismatches),
             Response::Error(error) => self.said.push(match error.at {
                 Some(at) => format!("{} (at {at})", error.what),
@@ -856,8 +893,12 @@ impl Report {
         }
     }
 
+    /// The run's summary, written into one string sized for what it lists.
     fn summary(&self, kind: CheckKind, ok: bool) -> String {
-        let mut text = format!(
+        let listed: usize = self.listed.iter().chain(&self.failures).map(|it| it.len() + 2).sum();
+        let mut text = String::with_capacity(256 + listed);
+        let _ = write!(
+            text,
             "{} error{}, {} warning{}",
             self.errors,
             plural(self.errors),
@@ -865,12 +906,17 @@ impl Report {
             plural(self.warnings)
         );
         match kind {
-            CheckKind::Test => text.push_str(&format!(
-                "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
-                 last results stand)",
-                self.passed, self.failed, self.ignored, self.unreached
-            )),
-            CheckKind::Build => text.push_str(&format!("; {} artifacts built", self.artifacts)),
+            CheckKind::Test => {
+                let _ = write!(
+                    text,
+                    "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
+                     last results stand)",
+                    self.passed, self.failed, self.ignored, self.unreached
+                );
+            }
+            CheckKind::Build => {
+                let _ = write!(text, "; {} artifacts built", self.artifacts);
+            }
             CheckKind::Check => {}
         }
         text.push('.');
@@ -882,7 +928,7 @@ impl Report {
                 text.push('\n');
             }
             if self.errors > self.listed.len() {
-                text.push_str(&format!("\nand {} more errors\n", self.errors - self.listed.len()));
+                let _ = write!(text, "\nand {} more errors\n", self.errors - self.listed.len());
             }
         }
         if !self.failures.is_empty() {
@@ -893,13 +939,13 @@ impl Report {
                 text.push('\n');
             }
             if self.failed > self.failures.len() {
-                text.push_str(&format!("\nand {} more failed tests\n", self.failed - self.failures.len()));
+                let _ = write!(text, "\nand {} more failed tests\n", self.failed - self.failures.len());
             }
         }
-        let text = self.with_errors(text);
+        let mut text = self.with_errors(text);
         let quiet = self.errors == 0 && self.failed == 0 && self.said.is_empty();
         if !ok && quiet {
-            return format!("{text}\n\nThe daemon ended the request as failed and said nothing more.");
+            text.push_str("\n\nThe daemon ended the request as failed and said nothing more.");
         }
         text
     }
@@ -910,14 +956,16 @@ impl Report {
         if !self.said.is_empty() {
             text.push_str("\n\n## The daemon's errors\n");
             for error in &self.said {
-                text.push_str(&format!("\n- {error}"));
+                text.push_str("\n- ");
+                text.push_str(error);
             }
             text.push('\n');
         }
         if !self.unexpected.is_empty() {
             text.push_str("\n\n## Responses this request should not have had\n");
             for response in &self.unexpected {
-                text.push_str(&format!("\n- {response}"));
+                text.push_str("\n- ");
+                text.push_str(response);
             }
             text.push('\n');
         }
@@ -942,22 +990,29 @@ fn level_name(level: Level) -> &'static str {
 /// An error as rustc prints its first line, its other labelled places, its notes and the facts
 /// its query read.
 fn render_diagnostic(diagnostic: &Diagnostic) -> String {
-    let code = diagnostic.code.as_deref().map(|code| format!("[{code}]")).unwrap_or_default();
-    let place = diagnostic
-        .spans
-        .first()
-        .map_or_else(|| "(no place)".to_owned(), |span| format!("{}:{}:{}", span.file, span.line, span.column));
-    let mut text = format!("{}{code} {place}: {}", level_name(diagnostic.level), diagnostic.message);
+    let mut text = String::with_capacity(64 + diagnostic.message.len());
+    text.push_str(level_name(diagnostic.level));
+    if let Some(code) = &diagnostic.code {
+        let _ = write!(text, "[{code}]");
+    }
+    match diagnostic.spans.first() {
+        Some(span) => {
+            let _ = write!(text, " {}:{}:{}: ", span.file, span.line, span.column);
+        }
+        None => text.push_str(" (no place): "),
+    }
+    text.push_str(&diagnostic.message);
     for span in &diagnostic.spans {
         if let Some(label) = &span.label {
-            text.push_str(&format!("\n  {}:{}:{}: {label}", span.file, span.line, span.column));
+            let _ = write!(text, "\n  {}:{}:{}: {label}", span.file, span.line, span.column);
         }
     }
     for child in &diagnostic.children {
-        text.push_str(&format!("\n  {}: {}", level_name(child.level), child.message));
+        let _ = write!(text, "\n  {}: {}", level_name(child.level), child.message);
     }
     for fact in &diagnostic.facts {
-        text.push_str(&format!("\n  read: {}", fact.what));
+        text.push_str("\n  read: ");
+        text.push_str(&fact.what);
     }
     text
 }
@@ -973,8 +1028,30 @@ fn render_failure(test: &TestResult) -> String {
 }
 
 /// The last [`TAIL_LINES`] lines of `output`, at most [`TAIL_BYTES`] of them.
+///
+/// Only the end of the output is read: a test that printed megabytes costs what its tail does.
+/// A suffix that starts just after a newline has the same lines as the whole, both decoded (a
+/// newline ends any malformed UTF-8 sequence) and trimmed, so long as it has the lines asked
+/// for; when trailing blank lines leave it short, a suffix twice as long is tried.
 fn tail(output: &[u8]) -> String {
-    let text = String::from_utf8_lossy(output);
+    let mut newlines = TAIL_LINES + 1;
+    let text = loop {
+        let start = output
+            .iter()
+            .rposition({
+                let mut seen = 0;
+                move |&byte| {
+                    seen += usize::from(byte == b'\n');
+                    seen == newlines
+                }
+            })
+            .map_or(0, |at| at + 1);
+        let text = String::from_utf8_lossy(&output[start..]);
+        if start == 0 || text.trim_end().lines().count() >= TAIL_LINES {
+            break text;
+        }
+        newlines *= 2;
+    };
     let lines: Vec<&str> = text.trim_end().lines().collect();
     let mut tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
     if tail.len() > TAIL_BYTES {

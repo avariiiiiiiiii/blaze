@@ -164,9 +164,7 @@ impl ExprScopes {
         let mut scopes = ExprScopes {
             scopes: Arena::default(),
             scope_entries: Arena::default(),
-            scope_by_expr: ArenaMap::with_capacity(
-                body.expr_only.as_ref().map_or(0, |it| it.exprs.len()),
-            ),
+            scope_by_expr: ArenaMap::with_capacity(body.expr_count()),
         };
         let root = scopes.root_scope();
         if let Some(Param { formal: self_param, user_written: _ }) = body.self_param {
@@ -183,9 +181,7 @@ impl ExprScopes {
         let mut scopes = ExprScopes {
             scopes: Arena::default(),
             scope_entries: Arena::default(),
-            scope_by_expr: ArenaMap::with_capacity(
-                store.expr_only.as_ref().map_or(0, |it| it.exprs.len()),
-            ),
+            scope_by_expr: ArenaMap::with_capacity(store.expr_count()),
         };
         let root = scopes.root_scope();
         for root_expr in roots {
@@ -338,25 +334,25 @@ impl ExprScopeVisitor<'_> {
 impl StoreVisitor for ExprScopeVisitor<'_> {
     fn on_expr(&mut self, expr: ExprId) {
         self.scopes.set_scope(expr, self.scope);
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Block { statements, tail, id, label, unsafe_: _ } => {
-                self.visit_block(expr, *id, statements, *tail, *label);
+                self.visit_block(expr, id, statements, tail, label);
             }
             Expr::Loop { body, label, source: _ } => {
-                let scope = self.scopes.new_labeled_scope(self.scope, *label);
-                self.with_scope(scope, |this| this.on_expr(*body));
+                let scope = self.scopes.new_labeled_scope(self.scope, label);
+                self.with_scope(scope, |this| this.on_expr(body));
             }
             Expr::Closure { args, arg_types, ret_type, body, capture_by: _, closure_kind: _ } => {
                 arg_types.iter().for_each(|type_ref| self.on_type_opt(*type_ref));
-                self.on_type_opt(*ret_type);
+                self.on_type_opt(ret_type);
                 let scope = self.scopes.new_scope(self.scope);
                 self.with_scope(scope, |this| {
                     this.on_pats(args);
-                    this.on_expr(*body);
+                    this.on_expr(body);
                 });
             }
             Expr::Match { expr, arms } => {
-                self.on_expr(*expr);
+                self.on_expr(expr);
                 for arm in arms.iter() {
                     let scope = self.scopes.new_scope(self.scope);
                     self.with_scope(scope, |this| {
@@ -366,7 +362,7 @@ impl StoreVisitor for ExprScopeVisitor<'_> {
                     });
                 }
             }
-            &Expr::If { condition, then_branch, else_branch } => {
+            Expr::If { condition, then_branch, else_branch } => {
                 let then_branch_scope = self.scopes.new_scope(self.scope);
                 self.with_scope(then_branch_scope, |this| {
                     this.on_expr(condition);
@@ -374,7 +370,7 @@ impl StoreVisitor for ExprScopeVisitor<'_> {
                 });
                 self.on_expr_opt(else_branch);
             }
-            &Expr::Let { pat, expr } => {
+            Expr::Let { pat, expr } => {
                 self.on_expr(expr);
                 self.scope = self.scopes.new_scope(self.scope);
                 self.on_pat(pat);
@@ -388,7 +384,7 @@ impl StoreVisitor for ExprScopeVisitor<'_> {
     }
 
     fn on_pat(&mut self, pat: PatId) {
-        if let Pat::Bind { id, .. } = self.store[pat] {
+        if let Pat::Bind { id, .. } = self.store.pat(pat) {
             self.scopes.add_bindings(self.store, self.scope, id, self.store.binding_hygiene(id));
         }
 

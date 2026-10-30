@@ -58,7 +58,7 @@ pub fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<u
     let m = b.chars().count();
     let big_len_diff = (n * 2) < m || (m * 2) < n;
     let len_diff = m.abs_diff(n);
-    let distance = edit_distance(a, b, limit + len_diff)?;
+    let distance = edit_distance(a, b, limit.saturating_add(len_diff))?;
     let score = distance - len_diff;
     let score = if score == 0 && len_diff > 0 && !big_len_diff {
         1

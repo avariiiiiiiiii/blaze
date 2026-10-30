@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { decode, decodeSequence, CborError } from "../cbor.js";
 import { parseSnapshot, SnapshotError } from "../snapshot.js";
-import { parseRecord, RecordError } from "../records.js";
+import { parseFrame, parseRecord, RecordError } from "../records.js";
 import { lastName, moduleOf, splitPath } from "../names.js";
 import { analyseEdit } from "../edit.js";
 import { Model } from "../model.js";
@@ -50,6 +50,21 @@ for (const [name, b, what] of [
   ["deep nesting", new Uint8Array(100).fill(0x81), /deeper/],
 ]) test(`cbor: refuses ${name}`, () => assert.throws(() => decode(b), (e) => e instanceof CborError && what.test(e.message)));
 test("cbor: two items where one is wanted", () => assert.throws(() => decode(bytes(1, 2)), /2 items/));
+
+// What the server sends in one frame: as many records as it had, back to back.
+const unlisted = (n) => [0xa2, text("at_ns"), n, text("event"), 0xa1, text("Unlisted"), 0xa1, text("count"), n].flat();
+test("frame: every record of it, in order", () => {
+  const rs = parseFrame(bytes(unlisted(1), unlisted(2), unlisted(3)));
+  assert.deepEqual(rs.map((r) => r.event.count), [1, 2, 3]);
+  assert.deepEqual(parseFrame(bytes(unlisted(7))).map((r) => r.at_ns), [7]);
+});
+test("frame: a record of it that is not one is named by its place", () => {
+  const bad = [0xa2, text("at_ns"), 1, text("event"), 0xa1, text("Bogus"), 0xa0].flat();
+  assert.throws(() => parseFrame(bytes(unlisted(1), bad)), (e) => e instanceof RecordError && /item 1: .*unknown variant "Bogus"/.test(e.message));
+});
+test("frame: one cut short is refused", () => {
+  assert.throws(() => parseFrame(bytes(unlisted(1), unlisted(2)).subarray(0, 30)), CborError);
+});
 
 // A snapshot of two crates, three nodes, two edges.
 function snap({ version = 1, krate1 = 1, how2 = 3, ns2 = 0n, edgeTo = 2, trailing = 0, dupKey = false } = {}) {

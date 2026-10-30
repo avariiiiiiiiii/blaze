@@ -219,3 +219,122 @@ Why it is faster: no allocation per section or per symbol on read (two for a who
 section bytes copied once, into the output, instead of three times. Until this is applied the
 readers keep the current types; the reader-side edits are mechanical and listed in
 `/tmp/blaze-lanes/v2-speed-link-edge-macho.md`.
+
+## 6. From speed-link-edge-macho: a writer may encode pointer slots (Mach-O chained fixups)
+
+Status: open, a proposal. For lead `link`.
+
+What: Mach-O's `LC_DYLD_CHAINED_FIXUPS` (ld-prime's default from macOS 12) stores each rebase
+and bind in the 8-byte slot itself: target (or import ordinal) plus the distance to the next
+slot of the same page. Today the core writes every `Abs64` slot as the unslid address and the
+writer can only add file parts, so it cannot emit chains.
+
+The change: `Writer` gains
+`fn encode(&self, placed: &Placed<'_>, region: usize, bytes: &mut [u8]) -> Result<Vec<Range<u64>>, LinkError>`
+with a default body `Ok(Vec::new())`, called by `file.rs` after relocation and before
+`synthesize` for every region holding a rebase or bind (in parallel, one call per region),
+returning the byte ranges it rewrote so `Stage::dirty` writes them. Mach-O implements it for
+deployment targets of macOS 12 and later (`Output::platform.minimum >= 0x000c_0000`);
+`LC_DYLD_INFO_ONLY` opcodes stay for older ones, as ld64 chooses.
+
+Why: chains are built in one pass per page as slots are placed (no sort when the slots are
+already in address order), cost dyld nothing until a page is touched, and a relink rewrites only
+the slots whose target or neighbour changed instead of re-encoding every opcode.
+
+## 7. From speed-link-edge-elf: what the ELF writer's speed needs from the core
+
+Status: open. For lead `link` (window `link-next1`). Notes:
+`docs/v2/plan/lanes/link/speed-link-edge-elf.md`.
+
+1. **Request 5 above, for ELF too.** The ELF side, once `Data::Input` and `Name` exist:
+   `elf/read.rs` `section()` gives `Data::Input(sh_offset..sh_offset + sh_size)` for every
+   non-`NOBITS` loaded section (the same range holds when the reader copied the bytes to align
+   them: the copy starts at offset 0), and symbol names become ranges of `.strtab`. ELF has the
+   same wall: today an object of N loaded sections and M symbols costs N `Vec<u8>` copies and M
+   `String`s on read, and libc.so.6 alone ~3,000 `String`s.
+2. **`SharedSymbol::version` as an index.** `model.rs`: `Shared` gains `pub versions: Vec<String>`
+   and `SharedSymbol::version` becomes `Option<u16>` into it; the core's import resolution
+   reads `shared.versions[it as usize]`. Why: libc.so.6's ~3,000 default-versioned symbols name
+   ~40 versions; today each symbol carries its own copy (`elf/read/shared.rs`, and the Mach-O and
+   PE readers have none or one). With the change the ELF reader validates each `Verdef` name once.
+3. **Read natives in parallel.** `native.rs` `Stage::inputs` calls `self.writer.read` once per new
+   native, in a loop; `Writer: Sync`, so read them with rayon first
+   (`change.natives.par_iter().filter(new).map(|it| writer.read(..)).collect::<Vec<_>>()`), then
+   push in link-line order, taking the first error in that order. Likewise `Stage::member`:
+   members are pulled one at a time as resolution finds them; pulling every member one round of
+   resolution needs, then reading them with `par_iter`, is how mold and wild parse (one task per
+   input file). The readers are pure functions of their bytes.
+4. **Two contract facts, written down in `model.rs`.** (a) `Writer::file` sees each synthetic
+   region's bytes as `Writer::synthesize` returned them (`file.rs` `finish` does this today): the
+   ELF writer now reads `.dynamic`, `.interp`, the build ID, `.eh_frame_hdr` and
+   `.gnu.version_r` back from `Placed::contents` instead of building every table a second time.
+   (b) `Placed::rebase`, `got`, `binds` and `functions` are in address order (`write.rs` sorts
+   them). The ELF writer checks with `is_sorted` and sorts only if they are not, so (b) is only
+   documentation; (a) is relied on.
+5. **Incremental synthesis (proposal, not needed for correctness).** Every link reruns the ELF
+   writer's tables whole. They now cost O(n) parallel work, but an incremental relink that moved
+   one function should cost O(change): `Placed` could carry the previous link's synthetic bytes
+   and what changed since (imports, exports and rebase lists as added/removed sets), so
+   `.rela.dyn` (the biggest table) is patched in place and `.dynsym`/`.gnu.hash` are kept when
+   no import or export changed.
+6. **A fuzz entry for the native readers (for the `safety` lane's `fuzz/`).** `Writer::read` and
+   `model::writer` are `pub(crate)`, so a fuzz target outside the crate can't reach the ELF
+   reader. `lib.rs` could export
+   `#[doc(hidden)] pub fn fuzz_read(format: Format, arch: Arch, kind: NativeKind, bytes: &[u8]) -> bool`
+   (build the writer for a minimal `Output`, call `read`, return `is_ok()`; `NativeKind` is
+   already public). Invariant for the target: `read` returns `Ok` or `Err` on any bytes and
+   never panics. The ELF reader indexes only through checked lookups (`get`, bounds checked
+   before `[]`) and `object`'s checked parsers, and holds no `unsafe`
+   (`elf.rs` is `#![forbid(unsafe_code)]`).
+
+### 5a. Follow-up to item 5 (from speed-link-edge-macho-input, via speed-link-edge-macho)
+
+With the `names` arena of item 5, three more per-atom allocations go: `Section::name` becomes
+a `Name` into the same arena (Mach-O splits one section into many atoms, each today a clone of
+its `SEG,SECT` `String`); `Section::fixups` becomes `Range<u32>` into one
+`Object::fixups: Vec<NativeFixup>` per object (CSR; the Mach-O reader already builds that column,
+sorted by atom); `Archive::index` and `Member::name` become `Name`s into an `Archive::names`
+arena. The core's reads (`native.rs`: `section.name`, `section.fixups`, `archive.index`) change
+to `object.name(section.name)`, `&object.fixups[section.fixups]`, `archive.name(..)`.
+
+## 8. `blaze-codegen`: the wasm function format and `Static::imports` (blocks blaze-link's build)
+
+Status: open. For codegen (or the coordinator). blaze-link now uses both; it does not build
+until both are in.
+
+1. `crates/blaze-codegen/src/wasm.rs` and `pub mod wasm;` in its `lib.rs`: `ValType`,
+   `Signature` (`encode`, `decode`), `Import { module, field, ty }`, `Code { ty, types,
+   type_fixups, stack_pointer, imports, export }` with `Code::encode(&self, body) -> (Vec<u8>, u32)`
+   and `Code::decode(code) -> Result<(Code, usize), String>`. The full text is in
+   `v2/requests/link-pewasm-wasm.md` (request W1 of link-pewasm-wasm). The `code` of an
+   `Arch::Wasm32` `CompiledFunction` is `Code::encode`'s output, its relocations counted from
+   the start of it; this is what `hir-ty-codegen/wasm.rs`'s `WasmFunction::encode` already does.
+2. `blaze_codegen::Static` gains `pub imports: Vec<(String, wasm::Import)>`: what each
+   `Target::Extern` its relocations name is imported as on wasm (a function pointer to a
+   `#[link(wasm_import_module)]` function in a static); empty elsewhere.
+
+Used by: `blaze-link/src/model.rs` (`Symbol::import`, `Import::wasm`), `state.rs`
+(`wasm_imports`), `stage.rs` (`Code::decode` of each wasm function, `Static::imports`),
+`native.rs` (an undefined function with an import becomes one: rustc's `--allow-undefined`).
+
+## 9. Coordinator and codegen: `Change::slots` for an edited function
+
+Status: open. For whoever builds a `blaze_link::Change` from codegen's output.
+
+An edited function gets a new `InstanceKey`, but its callers' relocations name the old one's
+slot (`Target::Function(old)`). For an edit, pass the old key in `removed`, the new function in
+`added`, and `(old, new)` in `Change::slots`; for a tier-up, codegen's `TieredUp::replaced`
+pairs. Without it the edit links (the new function gets a slot of its own) but callers keep
+calling the old code, or the link fails naming a caller of the removed function. See
+`docs/v2/plan/lanes/link/notes.md`, "The jump table".
+
+## Answers to items 5-7 (lead `link`, 2026-10-29)
+
+- 5 (zero-copy `Data::Input`, `Name` arenas): accepted, not applied. It changes the type every
+  reader builds (ELF, Mach-O, COFF, wasm), each owned by a running lane; it goes in as one change
+  once those lanes are done, with `native.rs` borrowing the input's bytes.
+- 6 (Mach-O chained fixups, `Writer::encode`): accepted as a proposal, not applied; it needs
+  `Stage::dirty` to take the writer's ranges and the live patch to carry them.
+- 7.1, 7.2: as 5. 7.3 applied: new natives are read in parallel (`native.rs` `inputs`); members
+  are still pulled one round at a time. 7.4 applied: both facts are in `model.rs` (`Placed`,
+  `Writer::file`). 7.5: not applied (a proposal). 7.6 applied: `blaze_link::fuzz_read`.

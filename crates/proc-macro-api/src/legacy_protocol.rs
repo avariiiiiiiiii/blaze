@@ -17,7 +17,7 @@ use crate::{
         ServerConfig, SpanDataIndexMap, deserialize_span_data_index_map,
         flat::serialize_span_data_index_map,
     },
-    process::ProcMacroServerProcess,
+    process::Claimed,
     version,
 };
 
@@ -35,7 +35,7 @@ impl std::fmt::Debug for SpanId {
     }
 }
 
-pub(crate) fn version_check(srv: &ProcMacroServerProcess) -> Result<u32, ServerError> {
+pub(crate) fn version_check(srv: &Claimed<'_>) -> Result<u32, ServerError> {
     let request = Request::ApiVersionCheck {};
     let response = send_task(srv, request)?;
 
@@ -47,7 +47,7 @@ pub(crate) fn version_check(srv: &ProcMacroServerProcess) -> Result<u32, ServerE
 
 /// Enable support for rust-analyzer span mode if the server supports it.
 pub(crate) fn enable_rust_analyzer_spans(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
 ) -> Result<SpanMode, ServerError> {
     let request = Request::SetConfig(ServerConfig { span_mode: SpanMode::RustAnalyzer });
     let response = send_task(srv, request)?;
@@ -60,7 +60,7 @@ pub(crate) fn enable_rust_analyzer_spans(
 
 /// Finds proc-macros in a given dynamic library.
 pub(crate) fn find_proc_macros(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
     dylib_path: &AbsPath,
 ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
     let request = Request::ListMacros { dylib_path: dylib_path.to_path_buf().into() };
@@ -75,7 +75,7 @@ pub(crate) fn find_proc_macros(
 
 pub(crate) fn expand(
     proc_macro: &ProcMacro,
-    process: &ProcMacroServerProcess,
+    process: &Claimed<'_>,
     subtree: tt::SubtreeView<'_>,
     attr: Option<tt::SubtreeView<'_>>,
     env: Vec<(String, String)>,
@@ -142,7 +142,7 @@ pub(crate) fn expand(
 }
 
 /// Sends a request to the proc-macro server and waits for a response.
-fn send_task(srv: &ProcMacroServerProcess, req: Request) -> Result<Response, ServerError> {
+fn send_task(srv: &Claimed<'_>, req: Request) -> Result<Response, ServerError> {
     if let Some(server_error) = srv.exited() {
         return Err(server_error.clone());
     }

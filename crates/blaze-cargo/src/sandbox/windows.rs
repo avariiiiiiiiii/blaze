@@ -132,16 +132,26 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
             format!("making the sandbox's writable directory {}: {error}", dir.display())
         })?;
     }
+    let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
+    let readers = [made.container.0, sid(&made.any)];
+    let mut reads = Vec::new();
+    for path in spec.read.iter().map(PathBuf::as_path).chain(program_dir).chain([spec.dir.as_path()]) {
+        let Ok(metadata) = std::fs::metadata(path) else { continue };
+        let dir = metadata.is_dir();
+        // Read grants are only ever added, so one seen without the lock stays: only a missing
+        // one is changed, under the lock, after looking again.
+        if !covered(path, dir, &readers, READ, "granting the sandbox read")? {
+            reads.push((path, dir));
+        }
+    }
     {
         let _lock = Lock::take()?;
-        let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
-        let readers = [made.container.0, sid(&made.any)];
-        let reads = spec.read.iter().map(PathBuf::as_path).chain(program_dir).chain([spec.dir.as_path()]);
-        for path in reads.filter(|it| it.exists()) {
-            grant(path, made.container.0, &readers, READ, "granting the sandbox read")?;
+        for (path, dir) in reads {
+            grant(path, dir, made.container.0, &readers, READ, "granting the sandbox read")?;
         }
+        // Each is a directory: `create_dir_all` made it or found one.
         for dir in writes {
-            if grant(dir, granted.sid, &[granted.sid], WRITE, "granting the sandbox write")? {
+            if grant(dir, true, granted.sid, &[granted.sid], WRITE, "granting the sandbox write")? {
                 granted.writes.push(dir.to_owned());
             }
         }
@@ -735,11 +745,18 @@ fn trustee(sid: PSID) -> TRUSTEE_W {
     }
 }
 
-/// Gives `sid` `mask` on `path`, inheritably when it is a directory, unless one of `already`
-/// has it there: whether an entry was added.
-fn grant(path: &Path, sid: PSID, already: &[PSID], mask: u32, what: &str) -> Result<bool, String> {
+/// Whether one of `already` has `mask` on `path` (and below it, when it is a directory `dir`), or
+/// its DACL is null and lets everyone in.
+fn covered(path: &Path, dir: bool, already: &[PSID], mask: u32, what: &str) -> Result<bool, String> {
     let name = wide(path.as_os_str(), "a path the sandbox grants")?;
-    let dir = path.is_dir();
+    let current = Dacl::of(&name, path, what)?;
+    Ok(current.dacl.is_null() || current.covers(already, mask, dir))
+}
+
+/// Gives `sid` `mask` on `path`, inheritably when it is a directory `dir`, unless one of
+/// `already` has it there: whether an entry was added.
+fn grant(path: &Path, dir: bool, sid: PSID, already: &[PSID], mask: u32, what: &str) -> Result<bool, String> {
+    let name = wide(path.as_os_str(), "a path the sandbox grants")?;
     let current = Dacl::of(&name, path, what)?;
     // A null DACL lets everyone do everything, and has no entries to add to.
     if current.dacl.is_null() || current.covers(already, mask, dir) {
@@ -824,8 +841,8 @@ impl Drop for Granted {
     }
 }
 
-/// The job of the run in progress, for the console's interrupt to end: 0 for none.
-static JOB: Mutex<usize> = Mutex::new(0);
+/// The jobs of the runs in progress, for the console's interrupt to end.
+static JOBS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// How many runs have not taken back their grants yet, for the console's close to wait on.
 static RUNS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
@@ -847,19 +864,23 @@ impl Drop for Running {
     }
 }
 
-/// Names a job in [`JOB`] while it is not dropped.
-struct Registered;
+/// Names a job in [`JOBS`] while it is not dropped.
+struct Registered(usize);
 
 impl Registered {
     fn new(job: &Handle) -> Registered {
-        *JOB.lock().unwrap_or_else(PoisonError::into_inner) = job.0 as usize;
-        Registered
+        let job = job.0 as usize;
+        JOBS.lock().unwrap_or_else(PoisonError::into_inner).push(job);
+        Registered(job)
     }
 }
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        *JOB.lock().unwrap_or_else(PoisonError::into_inner) = 0;
+        let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = jobs.iter().position(|it| *it == self.0) {
+            jobs.swap_remove(at);
+        }
     }
 }
 
@@ -870,12 +891,12 @@ unsafe extern "system" fn interrupted(event: u32) -> BOOL {
     if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
         return 0;
     }
-    let job = JOB.lock().unwrap_or_else(PoisonError::into_inner);
-    if *job != 0 {
-        // SAFETY: the job stays open while it is named in JOB, whose lock this holds.
-        unsafe { TerminateJobObject(*job as HANDLE, STATUS_CONTROL_C_EXIT as u32) };
+    let jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+    for &job in jobs.iter() {
+        // SAFETY: a job stays open while it is named in JOBS, whose lock this holds.
+        unsafe { TerminateJobObject(job as HANDLE, STATUS_CONTROL_C_EXIT as u32) };
     }
-    drop(job);
+    drop(jobs);
     if event == CTRL_CLOSE_EVENT {
         let runs = RUNS.0.lock().unwrap_or_else(PoisonError::into_inner);
         _ = RUNS.1.wait_timeout_while(runs, Duration::from_secs(4), |runs| *runs > 0);
@@ -1084,6 +1105,33 @@ mod tests {
         assert_eq!(temporary(&exit), temporary(&exit.clone()));
         assert_ne!(temporary(&exit), temporary(&spec(&[c, OsStr::new("exit"), OsStr::new("8")])));
         assert!(!temporary(&exit).unwrap().exists(), "the run's temporary directory was left behind");
+        _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_read_seen_granted_without_the_lock_is_one_granting_would_not_add() {
+        if let Err(why) = probe() {
+            eprintln!("no sandbox can be made here, so this is not run: {why}");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-covered-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&base);
+        let (dir, file) = (base.join("d"), base.join("f.txt"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "x").unwrap();
+        let made = make(false).unwrap();
+        let readers = [made.container.0, sid(&made.any)];
+        for (path, is_dir) in [(&dir, true), (&file, false)] {
+            let before = covered(path, is_dir, &readers, READ, "test").unwrap();
+            let added = {
+                let _lock = Lock::take().unwrap();
+                grant(path, is_dir, made.container.0, &readers, READ, "test").unwrap()
+            };
+            assert_eq!(added, !before, "{}", path.display());
+            assert!(covered(path, is_dir, &readers, READ, "test").unwrap(), "{}", path.display());
+            let _lock = Lock::take().unwrap();
+            assert!(!grant(path, is_dir, made.container.0, &readers, READ, "test").unwrap(), "{}", path.display());
+        }
         _ = std::fs::remove_dir_all(&base);
     }
 }

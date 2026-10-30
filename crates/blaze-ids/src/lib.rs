@@ -14,11 +14,12 @@ use std::{
     fmt, hash,
     marker::PhantomData,
     sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
+use blake3::hazmat::{self, ContextKey, HasherExt};
 use serde::{Deserialize, Serialize};
 
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
@@ -34,6 +35,27 @@ impl ContentId {
         let mut hasher = Hasher::new(domain);
         hasher.update(bytes);
         hasher.finish()
+    }
+
+    /// [`ContentId::of`] for a [`Domain`], its context key read with one acquire load.
+    pub fn of_domain(domain: &Domain, bytes: &[u8]) -> ContentId {
+        let mut hasher = Hasher::of(domain);
+        hasher.update(bytes);
+        hasher.finish()
+    }
+
+    /// `inputs.iter().map(|it| ContentId::of(domain, it))`, the domain's context key looked up
+    /// once for all of them.
+    pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
+        let key = context_key(domain);
+        inputs
+            .iter()
+            .map(|input| {
+                let mut hasher = blake3::Hasher::new_from_context_key(key);
+                hasher.update(input);
+                ContentId(*hasher.finalize().as_bytes())
+            })
+            .collect()
     }
 
     /// The first 128 bits, as a result's fingerprint.
@@ -68,9 +90,66 @@ impl fmt::LowerHex for ContentId {
 /// [`Idx`] can't be hashed but by spelling out [`Idx::raw`], which a reviewer sees.
 pub struct Hasher(blake3::Hasher);
 
+/// A hash domain whose BLAKE3 context key is derived once, on first use: what a domain hashed
+/// millions of times is declared as (`pub static KEY: Domain = Domain::new("blaze v2 key 1")`).
+pub struct Domain {
+    name: &'static str,
+    key: OnceLock<ContextKey>,
+}
+
+impl Domain {
+    pub const fn new(name: &'static str) -> Domain {
+        Domain { name, key: OnceLock::new() }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn key(&self) -> &ContextKey {
+        self.key.get_or_init(|| hazmat::hash_derive_key_context(self.name))
+    }
+}
+
+/// How many distinct domain names [`Hasher::new`] keeps the context keys of.
+const DOMAIN_SLOTS: usize = 1024;
+
+/// The context key of each domain name hashed so far, open-addressed by the name's text: a
+/// slot once set never changes, so a lookup is acquire loads and compares.
+static DOMAIN_KEYS: [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS] =
+    [const { OnceLock::new() }; DOMAIN_SLOTS];
+
+/// FNV-1a: domain names are a few dozen bytes, hashed once per [`Hasher::new`].
+fn name_hash(name: &str) -> usize {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
+    }) as usize
+}
+
+/// `blake3::hazmat::hash_derive_key_context(domain)`, derived once per name.
+fn context_key(domain: &'static str) -> &'static ContextKey {
+    let mut at = name_hash(domain) & (DOMAIN_SLOTS - 1);
+    for _ in 0..DOMAIN_SLOTS {
+        let slot = &DOMAIN_KEYS[at];
+        let (name, key) = match slot.get() {
+            Some(entry) => entry,
+            None => slot.get_or_init(|| (domain, hazmat::hash_derive_key_context(domain))),
+        };
+        if *name == domain {
+            return key;
+        }
+        at = (at + 1) & (DOMAIN_SLOTS - 1);
+    }
+    panic!("more than {DOMAIN_SLOTS} hash domains: raise blaze-ids' DOMAIN_SLOTS");
+}
+
 impl Hasher {
     pub fn new(domain: &'static str) -> Hasher {
-        Hasher(blake3::Hasher::new_derive_key(domain))
+        Hasher(blake3::Hasher::new_from_context_key(context_key(domain)))
+    }
+
+    pub fn of(domain: &Domain) -> Hasher {
+        Hasher(blake3::Hasher::new_from_context_key(domain.key()))
     }
 
     pub fn update(&mut self, bytes: &[u8]) -> &mut Hasher {
@@ -182,7 +261,8 @@ impl<T> fmt::Debug for Idx<T> {
 /// changes, so `&T` lives as long as the interner.
 pub trait Interner<T>: Sync {
     /// The index of the value whose content ID is `id`, interning `value` if it has none.
-    /// `value` must be what `id` is the content ID of.
+    /// `value` must be what `id` is the content ID of. It may run and its value be dropped
+    /// when another worker interns `id` at the same time.
     fn intern(&self, id: ContentId, value: impl FnOnce() -> T) -> Idx<T>;
     fn get(&self, idx: Idx<T>) -> &T;
     fn content(&self, idx: Idx<T>) -> ContentId;
@@ -191,23 +271,40 @@ pub trait Interner<T>: Sync {
 }
 
 /// The [`Interner`] of blaze v2: values in an append-only arena of chunks that never move,
-/// found by content ID in one of [`SHARDS`] open-addressed tables.
+/// found by content ID in one of [`shard_count`] open-addressed tables.
 ///
-/// Interning locks the one shard its content ID falls in; [`Interner::get`],
-/// [`Interner::content`] and [`Interner::find`] take no lock. A shard's table grows by
-/// copying into one twice its size, published once full; the tables it outgrew are kept until
-/// the interner is dropped, as a reader may be probing one, so the tables cost at most twice
-/// the last one. `intern`'s `value` runs with the shard locked, so it must not intern into the
-/// same interner.
+/// [`Interner::get`], [`Interner::content`] and [`Interner::find`] take no lock. Interning a
+/// new value computes it first, then locks the one shard its content ID falls in only to look
+/// again and insert (a racing loser's value is dropped). A shard's table grows by copying into
+/// one twice its size, published once full; the tables it outgrew are kept until the interner
+/// is dropped, as a reader may be probing one, so the tables cost at most twice the last one.
+///
+/// A shard hands out indices from a block of [`BLOCK`] it claims at a time, so writers to
+/// different shards share no counter. Indices are dense but for the unused rest of each
+/// shard's last block: every index is below [`Sharded::end`], at most `BLOCK - 1` per shard
+/// past [`Interner::len`].
 pub struct Sharded<T> {
     slots: Chunks<T>,
-    next: AtomicU32,
-    /// The values interned and published, for [`Interner::len`].
-    published: AtomicUsize,
+    /// The first index no shard has claimed.
+    next: AtomicU64,
     shards: Box<[Shard]>,
+    /// `shards.len() - 1`.
+    mask: usize,
 }
 
-pub const SHARDS: usize = 64;
+/// How many indices a shard claims at a time.
+pub const BLOCK: u32 = 64;
+
+/// The shards of every [`Sharded`]: a power of two at least 4 times the cores, at least 4, so
+/// writers rarely meet on one shard and each shard's table, copied under its lock to grow,
+/// stays small.
+pub fn shard_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        (cores * 4).next_power_of_two().max(4)
+    })
+}
 
 /// Chunk `k` holds `FIRST << k` slots, so an index's chunk and place in it are arithmetic and
 /// 27 chunks hold every `u32`.
@@ -219,9 +316,19 @@ const TABLES: usize = 28;
 
 type Chunks<T> = [OnceLock<Box<[OnceLock<(ContentId, T)>]>>; CHUNKS];
 
+/// The indices `next..end` a shard has claimed and not yet handed out.
+struct Claimed {
+    next: u32,
+    end: u32,
+}
+
+/// One cache line pair per shard, so writers to neighbouring shards don't share a line.
+#[repr(align(128))]
 struct Shard {
-    /// Held to intern; holds how many values the shard has.
-    lock: Mutex<u32>,
+    /// Held only to look again and insert.
+    lock: Mutex<Claimed>,
+    /// How many values the shard has, written under `lock`.
+    len: AtomicU32,
     /// Which of `tables` is the one in use.
     level: AtomicUsize,
     /// A place holds an index plus one; 0 is empty.
@@ -236,18 +343,26 @@ fn chunk_of(raw: u32) -> (usize, usize) {
 
 impl<T: Send + Sync> Sharded<T> {
     pub fn new() -> Sharded<T> {
+        let count = shard_count();
         Sharded {
             slots: std::array::from_fn(|_| OnceLock::new()),
-            next: AtomicU32::new(0),
-            published: AtomicUsize::new(0),
-            shards: (0..SHARDS)
+            next: AtomicU64::new(0),
+            shards: (0..count)
                 .map(|_| Shard {
-                    lock: Mutex::new(0),
+                    lock: Mutex::new(Claimed { next: 0, end: 0 }),
+                    len: AtomicU32::new(0),
                     level: AtomicUsize::new(0),
                     tables: std::array::from_fn(|_| OnceLock::new()),
                 })
                 .collect(),
+            mask: count - 1,
         }
+    }
+
+    /// Above every index handed out so far, by at most [`BLOCK`] per shard: what a column
+    /// indexed by [`Idx`] is sized to.
+    pub fn end(&self) -> usize {
+        self.next.load(Ordering::Acquire) as usize
     }
 
     fn slot(&self, raw: u32) -> Option<&(ContentId, T)> {
@@ -256,7 +371,9 @@ impl<T: Send + Sync> Sharded<T> {
     }
 
     fn shard(&self, id: &ContentId) -> &Shard {
-        &self.shards[id.0[0] as usize % SHARDS]
+        let mut word = [0; 4];
+        word.copy_from_slice(&id.0[..4]);
+        &self.shards[u32::from_le_bytes(word) as usize & self.mask]
     }
 
     /// Where `id`'s probe starts: bits of the ID the shard was not picked by.
@@ -320,31 +437,37 @@ impl<T: Send + Sync> Default for Sharded<T> {
 
 impl<T: Send + Sync> Interner<T> for Sharded<T> {
     fn intern(&self, id: ContentId, value: impl FnOnce() -> T) -> Idx<T> {
-        let shard = self.shard(&id);
         if let Some(found) = self.find(&id) {
             return found;
         }
-        let mut count = shard.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let value = value();
+        let shard = self.shard(&id);
+        let mut claimed = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut level = shard.level.load(Ordering::Acquire);
         if let Ok(found) = self.probe(Self::table(shard, level), &id) {
             return found;
         }
-        if (*count as usize + 1) * 2 > TABLE << level {
+        let len = shard.len.load(Ordering::Relaxed);
+        if (len as usize + 1) * 2 > TABLE << level {
             level = self.grow(shard, level);
         }
-        let raw = self.next.fetch_add(1, Ordering::Relaxed);
-        assert!(raw != u32::MAX, "an interner of 2^32 values");
+        if claimed.next == claimed.end {
+            let start = self.next.fetch_add(BLOCK as u64, Ordering::AcqRel);
+            assert!(start + BLOCK as u64 <= u32::MAX as u64, "an interner of 2^32 values");
+            *claimed = Claimed { next: start as u32, end: start as u32 + BLOCK };
+        }
+        let raw = claimed.next;
+        claimed.next += 1;
         let (chunk, at) = chunk_of(raw);
         let slots = self.slots[chunk]
             .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
-        if slots[at].set((id, value())).is_err() {
+        if slots[at].set((id, value)).is_err() {
             unreachable!("index {raw} handed out twice");
         }
         let table = Self::table(shard, level);
         let Err(empty) = self.probe(table, &id) else { unreachable!("interned under the lock") };
         table[empty].store(raw + 1, Ordering::Release);
-        *count += 1;
-        self.published.fetch_add(1, Ordering::Relaxed);
+        shard.len.store(len + 1, Ordering::Relaxed);
         Idx::from_raw(raw)
     }
 
@@ -363,7 +486,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
     }
 
     fn len(&self) -> usize {
-        self.published.load(Ordering::Relaxed)
+        self.shards.iter().map(|shard| shard.len.load(Ordering::Relaxed) as usize).sum()
     }
 }
 
@@ -375,6 +498,92 @@ mod tests {
     fn domains_part_equal_bytes() {
         assert_ne!(ContentId::of("blaze v2 a 1", b"x"), ContentId::of("blaze v2 b 1", b"x"));
         assert_eq!(ContentId::of("blaze v2 a 1", b"x"), ContentId::of("blaze v2 a 1", b"x"));
+    }
+
+    const DOMAINS: [&str; 5] =
+        ["blaze v2 a 1", "blaze v2 b 1", "", "blaze v2 key 1", "blaze v2 a domain of some length 7"];
+
+    #[test]
+    fn a_hasher_derives_its_domain_key() {
+        for domain in DOMAINS {
+            for bytes in [&b""[..], b"x", &[7; 1025]] {
+                let mut expected = blake3::Hasher::new_derive_key(domain);
+                expected.update(bytes);
+                let expected = ContentId(*expected.finalize().as_bytes());
+                assert_eq!(ContentId::of(domain, bytes), expected, "{domain:?}");
+                assert_eq!(ContentId::of(domain, bytes), expected, "{domain:?}, again");
+                let named = Domain::new(domain);
+                assert_eq!(named.name(), domain);
+                assert_eq!(ContentId::of_domain(&named, bytes), expected, "{domain:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn of_many_is_of_for_each() {
+        let lengths = [0, 1, 63, 64, 65, 1024, 1025, 3000, 2, 64];
+        let inputs: Vec<Vec<u8>> =
+            lengths.iter().enumerate().map(|(i, &len)| (0..len).map(|b| (b * 7 + i) as u8).collect()).collect();
+        let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
+        for domain in DOMAINS {
+            let expected: Vec<ContentId> = inputs.iter().map(|it| ContentId::of(domain, it)).collect();
+            assert_eq!(ContentId::of_many(domain, &inputs), expected, "{domain:?}");
+        }
+        assert_eq!(ContentId::of_many("blaze v2 a 1", &[]), Vec::new());
+    }
+
+    #[test]
+    fn many_domains_keep_their_own_keys() {
+        let names: Vec<&'static str> =
+            (0..600).map(|n| &*Box::leak(format!("blaze v2 test domain {n}").into_boxed_str())).collect();
+        let first: Vec<ContentId> = names.iter().map(|name| ContentId::of(name, b"x")).collect();
+        let threads: Vec<Vec<ContentId>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| names.iter().map(|name| ContentId::of(name, b"x")).collect()))
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        for (name, id) in names.iter().zip(&first) {
+            let mut expected = blake3::Hasher::new_derive_key(name);
+            expected.update(b"x");
+            assert_eq!(*id, ContentId(*expected.finalize().as_bytes()), "{name}");
+        }
+        for ids in threads {
+            assert_eq!(ids, first);
+        }
+        let copy: &'static str = Box::leak(names[3].to_owned().into_boxed_str());
+        assert_eq!(ContentId::of(copy, b"x"), first[3], "the same name at another address");
+    }
+
+    #[test]
+    fn shards_are_a_power_of_two_of_at_least_four_per_core() {
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let count = shard_count();
+        assert!(count.is_power_of_two() && count >= 4 && count >= 4 * cores, "{count}");
+        assert_eq!(Sharded::<u8>::new().shards.len(), count);
+    }
+
+    #[test]
+    fn a_value_may_intern_into_its_own_interner() {
+        let interner = Sharded::<u64>::new();
+        let outer = interner.intern(id(1), || *interner.get(interner.intern(id(2), || 2)) + 1);
+        assert_eq!(*interner.get(outer), 3);
+        assert_eq!(interner.find(&id(2)).map(|it| *interner.get(it)), Some(2));
+        assert_eq!(interner.len(), 2);
+    }
+
+    #[test]
+    fn indices_are_dense_but_for_each_shards_last_block() {
+        let interner = Sharded::<u64>::new();
+        for n in 0..30_000 {
+            interner.intern(id(n), || n);
+        }
+        let end = interner.end();
+        let shards = interner.shards.len();
+        assert!(end >= interner.len() && end - interner.len() <= shards * BLOCK as usize, "{end}");
+        for n in 0..30_000 {
+            assert!((interner.find(&id(n)).unwrap().raw() as usize) < end);
+        }
     }
 
     #[test]

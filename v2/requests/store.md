@@ -158,6 +158,8 @@
   64 KiB of dictionary into a zstd context cost more than decompressing a small cold value.
   The digested dictionaries are shared by every reader thread.
 
+> forwarded to coordinator: a new `vendor/` crate (and its root `[patch]`) is the coordinator's, not among the paths `requests` applies; `zstd-safe` 7.x and `zstd` 0.13 are in the lock and the local registry.
+
 ## Put each crate version's values in its unit (#1298)
 
 - Who: every caller of `Store::put`: blaze-codegen, blaze-usercode, blaze-expand,
@@ -170,3 +172,5 @@
 - Why: the store is now one mapped file per crate version, which the lane's "Done when" asks
   for, but a value only lands in its crate's file when its caller says which crate it is.
   Until then every value is in the shared file, as before.
+
+> forwarded to codegen, usercode, cargo and db: each caller of `Store::put` is in its own lane (blaze-codegen; blaze-usercode and blaze-expand; blaze-cargo's `serve/`; the query results through the daemon).

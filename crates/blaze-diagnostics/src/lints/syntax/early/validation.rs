@@ -41,48 +41,77 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
+/// One pass over the nodes [`Walk`] already holds (flat-tree cursors: a root pointer and a
+/// `u32` index), fusing AST validation, the parser's lints and the type parameter check the
+/// way rustc's combined early lint pass fuses its lints, but without rustc's second walk for
+/// AST validation. Each node costs one `kind` read (a column load) and a `match` on it; a
+/// cursor is cloned and cast only for the few kinds a lint looks at, and nothing is allocated
+/// unless a lint fires. The only other nodes read are those of the subtrees `cfg` removes and
+/// attribute macros replace, which only the parser sees.
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     let mut out = Vec::new();
-    for tree in &walk.trees {
+    let mut parsed = parser::Parsed::new(cx, walk);
+    for (index, tree) in walk.trees.iter().enumerate() {
+        let index = index as u32;
         for node in &tree.nodes {
             validate(cx, tree, node, &mut out);
-            if let Some(param) = ast::TypeParam::cast(node.clone()) {
-                type_param_case(cx, tree, &param, &mut out);
+            parsed.check(cx, tree, index, node);
+        }
+        let unseen = tree.off.iter().chain(&tree.replaced);
+        for root in unseen.clone() {
+            let range = root.text_range();
+            let nested = unseen.clone().any(|it| it.text_range() != range && it.text_range().contains_range(range));
+            if nested {
+                continue;
+            }
+            for node in root.descendants() {
+                parsed.check(cx, tree, index, &node);
             }
         }
     }
-    out.extend(parser::lints(cx, walk));
+    out.extend(parsed.finish());
     out
 }
 
-/// The lints AST validation buffers at `node`, in the order it buffers them.
+/// The lints AST validation buffers at `node`, in the order it buffers them, and
+/// `non_camel_case_types` of a type parameter.
 fn validate(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
-    if let Some(block) = ast::ExternBlock::cast(node.clone()) {
-        if block.unsafe_token().is_none() {
-            missing_unsafe_on_extern(cx, tree, node, out);
+    match node.kind() {
+        SyntaxKind::EXTERN_BLOCK => {
+            let Some(block) = ast::ExternBlock::cast(node.clone()) else { return };
+            if block.unsafe_token().is_none() {
+                missing_unsafe_on_extern(cx, tree, node, out);
+            }
+            if let Some(abi) = block.abi() {
+                missing_abi(cx, tree, &abi, node, out);
+            }
         }
-        if let Some(abi) = block.abi() {
+        SyntaxKind::FN => {
+            let Some(item) = ast::Fn::cast(node.clone()) else { return };
+            if let Some(abi) = item.abi() {
+                missing_abi(cx, tree, &abi, node, out);
+            }
+            if in_assoc_item_list(node) && item.body().is_none() {
+                patterns_without_body(cx, tree, &item, out);
+            }
+        }
+        SyntaxKind::FN_PTR_TYPE => {
+            let Some(abi) = ast::FnPtrType::cast(node.clone()).and_then(|it| it.abi()) else { return };
             missing_abi(cx, tree, &abi, node, out);
         }
-    } else if let Some(item) = ast::Fn::cast(node.clone()) {
-        if let Some(abi) = item.abi() {
-            missing_abi(cx, tree, &abi, node, out);
-        }
-        if item.body().is_none() && in_assoc_item_list(node) {
-            patterns_without_body(cx, tree, &item, out);
-        }
-    } else if let Some(ty) = ast::FnPtrType::cast(node.clone()) {
-        if let Some(abi) = ty.abi() {
-            missing_abi(cx, tree, &abi, node, out);
-        }
-    } else if let Some(item) = ast::Const::cast(node.clone()) {
-        if !in_assoc_item_list(node) {
+        SyntaxKind::CONST if !in_assoc_item_list(node) => {
+            let Some(item) = ast::Const::cast(node.clone()) else { return };
             unused_visibility(cx, tree, &item, out);
         }
-    } else if let Some(alias) = ast::TypeAlias::cast(node.clone())
-        && in_assoc_item_list(node)
-    {
-        where_clause_location(cx, tree, &alias, out);
+        SyntaxKind::TYPE_ALIAS if in_assoc_item_list(node) => {
+            let Some(alias) = ast::TypeAlias::cast(node.clone()) else { return };
+            where_clause_location(cx, tree, &alias, out);
+        }
+        SyntaxKind::TYPE_PARAM => {
+            let Some(param) = ast::TypeParam::cast(node.clone()) else { return };
+            type_param_case(cx, tree, &param, out);
+        }
+        _ => {}
     }
 }
 
@@ -95,14 +124,24 @@ fn in_assoc_item_list(node: &SyntaxNode) -> bool {
 /// `at`.
 fn emit(
     cx: &Cx<'_, '_>,
-    mut diag: Diag,
+    diag: Diag,
     pass: Pass,
     at: InFile<SyntaxNodePtr>,
     read: InFile<SyntaxNodePtr>,
     out: &mut Vec<Emitted>,
 ) {
+    out.push(emitted(cx, diag, pass, at, read));
+}
+
+fn emitted(
+    cx: &Cx<'_, '_>,
+    mut diag: Diag,
+    pass: Pass,
+    at: InFile<SyntaxNodePtr>,
+    read: InFile<SyntaxNodePtr>,
+) -> Emitted {
     source_fact(cx, &mut diag, read);
-    out.push(Emitted::new(diag, Phase::Resolve, pass, at));
+    Emitted::new(diag, Phase::Resolve, pass, at)
 }
 
 /// The syntax context of the token at `offset` of `file`: rustc's `Span::ctxt` of it, which
@@ -162,23 +201,8 @@ fn missing_abi(cx: &Cx<'_, '_>, tree: &Tree, abi: &ast::Abi, at: &SyntaxNode, ou
 /// body (any other pattern there is the error E0642, of a foreign function E0130).
 fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree, item: &ast::Fn, out: &mut Vec<Emitted>) {
     let Some(params) = item.param_list() else { return };
-    let mut found: Vec<(TextRange, String)> = Vec::new();
-    if let Some(it) = params.self_param()
-        && it.amp_token().is_none()
-        && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
-    {
-        let range = TextRange::new(mut_.text_range().start(), name.syntax().text_range().end());
-        found.push((range, name.text().to_owned()));
-    }
-    for param in params.params() {
-        let Some(ast::Pat::IdentPat(pat)) = param.pat() else { continue };
-        if pat.mut_token().is_none() || pat.ref_token().is_some() || pat.pat().is_some() {
-            continue;
-        }
-        let Some(name) = pat.name() else { continue };
-        found.push((pat.syntax().text_range(), name.text().to_owned()));
-    }
-    for (range, name) in found {
+    let at = tree.ptr(item.syntax());
+    let mut lint = |range: TextRange, name: &ast::Name| {
         let span = span(cx, tree, range);
         let edition = edition_at(cx, tree.file, range.start());
         let mut diag =
@@ -186,10 +210,24 @@ fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree, item: &ast::Fn, out: &mut
         diag.suggestion(
             span,
             "remove `mut` from the parameter",
-            pretty::ident(&name, edition),
+            pretty::ident(name.text(), edition),
             Applicability::MachineApplicable,
         );
-        emit(cx, diag, Pass::Buffered, tree.ptr(item.syntax()), tree.ptr(item.syntax()), out);
+        emit(cx, diag, Pass::Buffered, at, at, out);
+    };
+    if let Some(it) = params.self_param()
+        && it.amp_token().is_none()
+        && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
+    {
+        lint(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end()), &name);
+    }
+    for param in params.params() {
+        let Some(ast::Pat::IdentPat(pat)) = param.pat() else { continue };
+        if pat.mut_token().is_none() || pat.ref_token().is_some() || pat.pat().is_some() {
+            continue;
+        }
+        let Some(name) = pat.name() else { continue };
+        lint(pat.syntax().text_range(), &name);
     }
 }
 
@@ -219,35 +257,39 @@ fn unused_visibility(cx: &Cx<'_, '_>, tree: &Tree, item: &ast::Const, out: &mut 
 /// `= Type`, with rustc's suggestion to move its predicates after the type (or, when there are
 /// none and a `where` is already there, to remove it).
 fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree, alias: &ast::TypeAlias, out: &mut Vec<Emitted>) {
+    let mut clauses = alias.syntax().children().filter(|it| it.kind() == SyntaxKind::WHERE_CLAUSE);
+    let Some(before) = clauses.next() else { return };
     let (Some(eq), Some(ty)) = (alias.eq_token(), alias.ty()) else { return };
     let eq = eq.text_range();
-    let clauses: Vec<ast::WhereClause> = alias.syntax().children().filter_map(ast::WhereClause::cast).collect();
-    let Some(before) = clauses.iter().find(|it| it.syntax().text_range().end() <= eq.start()) else { return };
-    let after = clauses.iter().find(|it| it.syntax().text_range().start() >= eq.end());
-    let range = before.syntax().text_range();
+    let range = before.text_range();
+    if range.end() > eq.start() {
+        return;
+    }
+    let Some(before) = ast::WhereClause::cast(before) else { return };
+    let after = clauses.next().and_then(ast::WhereClause::cast);
     let span = span(cx, tree, range);
     let mut diag = Diag::lint("deprecated_where_clause_location", "where clause not allowed here", span.clone());
     diag.note("see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information");
-    let predicates: Vec<ast::WherePred> = before.predicates().collect();
-    if !predicates.is_empty() || after.is_none() {
+    let has_predicates = before.predicates().next().is_some();
+    if has_predicates || after.is_none() {
         let edition = edition_at(cx, tree.file, range.start());
-        let mut needs_comma = after.is_some_and(|it| it.predicates().next().is_some());
+        let mut needs_comma = after.as_ref().is_some_and(|it| it.predicates().next().is_some());
         let mut moved = String::new();
-        match after {
+        match &after {
             None => moved.push_str(" where "),
             Some(_) if !needs_comma => moved.push(' '),
             Some(_) => {}
         }
-        for predicate in &predicates {
+        for predicate in before.predicates() {
             if needs_comma {
                 moved.push_str(", ");
             }
             needs_comma = true;
-            moved.push_str(&pretty::where_predicate(predicate, edition));
+            pretty::where_predicate(&mut moved, &predicate, edition);
         }
         // rustc's printer writes a break it ends on as nothing.
-        let moved = moved.trim_end().to_owned();
-        let end = after.map_or(ty.syntax().text_range().end(), |it| it.syntax().text_range().end());
+        moved.truncate(moved.trim_end().len());
+        let end = after.as_ref().map_or(ty.syntax().text_range().end(), |it| it.syntax().text_range().end());
         let right = cx.span(InFile::new(tree.file, TextRange::empty(end)));
         diag.multipart_suggestion(
             "move it to the end of the type declaration",

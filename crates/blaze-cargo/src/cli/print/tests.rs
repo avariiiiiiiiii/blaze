@@ -111,7 +111,7 @@ fn printed(shown: Shown, responses: &[Response], ok: bool) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
     for response in responses {
-        printer.on(response).unwrap();
+        printer.on(response.clone()).unwrap();
     }
     printer.finish(ok, Duration::from_millis(1234)).unwrap();
     drop(printer);

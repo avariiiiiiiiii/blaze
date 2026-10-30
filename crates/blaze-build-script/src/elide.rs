@@ -20,6 +20,7 @@
 pub mod lex;
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
@@ -179,7 +180,7 @@ fn printed(tokens: &[Token<'_>]) -> Option<String> {
         if !tokens[end].is_punct(close) {
             return None;
         }
-        out.push_str(&format(&tokens[start..end], newline)?);
+        format(&tokens[start..end], newline, &mut out)?;
         at = end + 1;
         // A brace-delimited macro is a statement of its own; a `;` after it would be an empty
         // statement (`redundant_semicolons`). Another needs its `;` unless it ends the block.
@@ -194,12 +195,14 @@ fn printed(tokens: &[Token<'_>]) -> Option<String> {
     (at == tokens.len()).then_some(out)
 }
 
-/// What `format_args!` (with `println!`'s newline) makes of `args`.
-fn format(args: &[Token<'_>], newline: bool) -> Option<String> {
+/// What `format_args!` (with `println!`'s newline) makes of `args`, added to `out`. The
+/// format string is copied in runs between its braces, each argument borrowed where the
+/// source has it.
+fn format(args: &[Token<'_>], newline: bool, out: &mut String) -> Option<()> {
     let (spec, mut rest) = args.split_first()?;
-    let spec = match &spec.kind {
-        Kind::Str { value, escaped_brace: false } => value,
-        Kind::RawStr { value } => value,
+    let spec: &str = match &spec.kind {
+        Kind::Str { value, escaped_brace: false } => &**value,
+        Kind::RawStr { value } => *value,
         _ => return None,
     };
     let mut values = Vec::new();
@@ -213,22 +216,20 @@ fn format(args: &[Token<'_>], newline: bool) -> Option<String> {
     }
     let mut used = vec![false; values.len()];
     let mut next = 0;
-    let mut out = String::new();
-    let mut chars = spec.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '{' if chars.peek() == Some(&'{') => {
-                chars.next();
-                out.push('{');
+    // Braces are ASCII, so every index below is on a character's boundary.
+    let bytes = spec.as_bytes();
+    let (mut at, mut copied) = (0, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            brace @ (b'{' | b'}') if bytes.get(at + 1) == Some(&brace) => {
+                out.push_str(&spec[copied..=at]);
+                at += 2;
+                copied = at;
             }
-            '{' => {
-                let mut argument = String::new();
-                loop {
-                    match chars.next()? {
-                        '}' => break,
-                        c => argument.push(c),
-                    }
-                }
+            b'{' => {
+                out.push_str(&spec[copied..at]);
+                let close = at + 1 + memchr::memchr(b'}', &bytes[at + 1..])?;
+                let argument = &spec[at + 1..close];
                 let index = if argument.is_empty() {
                     next += 1;
                     next - 1
@@ -241,31 +242,34 @@ fn format(args: &[Token<'_>], newline: bool) -> Option<String> {
                 };
                 out.push_str(values.get(index)?);
                 used[index] = true;
+                at = close + 1;
+                copied = at;
             }
-            '}' if chars.peek() == Some(&'}') => {
-                chars.next();
-                out.push('}');
-            }
-            '}' => return None,
-            c => out.push(c),
+            b'}' => return None,
+            _ => at += 1,
         }
     }
+    out.push_str(&spec[copied..]);
     if used.contains(&false) {
         return None;
     }
     if newline {
         out.push('\n');
     }
-    Some(out)
+    Some(())
 }
 
-/// A literal as `Display` shows it.
-fn display(token: &Token<'_>) -> Option<String> {
+/// A literal as `Display` shows it: borrowed from the token but for a number or a
+/// character.
+fn display<'t>(token: &'t Token<'_>) -> Option<Cow<'t, str>> {
     match &token.kind {
-        Kind::Str { value, .. } | Kind::RawStr { value } => Some(value.clone()),
-        Kind::Char(c) => Some(c.to_string()),
-        Kind::Int(value) if *value <= i32::MAX as u128 => Some(value.to_string()),
-        Kind::Ident if token.text == "true" || token.text == "false" => Some(token.text.to_owned()),
+        Kind::Str { value, .. } => Some(Cow::Borrowed(&**value)),
+        Kind::RawStr { value } => Some(Cow::Borrowed(*value)),
+        Kind::Char(c) => Some(Cow::Owned(c.to_string())),
+        Kind::Int(value) if *value <= i32::MAX as u128 => Some(Cow::Owned(value.to_string())),
+        Kind::Ident if token.text == "true" || token.text == "false" => {
+            Some(Cow::Borrowed(token.text))
+        }
         _ => None,
     }
 }

@@ -1,6 +1,7 @@
 // A decoded CBOR item checked against blaze_protocol::events::Record (serde's externally
 // tagged enums: a unit variant is its name as text, a struct variant a map of one entry).
 // What does not fit is refused with the path to it, never patched up.
+import { decodeSequence } from "./cbor.js";
 
 export class RecordError extends Error {}
 
@@ -122,6 +123,18 @@ const EVENT = {
 export function parseRecord(v) {
   const r = struct(v, "", { at_ns: num, event: (e, p) => e });
   return { at_ns: r.at_ns, event: enumOf(r.event, ".event", EVENT) };
+}
+
+// A frame of the websocket: a CBOR sequence of records, as many as the server had at once
+// (docs/web.md, "The wire").
+export function parseFrame(bytes) {
+  return decodeSequence(bytes).map((v, i) => {
+    try {
+      return parseRecord(v);
+    } catch (e) {
+      throw new RecordError(`item ${i}: ${e.message}`);
+    }
+  });
 }
 
 // Cause::short, as the terminal says it.

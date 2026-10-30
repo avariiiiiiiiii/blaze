@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-ids.workspace = true
+blaze-reclaim.workspace = true
+hashbrown.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 

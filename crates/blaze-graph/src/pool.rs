@@ -1,14 +1,22 @@
 //! The threads the plane's tasks run on (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The
 //! executor"): one worker per CPU of a [`Topology`], stealing work nearest first.
 //!
-//! Each worker has a deque of its own and each group (the CPUs sharing a last-level cache or a
-//! cluster) an injector. A job submitted near a group goes to that group's injector; one near
-//! no group goes to the least loaded group, the fast ones first on a tie (Apple's performance
-//! cores, where the plane's first ready nodes, its critical path, go). An idle worker takes from
-//! its own deque, then its group's injector, then its group's workers, then each group of its
-//! [`Topology::steal_order`] the same way; after a short bound of looking again it parks, and
-//! each job wakes one parked worker, of its group first. Pushing, popping and stealing take no
-//! lock (crossbeam's deques).
+//! Each worker has a deque of its own (crossbeam's Chase-Lev deque, as Rayon's) and a LIFO
+//! slot, and each group (the CPUs sharing a last-level cache or a cluster) an injector. A job
+//! submitted near a group goes to that group's injector; one near no group goes to the least
+//! loaded group, the fast ones first on a tie (Apple's performance cores, where the plane's
+//! first ready nodes, its critical path, go). A job a worker gives itself ([`Pool::submit_next`],
+//! or a [`Scope`]'s job submitted on one of the pool's workers) goes to its LIFO slot and runs
+//! next, hot in its cache, as in Tokio; after three such jobs in a row the slot's job goes
+//! behind the deque's, so the slot never starves it.
+//!
+//! An idle worker takes from its slot and its deque, then searches: its group's injector and
+//! workers (from a random one, half a deque at a time), then each group of its
+//! [`Topology::steal_order`] the same way, four times over, then parks. At most half the
+//! workers search at once, and a job wakes a parked worker (of its group first) only when none
+//! searches; a searcher that finds work and was the last wakes another for the rest (Go's and
+//! Tokio's rules), so a burst of work wakes no stampede and none is left unseen. A parked worker
+//! sleeps on its own thread's futex (`thread::park`), not a shared condvar.
 //!
 //! Bound to its CPU, a worker is pinned to it on Linux (`sched_setaffinity`); on macOS, which
 //! pins nothing, it takes the QoS class of its kind of core: user-interactive on fast cores,
@@ -18,14 +26,14 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::Cell,
     io,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    rc::Rc,
+    ptr::{self, NonNull},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering, fence},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
     },
     thread::{self, JoinHandle, Thread},
 };
@@ -33,47 +41,130 @@ use std::{
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
 use crate::{
-    pump::{PUMP_DEPTH, SPINS, depth, lock, run_task},
+    pump::{Lock, PUMP_DEPTH, SPINS, depth, run_task},
     topology::{Cpu, Topology},
 };
 
 /// A worker's stack: room for the jobs it pumps above the one that waits.
 const STACK: usize = 64 << 20;
-/// How many jobs a worker takes from an injector at once.
+/// How many jobs a worker takes from an injector at once: few, so the plane's order (its
+/// critical path first) holds across workers.
 const BATCH: usize = 4;
+/// How many jobs in a row a worker runs from its LIFO slot before its deque's oldest (Tokio's
+/// `MAX_LIFO_POLLS_PER_TICK`).
+const LIFO_RUNS: u8 = 3;
+/// How many times a searching worker looks at every queue before it parks.
+const ROUNDS: u32 = 4;
 
-struct Job {
-    /// The group it was submitted to.
-    group: usize,
-    run: Box<dyn FnOnce() + Send>,
+/// What the queues hold: a pointer to a job's [`Header`], which says how to run it. 8 bytes,
+/// so a line of a deque's buffer holds eight jobs.
+pub(crate) struct Job(NonNull<Header>);
+
+const _: () = assert!(size_of::<Job>() == 8);
+
+// SAFETY: a job is made only of work that may move to another thread (`Job::erase`'s bound, or
+// a scheduler's run, whose fields are `Send`), and is run once, by the thread that takes it.
+unsafe impl Send for Job {}
+
+/// The first field of every job: the function that runs it, given the job.
+#[repr(C)]
+pub(crate) struct Header {
+    run: unsafe fn(NonNull<Header>),
 }
 
+impl Header {
+    pub(crate) const fn new(run: unsafe fn(NonNull<Header>)) -> Header {
+        Header { run }
+    }
+}
+
+#[repr(C)]
+struct Boxed<F> {
+    header: Header,
+    f: F,
+}
+
+impl Job {
+    /// `f` on the heap, freed as it runs.
+    fn boxed<F: FnOnce() + Send + 'static>(f: F) -> Job {
+        // SAFETY: `f` borrows nothing.
+        unsafe { Job::erase(f) }
+    }
+
+    /// # Safety
+    ///
+    /// What `f` borrows outlives its run.
+    unsafe fn erase<F: FnOnce() + Send>(f: F) -> Job {
+        unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
+            // SAFETY: `header` is the first field of the `Boxed<F>` that `erase` leaked, run once.
+            let boxed = unsafe { Box::from_raw(header.cast::<Boxed<F>>().as_ptr()) };
+            let Boxed { f, .. } = *boxed;
+            f();
+        }
+        let boxed = Box::leak(Box::new(Boxed { header: Header::new(run::<F>), f }));
+        Job(NonNull::from(boxed).cast())
+    }
+
+    /// # Safety
+    ///
+    /// `header` is the first field of a job that lives until it has run, and that no other
+    /// [`Job`] names until then.
+    pub(crate) unsafe fn from_header(header: NonNull<Header>) -> Job {
+        Job(header)
+    }
+
+    fn run(self) {
+        // SAFETY: a job is run once (it is moved here), and its header says how.
+        let run = unsafe { self.0.as_ref().run };
+        // SAFETY: as above.
+        unsafe { run(self.0) }
+    }
+}
+
+/// A group's own: 128-byte aligned, as its injector's ends are.
+#[repr(align(128))]
 struct Group {
     injector: Injector<Job>,
-    workers: Vec<usize>,
-    order: Vec<usize>,
+    workers: Box<[u32]>,
+    order: Box<[u32]>,
     fast: bool,
-    /// Its workers parked or about to park.
-    sleepers: AtomicUsize,
-    /// Jobs submitted to it not yet started.
-    queued: AtomicUsize,
-    /// Its workers running a job.
-    busy: AtomicUsize,
+    /// Its workers parked or about to park, as their [`Slot::sleeping`] says.
+    sleepers: AtomicU32,
 }
 
+/// A worker as the others see it: 128-byte aligned, since thieves read it while it writes.
+#[repr(align(128))]
 struct Slot {
     stealer: Stealer<Job>,
-    group: usize,
+    /// The LIFO slot: the job to run next, which thieves take only when there is nothing else.
+    next: AtomicPtr<Header>,
     sleeping: AtomicBool,
+    group: u32,
     thread: OnceLock<Thread>,
 }
 
+/// How many workers search and how many sleep, in one word so a submit reads both at once.
+#[repr(align(128))]
+struct Idle(AtomicU64);
+
+const SEARCHING: u64 = 1;
+const SLEEPING: u64 = 1 << 32;
+
+fn searching(word: u64) -> u64 {
+    word & (SLEEPING - 1)
+}
+
+fn sleeping(word: u64) -> u64 {
+    word >> 32
+}
+
 struct Shared {
-    groups: Vec<Group>,
-    slots: Vec<Slot>,
+    groups: Box<[Group]>,
+    slots: Box<[Slot]>,
+    idle: Idle,
     stop: AtomicBool,
     /// The first panic of a job's `done`, raised when the pool is dropped.
-    stray: Mutex<Option<Box<dyn Any + Send>>>,
+    stray: Lock<Option<Box<dyn Any + Send>>>,
 }
 
 pub struct Pool {
@@ -82,21 +173,32 @@ pub struct Pool {
     topology: Topology,
 }
 
-/// A worker's own: kept by its thread.
+/// A worker's own: on its thread's stack for as long as the thread works.
 struct Local {
     shared: Arc<Shared>,
     index: usize,
     group: usize,
     deque: Worker<Job>,
+    /// How many jobs in a row came from the LIFO slot.
+    lifo: Cell<u8>,
+    /// Where a search of a group's workers begins (xorshift).
+    seed: Cell<u32>,
 }
 
 thread_local! {
-    static LOCAL: RefCell<Option<Rc<Local>>> = const { RefCell::new(None) };
+    static LOCAL: Cell<*const Local> = const { Cell::new(ptr::null()) };
+}
+
+fn with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
+    let at = LOCAL.get();
+    // SAFETY: `work` points it at its own `Local`, which lives until `work` clears it on its
+    // way out, on this thread.
+    (!at.is_null()).then(|| f(unsafe { &*at }))
 }
 
 /// The group of the worker this thread is, or `None` for a thread of no pool.
 pub fn group() -> Option<u32> {
-    LOCAL.with_borrow(|local| local.as_ref().and_then(|it| u32::try_from(it.group).ok()))
+    with_local(|local| u32::try_from(local.group).ok()).flatten()
 }
 
 impl Pool {
@@ -108,8 +210,11 @@ impl Pool {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of no CPU"));
         }
         let count = topology.groups() as usize;
-        let mut members: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut members: Vec<Vec<u32>> = vec![Vec::new(); count];
         for (index, cpu) in topology.cpus.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of more than 2^32 CPUs")
+            })?;
             members[cpu.group as usize].push(index);
         }
         if let Some(empty) = members.iter().position(Vec::is_empty) {
@@ -124,8 +229,9 @@ impl Pool {
             .zip(&topology.cpus)
             .map(|(deque, cpu)| Slot {
                 stealer: deque.stealer(),
-                group: cpu.group as usize,
+                next: AtomicPtr::new(ptr::null_mut()),
                 sleeping: AtomicBool::new(false),
+                group: cpu.group,
                 thread: OnceLock::new(),
             })
             .collect();
@@ -134,19 +240,18 @@ impl Pool {
             .enumerate()
             .map(|(at, workers)| Group {
                 injector: Injector::new(),
-                fast: workers.iter().any(|&it| topology.cpus[it].fast),
-                order: topology.steal_order(at as u32).into_iter().map(|it| it as usize).collect(),
-                workers,
-                sleepers: AtomicUsize::new(0),
-                queued: AtomicUsize::new(0),
-                busy: AtomicUsize::new(0),
+                fast: workers.iter().any(|&it| topology.cpus[it as usize].fast),
+                order: topology.steal_order(at as u32).into_boxed_slice(),
+                workers: workers.into_boxed_slice(),
+                sleepers: AtomicU32::new(0),
             })
             .collect();
         let shared = Arc::new(Shared {
             groups,
             slots,
+            idle: Idle(AtomicU64::new(0)),
             stop: AtomicBool::new(false),
-            stray: Mutex::new(None),
+            stray: Lock::new(None),
         });
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
@@ -162,8 +267,16 @@ impl Pool {
                     let ok = bound.is_ok();
                     _ = ready.send(bound);
                     if ok {
-                        let group = shared.slots[index].group;
-                        work(Rc::new(Local { shared, index, group, deque }));
+                        let group = shared.slots[index].group as usize;
+                        let seed = (index as u32).wrapping_mul(0x9E37_79B9) | 1;
+                        work(&Local {
+                            shared,
+                            index,
+                            group,
+                            deque,
+                            lifo: Cell::new(0),
+                            seed: Cell::new(seed),
+                        });
                     }
                 });
             match spawned {
@@ -200,34 +313,65 @@ impl Pool {
         self.shared.slots.len()
     }
 
+    /// This thread's index among this pool's workers, if it is one of them: for tables kept
+    /// by worker, read and written without a lock. A job pumped while another waits runs on
+    /// the same worker, so such a table's entry must not be held across a wait.
+    pub fn worker(&self) -> Option<u32> {
+        with_local(|local| {
+            Arc::ptr_eq(&local.shared, &self.shared).then(|| u32::try_from(local.index).ok()).flatten()
+        })
+        .flatten()
+    }
+
     /// Runs `run` on a worker near `group` (a group this pool does not have is no group), then
     /// `done` on the same thread with what came of it: its value, or its panic, caught. The
     /// pool goes on after a panic; a panic of `done` is kept and raised when the pool is
-    /// dropped.
+    /// dropped. It goes behind what is queued for its group.
     pub fn submit<R: 'static>(
         &self,
         near: Option<u32>,
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        self.shared.push(near, Box::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.shared.push(near, Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run)))));
+    }
+
+    /// As [`Pool::submit`], but called on one of this pool's workers the job runs next on it
+    /// (its LIFO slot), hot in its cache; elsewhere it is [`Pool::submit`] near no group.
+    pub fn submit_next<R: 'static>(
+        &self,
+        run: impl FnOnce() -> R + Send + 'static,
+        done: impl FnOnce(thread::Result<R>) + Send + 'static,
+    ) {
+        let job = Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run))));
+        if let Some(job) = push_next(&self.shared, None, job) {
+            self.shared.push(None, job);
+        }
+    }
+
+    /// `job` behind what is queued near `near`, as [`Pool::submit`] puts a job.
+    pub(crate) fn push(&self, near: Option<u32>, job: Job) {
+        self.shared.push(near, job);
     }
 
     /// Runs `f`, which may submit jobs that borrow what outlives this call, and returns once
     /// every job it submitted has run. On a worker of a pool the wait pumps (as [`crate::pump`]
     /// says); elsewhere it parks.
     pub fn scope<'env, R>(&self, f: impl FnOnce(&Scope<'env>) -> R) -> R {
-        let scope = Scope {
-            shared: self.shared.clone(),
-            pending: Arc::new(Pending { count: AtomicUsize::new(0), owner: thread::current() }),
-            _env: PhantomData,
+        let pending = Pending {
+            count: AtomicUsize::new(1),
+            finished: AtomicBool::new(false),
+            owner: thread::current(),
         };
+        let scope = Scope { shared: Arc::as_ptr(&self.shared), pending: &pending, _env: PhantomData };
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
-        let pending = &scope.pending;
+        if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            pending.finished.store(true, Ordering::Release);
+        }
         let mut idle = 0;
-        while pending.count.load(Ordering::SeqCst) != 0 {
+        while !pending.finished.load(Ordering::Acquire) {
             let pump = depth() < PUMP_DEPTH;
-            if pump && run_one() {
+            if pump && idle % 16 == 0 && run_one() {
                 idle = 0;
                 continue;
             }
@@ -236,7 +380,7 @@ impl Pool {
                 std::hint::spin_loop();
                 continue;
             }
-            park(&|| pending.count.load(Ordering::SeqCst) == 0, pump);
+            park(&|| pending.finished.load(Ordering::Acquire), pump);
         }
         result.unwrap_or_else(|panic| resume_unwind(panic))
     }
@@ -258,7 +402,7 @@ impl Drop for Pool {
                 _ = handle.join();
             }
         }
-        if let Some(panic) = lock(&self.shared.stray).take()
+        if let Some(panic) = self.shared.stray.lock().take()
             && !thread::panicking()
         {
             resume_unwind(panic);
@@ -268,79 +412,145 @@ impl Drop for Pool {
 
 /// Jobs that borrow what lives for `'env`, of [`Pool::scope`].
 pub struct Scope<'env> {
-    shared: Arc<Shared>,
-    pending: Arc<Pending>,
+    shared: *const Shared,
+    pending: *const Pending,
     _env: PhantomData<&'env mut &'env ()>,
 }
 
+// SAFETY: a scope only pushes jobs (lock-free, from any thread) and counts them in `Pending`'s
+// atomics; the pool and `Pending` outlive it, as `Pool::scope` keeps them.
+unsafe impl Send for Scope<'_> {}
+// SAFETY: as above.
+unsafe impl Sync for Scope<'_> {}
+
+/// A scope's count, on the stack of its call: 128-byte aligned, since every job of it writes
+/// it once.
+#[repr(align(128))]
 struct Pending {
+    /// Jobs submitted and not done, and one for the call while it runs `f`.
     count: AtomicUsize,
+    /// Set by whoever brought `count` to 0, as the last thing it does with `Pending`: the call
+    /// returns only once it is.
+    finished: AtomicBool,
     owner: Thread,
 }
 
 /// Counts a job of a scope as run, once everything it borrowed is no longer used.
-struct Left(Arc<Pending>);
+struct Left(*const Pending);
+
+// SAFETY: `Pending` is atomics and a `Thread`, shared by design.
+unsafe impl Send for Left {}
 
 impl Drop for Left {
     fn drop(&mut self) {
-        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.owner.unpark();
+        // SAFETY: the scope's call waits for `finished`, which only the last of its jobs sets,
+        // here, and does nothing with `Pending` after.
+        let pending = unsafe { &*self.0 };
+        if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let owner = pending.owner.clone();
+            pending.finished.store(true, Ordering::Release);
+            owner.unpark();
         }
     }
 }
 
 impl<'env> Scope<'env> {
-    /// As [`Pool::submit`], for a job that borrows what lives for `'env`.
+    /// As [`Pool::submit`], for a job that borrows what lives for `'env`. Submitted on one of
+    /// the pool's workers near its own group (or none), it runs next on that worker (its LIFO
+    /// slot), unless the worker's other workers take it first.
     pub fn submit<R: 'env>(
         &self,
         near: Option<u32>,
         run: impl FnOnce() -> R + Send + 'env,
         done: impl FnOnce(thread::Result<R>) + Send + 'env,
     ) {
-        self.pending.count.fetch_add(1, Ordering::SeqCst);
-        let left = Left(self.pending.clone());
-        let job: Box<dyn FnOnce() + Send + 'env> = Box::new(move || {
+        // SAFETY: `Pool::scope` keeps `Pending` until every job counted in it is done.
+        unsafe { &*self.pending }.count.fetch_add(1, Ordering::Relaxed);
+        let left = Left(self.pending);
+        let job = move || {
             let _left = left;
             done(catch_unwind(AssertUnwindSafe(run)));
-        });
-        // SAFETY: the job borrows only what lives for `'env`, which outlives the call of
-        // `Pool::scope` this scope is of. That call returns (or unwinds) only once `pending` is
-        // 0, and `Left` counts the job out after `run` and `done` were consumed, so nothing of
-        // `'env` is used after it. The pool runs every job it was given before its workers stop,
-        // and it outlives the call, which borrows it; a job never run is never counted out, and
-        // the call waits rather than return.
-        let job: Box<dyn FnOnce() + Send + 'static> = unsafe {
-            std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Box<dyn FnOnce() + Send + 'static>>(
-                job,
-            )
         };
-        self.shared.push(near, job);
+        // SAFETY: the job borrows only what lives for `'env`, which outlives the call of
+        // `Pool::scope` this scope is of. That call returns (or unwinds) only once `finished`
+        // is set, which `Left` does after `run` and `done` were consumed, so nothing of `'env`
+        // is used after it. The pool runs every job it was given before its workers stop, and
+        // it outlives the call, which borrows it; a job never run is never counted out, and
+        // the call waits rather than return.
+        let job = unsafe { Job::erase(job) };
+        // SAFETY: the pool outlives the call of `Pool::scope`, which borrows it.
+        let shared = unsafe { &*self.shared };
+        if let Some(job) = push_next(shared, near, job) {
+            shared.push(near, job);
+        }
     }
 }
 
+/// Gives `job` to this thread's LIFO slot when it is a worker of `shared`'s pool and `near`
+/// is its group or none; otherwise gives it back.
+fn push_next(shared: &Shared, near: Option<u32>, job: Job) -> Option<Job> {
+    let at = LOCAL.get();
+    // SAFETY: as in `with_local`.
+    match unsafe { at.as_ref() } {
+        Some(local)
+            if ptr::eq(Arc::as_ptr(&local.shared), shared)
+                && near.is_none_or(|it| it as usize == local.group) =>
+        {
+            local.push_next(job);
+            None
+        }
+        _ => Some(job),
+    }
+}
+
+/// The job in a LIFO slot, taken; nothing written when it is empty.
+fn take(next: &AtomicPtr<Header>) -> Option<Job> {
+    if next.load(Ordering::Relaxed).is_null() {
+        return None;
+    }
+    NonNull::new(next.swap(ptr::null_mut(), Ordering::Acquire)).map(Job)
+}
+
 impl Shared {
-    fn push(&self, near: Option<u32>, run: Box<dyn FnOnce() + Send>) {
+    fn push(&self, near: Option<u32>, job: Job) {
         let group = near
             .map(|it| it as usize)
             .filter(|&it| it < self.groups.len())
             .unwrap_or_else(|| self.least_loaded());
-        self.groups[group].queued.fetch_add(1, Ordering::Relaxed);
-        self.groups[group].injector.push(Job { group, run });
-        // Against a worker about to park: it says so, then looks for work once more.
-        fence(Ordering::SeqCst);
-        self.wake(group);
+        self.groups[group].injector.push(job);
+        self.announce(group);
     }
 
+    /// After a job is queued: wakes a parked worker, of `group` first, when none searches. A
+    /// worker about to park says so, then looks for work once more; one of the two sees the
+    /// other.
+    fn announce(&self, group: usize) {
+        fence(Ordering::SeqCst);
+        let word = self.idle.0.load(Ordering::SeqCst);
+        if searching(word) == 0 && sleeping(word) > 0 {
+            self.wake(group);
+        }
+    }
+
+    /// The group with the least queued and awake per worker, the fast ones first on a tie:
+    /// read from what idling and queueing already keep, so a job adds no count of its own.
     fn least_loaded(&self) -> usize {
+        if self.groups.len() == 1 {
+            return 0;
+        }
         let load = |group: &Group| {
-            group.queued.load(Ordering::Relaxed) + group.busy.load(Ordering::Relaxed)
+            let workers = group.workers.len() as u64;
+            let asleep = u64::from(group.sleepers.load(Ordering::Relaxed)).min(workers);
+            group.injector.len() as u64 + workers - asleep
         };
         let mut best = 0;
         for at in 1..self.groups.len() {
             let (a, b) = (&self.groups[at], &self.groups[best]);
             // Load per worker, compared without division.
-            let (load_a, load_b) =
-                (load(a) as u128 * b.workers.len() as u128, load(b) as u128 * a.workers.len() as u128);
+            let (load_a, load_b) = (
+                u128::from(load(a)) * b.workers.len() as u128,
+                u128::from(load(b)) * a.workers.len() as u128,
+            );
             if load_a < load_b || (load_a == load_b && a.fast && !b.fast) {
                 best = at;
             }
@@ -348,18 +558,24 @@ impl Shared {
         best
     }
 
-    /// Wakes one parked worker, of `group` first, then of the groups that steal from it first.
+    /// Wakes one parked worker, of `group` first, then of the groups that steal from it first,
+    /// as a searcher: the next job queued wakes no other while it looks.
     fn wake(&self, group: usize) {
-        for &at in &self.groups[group].order {
-            let group = &self.groups[at];
+        for &at in self.groups[group].order.iter() {
+            let group = &self.groups[at as usize];
             if group.sleepers.load(Ordering::SeqCst) == 0 {
                 continue;
             }
-            for &worker in &group.workers {
-                let slot = &self.slots[worker];
-                if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            for &worker in group.workers.iter() {
+                let slot = &self.slots[worker as usize];
+                if slot.sleeping.load(Ordering::Relaxed)
+                    && slot
+                        .sleeping
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
                 {
                     group.sleepers.fetch_sub(1, Ordering::SeqCst);
+                    self.idle.0.fetch_add(SEARCHING.wrapping_sub(SLEEPING), Ordering::SeqCst);
                     if let Some(thread) = slot.thread.get() {
                         thread.unpark();
                     }
@@ -371,49 +587,78 @@ impl Shared {
 
     fn any_work(&self) -> bool {
         self.groups.iter().any(|it| !it.injector.is_empty())
-            || self.slots.iter().any(|it| !it.stealer.is_empty())
+            || self
+                .slots
+                .iter()
+                .any(|it| !it.stealer.is_empty() || !it.next.load(Ordering::SeqCst).is_null())
     }
 }
 
 impl Local {
-    /// The next job for this worker. A steal that leaves work where it took it from wakes
-    /// another worker for it: what moved into this deque, or stays in another's, was announced
-    /// by one wake only, and its worker is busy.
-    fn find(&self) -> Option<Job> {
-        if let Some(job) = self.deque.pop() {
-            return Some(job);
+    fn push_next(&self, job: Job) {
+        let slot = &self.shared.slots[self.index];
+        if let Some(old) = NonNull::new(slot.next.swap(job.0.as_ptr(), Ordering::AcqRel)) {
+            self.deque.push(Job(old));
         }
+        self.shared.announce(self.group);
+    }
+
+    /// The next job of this worker's own: its LIFO slot's, but not more than [`LIFO_RUNS`] in a
+    /// row, then its deque's oldest.
+    fn next(&self) -> Option<Job> {
+        let slot = &self.shared.slots[self.index].next;
+        if self.lifo.get() < LIFO_RUNS {
+            if let Some(job) = take(slot) {
+                self.lifo.set(self.lifo.get() + 1);
+                return Some(job);
+            }
+        } else if let Some(job) = take(slot) {
+            self.deque.push(job);
+        }
+        self.lifo.set(0);
+        self.deque.pop()
+    }
+
+    fn random(&self) -> u32 {
+        let mut x = self.seed.get();
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.seed.set(x);
+        x
+    }
+
+    /// One look at every queue but this worker's own, nearest first: each group's injector (a
+    /// few jobs), its workers' deques (half of one), then their LIFO slots.
+    fn steal(&self) -> Option<Job> {
         let shared = &*self.shared;
         loop {
             let mut retry = false;
-            for &at in &shared.groups[self.group].order {
-                let group = &shared.groups[at];
+            for &at in shared.groups[self.group].order.iter() {
+                let group = &shared.groups[at as usize];
                 match group.injector.steal_batch_with_limit_and_pop(&self.deque, BATCH) {
-                    Steal::Success(job) => {
-                        if !self.deque.is_empty() || !group.injector.is_empty() {
-                            fence(Ordering::SeqCst);
-                            shared.wake(self.group);
-                        }
-                        return Some(job);
-                    }
+                    Steal::Success(job) => return Some(job),
                     Steal::Retry => retry = true,
                     Steal::Empty => {}
                 }
-                for &worker in &group.workers {
+                let count = group.workers.len();
+                let start = self.random() as usize % count;
+                for step in 0..count {
+                    let worker = group.workers[(start + step) % count] as usize;
                     if worker == self.index {
                         continue;
                     }
-                    let stealer = &shared.slots[worker].stealer;
-                    match stealer.steal() {
-                        Steal::Success(job) => {
-                            if !stealer.is_empty() {
-                                fence(Ordering::SeqCst);
-                                shared.wake(at);
-                            }
-                            return Some(job);
-                        }
+                    match shared.slots[worker].stealer.steal_batch_and_pop(&self.deque) {
+                        Steal::Success(job) => return Some(job),
                         Steal::Retry => retry = true,
                         Steal::Empty => {}
+                    }
+                }
+                for &worker in group.workers.iter() {
+                    if worker as usize != self.index
+                        && let Some(job) = take(&shared.slots[worker as usize].next)
+                    {
+                        return Some(job);
                     }
                 }
             }
@@ -423,87 +668,127 @@ impl Local {
         }
     }
 
-    fn run(&self, job: Job) {
-        let shared = &*self.shared;
-        shared.groups[job.group].queued.fetch_sub(1, Ordering::Relaxed);
-        shared.groups[self.group].busy.fetch_add(1, Ordering::Relaxed);
-        // `run` catches the job's own panic; only its `done`'s comes here.
-        let ran = catch_unwind(AssertUnwindSafe(|| run_task(job.run)));
-        shared.groups[self.group].busy.fetch_sub(1, Ordering::Relaxed);
-        if let Err(panic) = ran {
-            lock(&shared.stray).get_or_insert(panic);
+    /// Whether this worker may search: while fewer than half the workers do.
+    fn begin_search(&self) -> bool {
+        let idle = &self.shared.idle.0;
+        if 2 * searching(idle.load(Ordering::Relaxed)) >= self.shared.slots.len() as u64 {
+            return false;
+        }
+        idle.fetch_add(SEARCHING, Ordering::SeqCst);
+        true
+    }
+
+    /// Stops searching; the last searcher, having found work, wakes another for the rest.
+    fn end_search(&self, found: bool) {
+        let before = self.shared.idle.0.fetch_sub(SEARCHING, Ordering::SeqCst);
+        if found && searching(before) == 1 {
+            self.shared.announce(self.group);
         }
     }
 
-    /// Parks until unparked, unless `ended` or there is work: a job pushed after this says it
-    /// sleeps wakes it.
-    fn sleep(&self, ended: &dyn Fn() -> bool) {
-        let (slot, group) =
-            (&self.shared.slots[self.index], &self.shared.groups[self.group]);
+    /// Searches, as a searcher, up to `rounds` times; the search ends either way.
+    fn search(&self, rounds: u32) -> Option<Job> {
+        for round in 0..rounds {
+            if let Some(job) = self.steal() {
+                self.end_search(true);
+                return Some(job);
+            }
+            if round + 1 < rounds {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        self.end_search(false);
+        None
+    }
+
+    fn run(&self, job: Job) {
+        // `job` catches its own panic and gives it to `done`; only `done`'s comes here.
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run_task(|| job.run()))) {
+            self.shared.stray.lock().get_or_insert(panic);
+        }
+    }
+
+    /// Parks until woken, unless `ended` or there is work: a job queued after this says it
+    /// sleeps wakes it. Whether it was woken to search, as its waker counted it.
+    fn sleep(&self, ended: &dyn Fn() -> bool) -> bool {
+        let shared = &*self.shared;
+        let (slot, group) = (&shared.slots[self.index], &shared.groups[self.group]);
         slot.sleeping.store(true, Ordering::SeqCst);
         group.sleepers.fetch_add(1, Ordering::SeqCst);
+        shared.idle.0.fetch_add(SLEEPING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        if !ended() && !self.shared.any_work() && self.deque.is_empty() {
+        if !ended() && !shared.any_work() {
             thread::park();
         }
-        if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             group.sleepers.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-fn work(local: Rc<Local>) {
-    LOCAL.with_borrow_mut(|it| *it = Some(local.clone()));
-    'next: loop {
-        if let Some(job) = local.find() {
-            local.run(job);
-            continue;
-        }
-        for spin in 0..SPINS {
-            if spin % 16 == 15 {
-                thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
-            if let Some(job) = local.find() {
-                local.run(job);
-                continue 'next;
-            }
-        }
-        if local.shared.stop.load(Ordering::SeqCst) {
-            // Every job given before the stop is run: what is left was found by none.
-            if !local.shared.any_work() && local.deque.is_empty() {
-                break;
-            }
-            continue;
-        }
-        local.sleep(&|| local.shared.stop.load(Ordering::SeqCst));
-    }
-    LOCAL.with_borrow_mut(|it| *it = None);
-}
-
-/// Runs one job of this thread's pool, if this thread is a worker and one is there to run.
-pub(crate) fn run_one() -> bool {
-    let Some(local) = LOCAL.with_borrow(Clone::clone) else { return false };
-    match local.find() {
-        Some(job) => {
-            local.run(job);
+            shared.idle.0.fetch_sub(SLEEPING, Ordering::SeqCst);
+            false
+        } else {
             true
         }
-        None => false,
     }
+}
+
+fn work(local: &Local) {
+    LOCAL.set(local);
+    let shared = &*local.shared;
+    let mut searching = false;
+    loop {
+        if let Some(job) = local.next() {
+            if searching {
+                local.end_search(true);
+                searching = false;
+            }
+            local.run(job);
+            continue;
+        }
+        if searching || local.begin_search() {
+            searching = false;
+            if let Some(job) = local.search(ROUNDS) {
+                local.run(job);
+                continue;
+            }
+        }
+        if shared.stop.load(Ordering::SeqCst) {
+            // Every job given before the stop is run: what is left was found by none.
+            if !shared.any_work() {
+                break;
+            }
+            std::hint::spin_loop();
+            continue;
+        }
+        searching = local.sleep(&|| shared.stop.load(Ordering::SeqCst));
+    }
+    LOCAL.set(ptr::null());
+}
+
+/// Runs one job of this thread's pool, if this thread is a worker and one is there to run:
+/// its own, or one found by a single search when fewer than half the workers search.
+pub(crate) fn run_one() -> bool {
+    with_local(|local| {
+        let job = local.next().or_else(|| if local.begin_search() { local.search(1) } else { None });
+        job.map(|job| local.run(job)).is_some()
+    })
+    .unwrap_or(false)
 }
 
 /// Parks this thread until it is unparked, unless `ended` says not to. A worker that
-/// `take_jobs` is woken by a job as a parked worker is.
+/// `take_jobs` is woken by a job as a parked worker is, and runs what it finds.
 pub(crate) fn park(ended: &dyn Fn() -> bool, take_jobs: bool) {
-    match LOCAL.with_borrow(Clone::clone) {
-        Some(local) if take_jobs => local.sleep(ended),
-        _ => {
-            if !ended() {
-                thread::park();
+    let slept = take_jobs
+        && with_local(|local| {
+            if local.sleep(ended)
+                && let Some(job) = local.search(1)
+            {
+                local.run(job);
             }
-        }
+        })
+        .is_some();
+    if !slept && !ended() {
+        thread::park();
     }
 }
 
@@ -542,14 +827,14 @@ mod tests {
     use std::{
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU32, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crossbeam_channel::{bounded, unbounded};
 
-    use super::{Pool, group};
+    use super::{Group, Job, Pending, Pool, Slot, group, searching, sleeping};
     use crate::topology::{Cpu, Topology};
 
     const LONG: Duration = Duration::from_secs(60);
@@ -560,6 +845,22 @@ mod tests {
                 .map(|id| Cpu { id, group: id / each, socket: 0, fast: true })
                 .collect(),
         }
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let until = Instant::now() + LONG;
+        while !done() {
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn per_worker_state_is_padded_and_a_job_is_a_pointer() {
+        assert_eq!(align_of::<Slot>(), 128);
+        assert_eq!(align_of::<Group>(), 128);
+        assert_eq!(align_of::<Pending>(), 128);
+        assert_eq!(size_of::<Job>(), 8);
     }
 
     #[test]
@@ -666,9 +967,11 @@ mod tests {
         let sums = sums.into_inner().unwrap();
         assert_eq!(sums.len(), 10);
         assert_eq!(sums.iter().sum::<u64>(), 4950);
+        assert_eq!(pool.scope(|_| 3), 3, "a scope of no job returns at once");
     }
 
-    /// A scope waited on inside a job of a one-worker pool pumps its own jobs.
+    /// A scope waited on inside a job of a one-worker pool pumps its own jobs, which went to
+    /// that worker's LIFO slot and deque.
     #[test]
     fn a_scope_inside_a_job_pumps() {
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
@@ -690,6 +993,213 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         assert_eq!(rx.recv_timeout(LONG).unwrap(), 5);
+    }
+
+    /// A scope's job given to a worker's LIFO slot is taken by another worker while the first
+    /// blocks without pumping: the slot is stealable.
+    #[test]
+    fn a_job_in_a_blocked_workers_slot_is_stolen() {
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let (tx, rx) = bounded::<Option<u32>>(1);
+        let inner = pool.clone();
+        pool.submit(
+            None,
+            move || {
+                let mine = inner.worker();
+                let (ran_tx, ran_rx) = bounded::<Option<u32>>(1);
+                let asked = inner.clone();
+                inner.scope(|scope| {
+                    scope.submit(None, move || asked.worker(), move |it| _ = ran_tx.send(it.unwrap()));
+                    // Blocks this worker without pumping: only the other can run the job.
+                    let ran = ran_rx.recv_timeout(LONG).expect("the other worker took it");
+                    assert_ne!(ran, mine);
+                    ran
+                })
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        assert!(rx.recv_timeout(LONG).unwrap().is_some());
+    }
+
+    /// One worker: a job gives itself `a` then `b` to run next, so `a` goes to the deque; `b`
+    /// starts a chain of jobs each giving itself the next. The chain runs from the LIFO slot,
+    /// but `a` runs after at most three of it.
+    #[test]
+    fn the_lifo_slot_runs_the_job_just_given_but_never_starves_the_deque() {
+        fn chain(pool: Arc<Pool>, log: Arc<Mutex<Vec<String>>>, n: u32) {
+            log.lock().unwrap().push(format!("b{n}"));
+            if n < 20 {
+                let next = pool.clone();
+                pool.submit_next(move || chain(next, log, n + 1), |it| it.unwrap());
+            }
+        }
+        let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let (inner, log) = (pool.clone(), log.clone());
+            pool.submit(
+                None,
+                move || {
+                    let a = log.clone();
+                    inner.submit_next(move || a.lock().unwrap().push("a".to_owned()), |it| it.unwrap());
+                    let next = inner.clone();
+                    inner.submit_next(move || chain(next, log, 0), |it| it.unwrap());
+                },
+                |it| it.unwrap(),
+            );
+        }
+        {
+            let log = log.clone();
+            until("the chain to end", || log.lock().unwrap().len() == 22);
+        }
+        let log = log.lock().unwrap().clone();
+        assert_eq!(&log[..3], ["b0", "b1", "b2"], "the job just given runs next: {log:?}");
+        assert_eq!(log[3], "a", "after three from the slot, the deque's job: {log:?}");
+        assert_eq!(log.iter().filter(|it| it.starts_with('b')).count(), 21);
+        tx.send(()).unwrap();
+    }
+
+    /// Off the pool, `submit_next` is `submit`; and each worker says its own index.
+    #[test]
+    fn workers_say_their_index_and_submit_next_works_off_the_pool() {
+        let pool = Arc::new(Pool::new(&groups_of(2, 2), false).unwrap());
+        assert_eq!(pool.worker(), None);
+        let other = Pool::new(&Topology::flat(1), false).unwrap();
+        let (tx, rx) = unbounded::<(Option<u32>, Option<u32>)>();
+        let inner = pool.clone();
+        let other = Arc::new(other);
+        let theirs = other.clone();
+        for _ in 0..64 {
+            let (tx, inner, theirs) = (tx.clone(), inner.clone(), theirs.clone());
+            pool.submit_next(move || (inner.worker(), theirs.worker()), move |it| _ = tx.send(it.unwrap()));
+        }
+        for _ in 0..64 {
+            let (mine, theirs) = rx.recv_timeout(LONG).unwrap();
+            assert!(mine.is_some_and(|it| it < 4), "{mine:?}");
+            assert_eq!(theirs, None, "a worker of one pool is none of another's");
+        }
+    }
+
+    /// Once the work is done, every worker parks and none is left counted as searching.
+    #[test]
+    fn idle_workers_park_and_leave_no_searcher() {
+        let pool = Pool::new(&groups_of(2, 3), false).unwrap();
+        let (tx, rx) = unbounded::<()>();
+        for job in 0..500u32 {
+            let tx = tx.clone();
+            pool.submit((job % 3 != 0).then_some(job % 2), || std::hint::spin_loop(), move |_| {
+                _ = tx.send(());
+            });
+        }
+        for _ in 0..500 {
+            rx.recv_timeout(LONG).unwrap();
+        }
+        until("every worker to park", || {
+            let word = pool.shared.idle.0.load(Ordering::SeqCst);
+            searching(word) == 0 && sleeping(word) == 6
+        });
+        let asleep: u32 = pool.shared.groups.iter().map(|it| it.sleepers.load(Ordering::SeqCst)).sum();
+        assert_eq!(asleep, 6);
+    }
+
+    /// SplitMix64, as `blaze-core`'s `sim::Rng`.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum How {
+        Submit(Option<u32>),
+        Next,
+        Scope,
+    }
+
+    struct Tree {
+        children: Vec<Vec<(How, usize)>>,
+        ran: Vec<AtomicU32>,
+        ended: AtomicUsize,
+    }
+
+    fn run_node(pool: &Arc<Pool>, tree: &Arc<Tree>, node: usize) {
+        tree.ran[node].fetch_add(1, Ordering::SeqCst);
+        let mut scoped = Vec::new();
+        for &(how, child) in &tree.children[node] {
+            let (pool2, tree2) = (pool.clone(), tree.clone());
+            let job = move || run_node(&pool2, &tree2, child);
+            match how {
+                How::Submit(near) => pool.submit(near, job, |it| it.unwrap()),
+                How::Next => pool.submit_next(job, |it| it.unwrap()),
+                How::Scope => scoped.push(child),
+            }
+        }
+        if !scoped.is_empty() {
+            pool.scope(|scope| {
+                for &child in &scoped {
+                    scope.submit(None, || run_node(pool, tree, child), |it| it.unwrap());
+                }
+            });
+        }
+        tree.ended.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Random trees of jobs that give their children by `submit` (near a random group or
+    /// none), `submit_next` and a scope, on random topologies: every node of the model's tree
+    /// runs exactly once, and then every worker parks with no searcher left.
+    #[test]
+    fn a_seeded_stress_runs_every_job_of_the_model_once() {
+        for seed in 0..10u64 {
+            let mut rng = Rng(seed);
+            let (count, each) = (1 + rng.below(3) as u32, 1 + rng.below(3) as u32);
+            let mut children: Vec<Vec<(How, usize)>> = vec![Vec::new()];
+            let mut at = 0;
+            while at < children.len() && children.len() < 600 {
+                for _ in 0..rng.below(4) {
+                    let how = match rng.below(4) {
+                        0 => How::Submit(None),
+                        1 => How::Submit(Some(rng.below(u64::from(count) + 1) as u32)),
+                        2 => How::Next,
+                        _ => How::Scope,
+                    };
+                    let child = children.len();
+                    children.push(Vec::new());
+                    children[at].push((how, child));
+                }
+                at += 1;
+            }
+            let nodes = children.len();
+            let tree = Arc::new(Tree {
+                children,
+                ran: (0..nodes).map(|_| AtomicU32::new(0)).collect(),
+                ended: AtomicUsize::new(0),
+            });
+            let pool = Arc::new(Pool::new(&groups_of(count, each), false).unwrap());
+            {
+                let (inner, tree) = (pool.clone(), tree.clone());
+                pool.submit(None, move || run_node(&inner, &tree, 0), |it| it.unwrap());
+            }
+            until("the tree to run", || tree.ended.load(Ordering::SeqCst) == nodes);
+            assert!(
+                tree.ran.iter().all(|it| it.load(Ordering::SeqCst) == 1),
+                "seed {seed}: a job ran other than once"
+            );
+            let workers = u64::from(count * each);
+            until("every worker to park", || {
+                let word = pool.shared.idle.0.load(Ordering::SeqCst);
+                searching(word) == 0 && sleeping(word) == workers
+            });
+        }
     }
 
     #[test]

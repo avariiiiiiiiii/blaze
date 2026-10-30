@@ -53,19 +53,22 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 fn the_test() {
     crate::sync::check(|| {
         tracing::debug!("Starting new run");
-        let db_t1 = Knobs::default();
-        let db_t2 = db_t1.clone();
+        let db = Knobs::default();
+        let db = &db;
 
-        let t1 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
-            query_a(&db_t1)
+        let (r_t1, r_t2) = thread::scope(|scope| {
+            let t1 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
+                query_a(db)
+            });
+            let t2 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
+                query_b(db)
+            });
+            (t1.join().unwrap(), t2.join().unwrap())
         });
-        let t2 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
-            query_b(&db_t2)
-        });
-
-        let (r_t1, r_t2) = (t1.join().unwrap(), t2.join().unwrap());
 
         assert_eq!((r_t1, r_t2), (MAX, MAX));
     });

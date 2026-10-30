@@ -197,6 +197,43 @@ fn every_simd_path_finds_the_first_difference_the_scalar_one_does() {
 }
 
 #[test]
+fn every_simd_path_finds_each_difference_in_a_block_and_the_overlapping_tail() {
+    let paths = bytes::available();
+    let mut rng = Rng::new(77);
+    // Every length across the four-vector blocks (up to 256 bytes) and the tails after them;
+    // a single difference at every offset, so each lane of each vector and of the last,
+    // overlapping one is where the first difference is.
+    for len in (0..=600).chain([1023, 1024, 1025, 4096 + 63]) {
+        let a: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        for &path in &paths {
+            assert_eq!(bytes::first_difference_with(path, &a, &a), None, "{path:?}, length {len}");
+        }
+        let offsets: Vec<usize> = if len <= 300 { (0..len).collect() } else { (0..64).map(|_| rng.below(len as u64) as usize).collect() };
+        for at in offsets {
+            let mut b = a.clone();
+            b[at] = !b[at];
+            for &path in &paths {
+                assert_eq!(bytes::first_difference_with(path, &a, &b), Some(at), "{path:?}, length {len}, at {at}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_empty_file_maps_to_no_bytes() {
+    let dir = std::env::temp_dir().join(format!("blaze-v2-proof-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    std::fs::write(&a, b"").unwrap();
+    std::fs::write(&b, b"x").unwrap();
+    assert_eq!(bytes::Mapped::open(&a).unwrap().bytes(), b"");
+    assert_eq!(bytes::first_file_difference(&a, &a).unwrap(), None);
+    assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some(0));
+    assert!(bytes::first_file_difference(&a, &dir.join("missing")).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn files_are_compared_across_buffer_boundaries() {
     let dir = std::env::temp_dir().join(format!("blaze-v2-proof-bytes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -298,4 +335,235 @@ fn a_frame_of_reference_packing_reads_in_place() {
     assert_eq!(columns::reads_in_place(encode, get, 5).unwrap(), columns::shapes(5).len());
     let off_by_one = |packed: &(u32, u32, Vec<u64>), i: usize| get(packed, i).wrapping_add(u32::from(i == 3));
     assert!(columns::reads_in_place(encode, off_by_one, 5).unwrap_err().contains("element 3"));
+}
+
+/// The layout and joins before the speed pass (a `BTreeMap` builder, a binary search per edge
+/// and per key, `apart` by lookups and a sort): the model the columns must agree with.
+mod model {
+    use std::collections::BTreeMap;
+
+    use blaze_ids::Fingerprint;
+    use blaze_query::{Edge, QueryKey};
+
+    use crate::{Apart, Bits, Stale, Trace, Work};
+
+    pub fn finish(rows: &[(QueryKey, Fingerprint, Vec<Edge>, bool)]) -> Trace {
+        let mut results: BTreeMap<QueryKey, (Fingerprint, bool, &[Edge])> = BTreeMap::new();
+        for (key, fingerprint, edges, ran) in rows {
+            results.insert(*key, (*fingerprint, *ran, edges));
+        }
+        let mut keys: Vec<QueryKey> = results.keys().copied().collect();
+        for (_, _, edges) in results.values() {
+            keys.extend(edges.iter().map(|e| e.read));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let n = keys.len();
+        let mut trace = Trace {
+            has: Bits::with_len(n),
+            ran: Bits::with_len(n),
+            fingerprints: vec![Fingerprint(0); n],
+            edges_from: vec![0],
+            ..Trace::default()
+        };
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(&(fingerprint, ran, edges)) = results.get(key) {
+                trace.has.set(i as u32);
+                if ran {
+                    trace.ran.set(i as u32);
+                }
+                trace.fingerprints[i] = fingerprint;
+                for edge in edges {
+                    trace.reads.push(keys.binary_search(&edge.read).unwrap() as u32);
+                    trace.saw.push(edge.saw);
+                }
+            }
+            trace.edges_from.push(trace.reads.len() as u32);
+        }
+        trace.keys = keys;
+        trace
+    }
+
+    fn same_edges(a: &Trace, i: u32, b: &Trace, j: u32) -> bool {
+        let x: Vec<_> = a.edges(i).map(|(r, s)| (a.keys[r as usize], s)).collect();
+        let y: Vec<_> = b.edges(j).map(|(r, s)| (b.keys[r as usize], s)).collect();
+        x == y
+    }
+
+    pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<Stale> {
+        let reached = scratch.reachable(roots);
+        let mut stale = Vec::new();
+        for i in 0..scratch.keys.len() as u32 {
+            let Some(theirs) = scratch.result(i).filter(|_| reached.get(i)) else { continue };
+            let query = scratch.keys[i as usize];
+            let Some((j, ours)) = incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?))) else {
+                stale.push(Stale::Absent { query });
+                continue;
+            };
+            if !incremental.ran.get(j)
+                && let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw))
+            {
+                let now = incremental.result(read);
+                stale.push(Stale::Unverified { query, read: incremental.keys[read as usize], saw, now });
+                continue;
+            }
+            if ours == theirs {
+                continue;
+            }
+            stale.push(if same_edges(incremental, j, scratch, i) {
+                Stale::UnrecordedRead { query, incremental: ours, scratch: theirs }
+            } else {
+                Stale::Downstream { query, incremental: ours, scratch: theirs }
+            });
+        }
+        stale.sort_by_key(|s| (s.rank(), s.query()));
+        stale
+    }
+
+    pub fn over(before: &Trace, after: &Trace) -> (Work, Vec<QueryKey>) {
+        let mut work = Work::default();
+        let mut needless = Vec::new();
+        for i in 0..after.keys.len() as u32 {
+            let Some(now) = after.result(i).filter(|_| after.ran.get(i)) else { continue };
+            work.ran += 1;
+            let key = after.keys[i as usize];
+            match before.index(&key).and_then(|j| Some((j, before.result(j)?))) {
+                None => work.new += 1,
+                Some((j, was)) if was == now && same_edges(before, j, after, i) => {
+                    work.needless += 1;
+                    needless.push(key);
+                }
+                Some((_, was)) if was == now => work.cut_off += 1,
+                Some(_) => {}
+            }
+        }
+        (work, needless)
+    }
+
+    pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(first: &BTreeMap<K, V>, second: &BTreeMap<K, V>) -> Vec<Apart<K, V>> {
+        let mut out = Vec::new();
+        for (key, value) in first {
+            match second.get(key) {
+                None => out.push(Apart::OnlyFirst { key: key.clone(), value: value.clone() }),
+                Some(other) if other != value => {
+                    out.push(Apart::Differ { key: key.clone(), first: value.clone(), second: other.clone() })
+                }
+                Some(_) => {}
+            }
+        }
+        for (key, value) in second {
+            if !first.contains_key(key) {
+                out.push(Apart::OnlySecond { key: key.clone(), value: value.clone() });
+            }
+        }
+        let key_of = |a: &Apart<K, V>| match a {
+            Apart::OnlyFirst { key, .. } | Apart::OnlySecond { key, .. } | Apart::Differ { key, .. } => key.clone(),
+        };
+        out.sort_by_key(key_of);
+        out
+    }
+}
+
+/// `n` keys of a few kinds, where many share their first eight bytes (one slot of the key
+/// table) and some differ only in kind, so probing and the kind's mixing are both exercised.
+fn pool(rng: &mut Rng, n: usize) -> Vec<QueryKey> {
+    (0..n)
+        .map(|i| {
+            let mut input = [0u8; 32];
+            input.iter_mut().for_each(|b| *b = rng.next_u64() as u8);
+            if i % 3 == 0 {
+                input[..8].copy_from_slice(&[0xab; 8]);
+            }
+            QueryKey { kind: QueryKind(0x2000 + (i % 4) as u16), input: ContentId(input) }
+        })
+        .collect()
+}
+
+/// Rows of a random build over `keys`: some keys inserted twice, edges to keys with and
+/// without results, fingerprints from a small range so equal and different ones both occur.
+fn rows(rng: &mut Rng, keys: &[QueryKey], n: usize) -> Vec<(QueryKey, Fingerprint, Vec<Edge>, bool)> {
+    (0..n)
+        .map(|_| {
+            let key = keys[rng.below(keys.len() as u64) as usize];
+            let edges = (0..rng.below(6))
+                .map(|_| Edge { read: keys[rng.below(keys.len() as u64) as usize], saw: Fingerprint(u128::from(rng.below(4) as u8)) })
+                .collect();
+            (key, Fingerprint(u128::from(rng.below(4) as u8)), edges, rng.below(2) == 0)
+        })
+        .collect()
+}
+
+fn built(rows: &[(QueryKey, Fingerprint, Vec<Edge>, bool)]) -> Trace {
+    let mut builder = TraceBuilder::default();
+    for (key, fingerprint, edges, ran) in rows {
+        builder.insert(*key, *fingerprint, edges, *ran);
+    }
+    builder.finish()
+}
+
+#[test]
+fn the_builder_gives_the_trace_the_sorted_map_gave() {
+    for seed in 0..200 {
+        let mut rng = Rng::new(seed);
+        let (n_keys, n_rows) = (1 + rng.below(300) as usize, rng.below(500) as usize);
+        let keys = pool(&mut rng, n_keys);
+        let rows = rows(&mut rng, &keys, n_rows);
+        assert_eq!(built(&rows), model::finish(&rows), "seed {seed}");
+    }
+}
+
+#[test]
+fn the_key_table_grows_past_many_keys_sharing_a_slot() {
+    let mut rng = Rng::new(9);
+    let keys = pool(&mut rng, 20_000);
+    let rows: Vec<_> = keys.iter().map(|&k| (k, Fingerprint(1), vec![], true)).collect();
+    let trace = built(&rows);
+    assert_eq!(trace.keys.len(), keys.len());
+    assert!(trace.keys.windows(2).all(|w| w[0] < w[1]));
+    assert!(keys.iter().all(|k| trace.index(k).is_some()));
+}
+
+#[test]
+fn the_joins_find_what_a_lookup_per_key_found() {
+    for seed in 0..200 {
+        let mut rng = Rng::new(1000 + seed);
+        let (n_keys, n_before, n_after) = (1 + rng.below(200) as usize, rng.below(300) as usize, rng.below(300) as usize);
+        let keys = pool(&mut rng, n_keys);
+        let before_rows = rows(&mut rng, &keys, n_before);
+        // Part of the build before again as it was, so kept, cut-off and needless results occur.
+        let kept = rng.below(before_rows.len() as u64 + 1) as usize;
+        let mut after_rows = before_rows[..kept].to_vec();
+        after_rows.extend(rows(&mut rng, &keys, n_after));
+        let (before, after) = (built(&before_rows), built(&after_rows));
+        let roots: Vec<QueryKey> = if seed % 4 == 0 { vec![keys[0], keys[keys.len() / 2]] } else { vec![] };
+        assert_eq!(under(&after, &before, &roots), model::under(&after, &before, &roots), "seed {seed}");
+        assert_eq!(over(&before, &after), model::over(&before, &after), "seed {seed}");
+    }
+}
+
+#[test]
+fn seek_finds_the_partition_point_from_any_cursor() {
+    let mut rng = Rng::new(5);
+    let mut keys = pool(&mut rng, 500);
+    keys.sort_unstable();
+    keys.dedup();
+    let probes = pool(&mut rng, 50);
+    for from in [0, 1, 7, 250, keys.len() - 1, keys.len()] {
+        for probe in probes.iter().chain(&keys) {
+            let want = from + keys[from..].partition_point(|k| k < probe);
+            assert_eq!(seek(&keys, from, probe), want);
+        }
+    }
+}
+
+#[test]
+fn apart_by_merge_is_apart_by_lookup() {
+    for seed in 0..200 {
+        let mut rng = Rng::new(seed);
+        let map = |rng: &mut Rng| -> BTreeMap<u16, u8> {
+            (0..rng.below(60)).map(|_| (rng.below(80) as u16, rng.below(3) as u8)).collect()
+        };
+        let (first, second) = (map(&mut rng), map(&mut rng));
+        assert_eq!(apart(&first, &second), model::apart(&first, &second), "seed {seed}");
+    }
 }

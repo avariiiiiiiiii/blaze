@@ -34,7 +34,7 @@ use super::{
     heads::{Heads, Out},
     job::{Jobs, Said, Setup, Value, World},
     mounts::Mounts,
-    plane::{Plane, Runner},
+    plane::{Happened, Plane, Runner},
     work::Steps,
 };
 
@@ -46,6 +46,7 @@ const DB: u64 = 3 << 32;
 const STORE: u64 = 4 << 32;
 const COOKIES: u64 = 5 << 32;
 const JOBS: u64 = 6 << 32;
+const JOBS_END: u64 = 7 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -144,11 +145,22 @@ pub struct Daemon<D: Driver> {
     jobs: Jobs,
     steps: Arc<dyn Steps>,
     replies: Vec<Reply>,
+    spare: Spare,
     stopping: Option<Stopping>,
     /// A `blaze stop` arrived: the daemon stops once its answer is sent.
     stop_asked: bool,
     settling: bool,
     failed: Option<String>,
+}
+
+/// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
+/// made inside another takes one of its own, so each holds as many as calls nest.
+#[derive(Default)]
+struct Spare {
+    said: Vec<Vec<Said>>,
+    out: Vec<Vec<Out>>,
+    arrived: Vec<Vec<Arrived>>,
+    happened: Vec<Happened<Value>>,
 }
 
 /// What the start read, each once it is in.
@@ -299,6 +311,7 @@ impl<D: Driver> Daemon<D> {
             jobs,
             steps,
             replies: Vec::new(),
+            spare: Spare::default(),
             stopping: None,
             stop_asked: false,
             settling: false,
@@ -375,10 +388,12 @@ impl<D: Driver> Daemon<D> {
             Duration::from_millis(50)
         };
         self.driver.submit(&mut self.effects);
-        self.driver.poll(&mut self.done, wait);
-        for completion in std::mem::take(&mut self.done) {
+        let mut done = std::mem::take(&mut self.done);
+        self.driver.poll(&mut done, wait);
+        for completion in done.drain(..) {
             self.dispatch(completion);
         }
+        self.done = done;
         self.step_plane();
         self.between();
         self.stepping_stop();
@@ -386,57 +401,71 @@ impl<D: Driver> Daemon<D> {
         !matches!(self.stopping, Some(Stopping::Over))
     }
 
+    /// A completion to its part, by the block of tags it is in: compares on the tag alone,
+    /// no part asked and no lock taken.
     fn dispatch(&mut self, completion: Completion) {
-        let tag = completion.tag;
-        if self.server.owns(tag) {
-            let mut arrived = Vec::new();
-            self.server.complete(completion, &mut self.effects, &mut arrived);
-            for it in arrived {
-                self.arrive(it);
+        match completion.tag.0 {
+            tag if tag == WRITE_ESTIMATES.0 => {
+                if let Done::Failed(error) = completion.done {
+                    eprintln!("blaze serve: writing the plane's estimates /{}: {error}", self.estimates_file);
+                }
             }
-            if let Some(why) = self.server.failed()
-                && self.failed.is_none()
-            {
-                self.failed = Some(why.to_owned());
-                self.stop();
+            SERVER..VFS => {
+                let mut arrived = self.spare.arrived.pop().unwrap_or_default();
+                self.server.complete(completion, &mut self.effects, &mut arrived);
+                for it in arrived.drain(..) {
+                    self.arrive(it);
+                }
+                self.spare.arrived.push(arrived);
+                if let Some(why) = self.server.failed()
+                    && self.failed.is_none()
+                {
+                    self.failed = Some(why.to_owned());
+                    self.stop();
+                }
             }
-        } else if self.vfs.owns(tag) {
-            let tickets = self.vfs.complete(completion, &mut self.effects);
-            self.durable(&tickets);
-        } else if self.db.owns(tag) {
-            self.db.complete(completion, &mut self.effects);
-        } else if self.store.read().expect("the store's lock").owns(tag) {
-            let placed = {
-                let mut store = self.store.write().expect("the store's lock");
-                store.complete(completion, &mut self.effects);
-                store.placed()
-            };
-            let mut said = Vec::new();
-            self.jobs.placed(&mut world!(self, said), placed);
-            self.said(said);
-        } else if self.heads.owns(tag) {
-            let mut out = Vec::new();
-            self.heads.complete(&mut self.vfs, completion, &mut self.effects, &mut out);
-            self.outs(out);
-        } else if self.jobs.owns(tag) {
-            let mut said = Vec::new();
-            self.jobs.complete(&mut world!(self, said), completion);
-            self.said(said);
-        } else if tag == WRITE_ESTIMATES
-            && let Done::Failed(error) = completion.done
-        {
-            eprintln!("blaze serve: writing the plane's estimates /{}: {error}", self.estimates_file);
+            VFS..DB => {
+                let tickets = self.vfs.complete(completion, &mut self.effects);
+                if !tickets.is_empty() {
+                    self.durable(&tickets);
+                }
+            }
+            DB..STORE => self.db.complete(completion, &mut self.effects),
+            STORE..COOKIES => {
+                debug_assert!(self.store.read().expect("the store's lock").owns(completion.tag), "the store's tags are its");
+                let placed = {
+                    let mut store = self.store.write().expect("the store's lock");
+                    store.complete(completion, &mut self.effects);
+                    store.placed()
+                };
+                let mut said = self.spare.said.pop().unwrap_or_default();
+                self.jobs.placed(&mut world!(self, said), placed);
+                self.said(said);
+            }
+            COOKIES..JOBS | WATCHERS..RUNS => {
+                debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
+                let mut out = self.spare.out.pop().unwrap_or_default();
+                self.heads.complete(&mut self.vfs, completion, &mut self.effects, &mut out);
+                self.outs(out);
+            }
+            JOBS..JOBS_END | RUNS..RUNS_END => {
+                debug_assert!(self.jobs.owns(completion.tag), "the jobs' tags are theirs");
+                let mut said = self.spare.said.pop().unwrap_or_default();
+                self.jobs.complete(&mut world!(self, said), completion);
+                self.said(said);
+            }
+            _ => {}
         }
     }
 
     fn arrive(&mut self, arrived: Arrived) {
-        let mut out = Vec::new();
+        let mut out = self.spare.out.pop().unwrap_or_default();
         self.heads.arrive(arrived, &mut self.effects, &mut out);
         self.outs(out);
     }
 
-    fn outs(&mut self, out: Vec<Out>) {
-        for it in out {
+    fn outs(&mut self, mut out: Vec<Out>) {
+        for it in out.drain(..) {
             match it {
                 Out::Pass(arrived) => {
                     if matches!(arrived, Arrived::Request { request: Request::Stop, .. }) {
@@ -450,6 +479,7 @@ impl<D: Driver> Daemon<D> {
                 Out::Answer(reply) => self.server.reply(reply, &mut self.effects),
             }
         }
+        self.spare.out.push(out);
         if self.stop_asked {
             self.stop();
         }
@@ -459,7 +489,7 @@ impl<D: Driver> Daemon<D> {
         let mut replies = std::mem::take(&mut self.replies);
         self.session.durable(&mut cx!(self), tickets, &mut replies);
         self.replies = replies;
-        let mut said = Vec::new();
+        let mut said = self.spare.said.pop().unwrap_or_default();
         self.jobs.durable(&mut world!(self, said), tickets);
         self.said(said);
         self.after_session();
@@ -469,26 +499,30 @@ impl<D: Driver> Daemon<D> {
     /// and the replies sent.
     fn after_session(&mut self) {
         self.vfs.flush(&mut self.effects);
-        let mut said = Vec::new();
+        let mut said = self.spare.said.pop().unwrap_or_default();
         self.jobs.step(&mut world!(self, said));
         self.said(said);
-        for reply in std::mem::take(&mut self.replies) {
+        let mut replies = std::mem::take(&mut self.replies);
+        for reply in replies.drain(..) {
             self.server.reply(reply, &mut self.effects);
         }
+        self.replies = replies;
     }
 
     /// What the jobs said, told to the session.
-    fn said(&mut self, said: Vec<Said>) {
+    fn said(&mut self, mut said: Vec<Said>) {
         if said.is_empty() {
+            self.spare.said.push(said);
             return;
         }
         let mut replies = std::mem::take(&mut self.replies);
-        for it in said {
+        for it in said.drain(..) {
             match it {
                 Said::Report(job, response) => self.session.report(&mut cx!(self), job, response, &mut replies),
                 Said::Finish(job, ok, error) => self.session.finish(&mut cx!(self), job, ok, error, &mut replies),
             }
         }
+        self.spare.said.push(said);
         self.replies = replies;
         self.after_session();
     }
@@ -496,16 +530,18 @@ impl<D: Driver> Daemon<D> {
     /// The plane's thread tasks that ended taken, and what it did given to the jobs, until it
     /// does nothing more.
     fn step_plane(&mut self) {
+        let mut happened = std::mem::take(&mut self.spare.happened);
         loop {
             self.plane.poll(self.driver.now());
-            let happened = self.plane.happened();
+            self.plane.happened(&mut happened);
             if happened.is_empty() {
-                return;
+                break;
             }
-            let mut said = Vec::new();
-            self.jobs.happened(&mut world!(self, said), happened);
+            let mut said = self.spare.said.pop().unwrap_or_default();
+            self.jobs.happened(&mut world!(self, said), &mut happened);
             self.said(said);
         }
+        self.spare.happened = happened;
     }
 
     /// Between requests: the collections, and after a cold build the image and the settle.

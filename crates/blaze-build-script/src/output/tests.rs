@@ -355,6 +355,66 @@ fn the_rest() {
     );
 }
 
+/// A directive after any of Unicode's spaces is read, as `str::trim` reads it: one past
+/// ASCII takes the whole check, one in ASCII (the vertical tab too) the quick one.
+#[test]
+fn a_directive_after_any_space_is_read() {
+    let package = foo("0.0.1", None, lib());
+    let out = read(
+        &package,
+        "\u{a0}cargo:rustc-cfg=a\n\x0b\x0ccargo::rustc-cfg=b\r\n\u{2003}\tcargo:rustc-cfg=c\n\u{85}x\n",
+    )
+    .unwrap();
+    assert_eq!(out.cfgs, ["a", "b", "c"]);
+}
+
+/// [`directive`] against what cargo does to every line (`from_utf8`, `trim`, then the prefix),
+/// over seeded lines of the bytes that matter: ASCII and Unicode spaces, `cargo:`'s pieces,
+/// bytes that are not UTF-8.
+#[test]
+fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
+    let pieces: [&[u8]; 14] = [
+        b" ", b"\t", b"\x0b", b"\x0c", b"\r", "\u{a0}".as_bytes(), "\u{85}".as_bytes(),
+        "\u{2003}".as_bytes(), b"cargo:", b"cargo", b":", b"x=y", b"\xff", b"\xc2",
+    ];
+    let cargo = |line: &[u8]| {
+        std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
+    };
+    let mut state = 0x853c_49e6_748f_ea9bu64;
+    for _ in 0..50_000 {
+        let mut line = Vec::new();
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for at in 0..(state % 6) {
+            line.extend_from_slice(pieces[((state >> (8 + 4 * at)) % pieces.len() as u64) as usize]);
+        }
+        assert_eq!(directive(&line), cargo(&line), "{line:?}");
+    }
+}
+
+/// The `match` of reserved keys against cargo's list of prefixes.
+#[test]
+fn a_reserved_key_is_one_of_cargo_s_prefixes() {
+    const CARGO: &[&str] = &[
+        "rustc-flags=", "rustc-link-lib=", "rustc-link-search=", "rustc-link-arg-cdylib=",
+        "rustc-cdylib-link-arg=", "rustc-link-arg-bins=", "rustc-link-arg-bin=",
+        "rustc-link-arg-tests=", "rustc-link-arg-benches=", "rustc-link-arg-examples=",
+        "rustc-link-arg=", "rustc-cfg=", "rustc-check-cfg=", "rustc-env=", "warning=",
+        "rerun-if-changed=", "rerun-if-env-changed=",
+    ];
+    let mut flags: Vec<String> = Vec::new();
+    for prefix in CARGO {
+        let key = &prefix[..prefix.len() - 1];
+        flags.extend([prefix.to_string(), format!("{prefix}x=y"), key.to_owned(), format!("{key}x=1")]);
+        flags.push(format!("{}={key}", &key[..key.len() - 1]));
+    }
+    flags.extend(["".to_owned(), "=".to_owned(), "metadata=k=v".to_owned(), "error=e".to_owned()]);
+    for flag in &flags {
+        assert_eq!(has_reserved_prefix(flag), CARGO.iter().any(|it| flag.starts_with(it)), "{flag:?}");
+    }
+}
+
 #[test]
 fn link_lib_specs() {
     let lib = LinkLib::parse("static:+whole-archive,-bundle=foo:bar");

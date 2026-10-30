@@ -31,7 +31,7 @@ mod ingredients {
 }
 
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct DatabaseImpl {
     storage: salsa::Storage<Self>,
 }

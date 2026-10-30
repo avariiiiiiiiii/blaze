@@ -65,8 +65,6 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
-#include <os/lock.h>
-#include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -173,51 +171,67 @@ static _Atomic int random_said;
 // ---------------------------------------------------------------------------------------
 // Records.
 
-static os_unfair_lock seen_lock = OS_UNFAIR_LOCK_INIT;
-static uint64_t *seen;
-static size_t seen_size, seen_count;
+// The hashes of the lines this process wrote, open addressing with no lock: a slot is taken
+// once, by compare-and-swap, and never changes after. Mapped once, its pages as they are
+// first written.
+#define SEEN_SLOTS (1u << 20)
+#define SEEN_PROBES 64
+static _Atomic(_Atomic uint64_t *) seen;
+
+static inline uint64_t mum(uint64_t a, uint64_t b) {
+    __uint128_t r = (__uint128_t)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+
+static inline uint64_t word(const char *s, size_t n) {
+    uint64_t w = 0;
+    memcpy(&w, s, n);
+    return w;
+}
+
+// `h` with `s` and its length hashed in, sixteen bytes a multiply (wyhash's mixing).
+static uint64_t hash_text(uint64_t h, const char *s) {
+    size_t n = strlen(s), len = n;
+    for (; n > 16; s += 16, n -= 16) {
+        uint64_t a = word(s, 8), b = word(s + 8, 8);
+        h ^= mum(a ^ 0xa0761d6478bd642full, b ^ h ^ 0xe7037ed1a0b428dbull);
+    }
+    uint64_t a = word(s, n > 8 ? 8 : n), b = n > 8 ? word(s + 8, n - 8) : 0;
+    return h ^ mum(a ^ 0x8ebc6af09c88c6e3ull ^ len, b ^ h ^ 0x589965cc75374cc3ull);
+}
 
 static uint64_t hash(char kind, const char *a, const char *b) {
-    uint64_t h = 0xcbf29ce484222325ull;
-    h = (h ^ (uint8_t)kind) * 0x100000001b3ull;
-    for (; *a; a++) h = (h ^ (uint8_t)*a) * 0x100000001b3ull;
-    h = (h ^ 0xff) * 0x100000001b3ull;
-    for (; *b; b++) h = (h ^ (uint8_t)*b) * 0x100000001b3ull;
-    return h | 1;
+    return hash_text(hash_text(0x1d8e4e27c47d124full ^ (uint8_t)kind, a), b) | 1;
 }
 
 // Whether the line is new to this process; reading the record removes what several processes
-// repeat.
+// repeat, and a line written twice when the table is that full.
 static int first_time(char kind, const char *a, const char *b) {
     uint64_t h = hash(kind, a, b);
-    int fresh = 0;
-    os_unfair_lock_lock(&seen_lock);
-    if (seen_count * 2 >= seen_size) {
-        size_t size = seen_size ? seen_size * 2 : 1 << 14;
-        uint64_t *grown = mmap(NULL, size * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (grown == MAP_FAILED) {
-            os_unfair_lock_unlock(&seen_lock);
+    _Atomic uint64_t *table = atomic_load_explicit(&seen, memory_order_acquire);
+    if (!table) {
+        int prot = PROT_READ | PROT_WRITE;
+        void *made = mmap(NULL, SEEN_SLOTS * 8, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (made == MAP_FAILED) return 1;
+        _Atomic uint64_t *none = NULL;
+        if (atomic_compare_exchange_strong(&seen, &none, (_Atomic uint64_t *)made)) {
+            table = made;
+        } else {
+            munmap(made, SEEN_SLOTS * 8);
+            table = none;
+        }
+    }
+    size_t at = h & (SEEN_SLOTS - 1);
+    for (int probe = 0; probe < SEEN_PROBES; probe++, at = (at + 1) & (SEEN_SLOTS - 1)) {
+        uint64_t was = atomic_load_explicit(&table[at], memory_order_relaxed);
+        if (was == h) return 0;
+        if (was) continue;
+        if (atomic_compare_exchange_strong_explicit(&table[at], &was, h, memory_order_relaxed,
+                                                    memory_order_relaxed))
             return 1;
-        }
-        for (size_t i = 0; i < seen_size; i++) {
-            if (!seen[i]) continue;
-            size_t at = seen[i] & (size - 1);
-            while (grown[at]) at = (at + 1) & (size - 1);
-            grown[at] = seen[i];
-        }
-        if (seen) munmap(seen, seen_size * 8);
-        seen = grown;
-        seen_size = size;
+        if (was == h) return 0;
     }
-    size_t at = h & (seen_size - 1);
-    while (seen[at] && seen[at] != h) at = (at + 1) & (seen_size - 1);
-    if (!seen[at]) {
-        seen[at] = h;
-        seen_count++;
-        fresh = 1;
-    }
-    os_unfair_lock_unlock(&seen_lock);
-    return fresh;
+    return 1;
 }
 
 static void put(char *line, size_t *at, size_t cap, const char *text) {
@@ -292,9 +306,17 @@ static void read_random(void) {
 // ---------------------------------------------------------------------------------------
 // Paths.
 
-static os_unfair_lock cwd_lock = OS_UNFAIR_LOCK_INIT;
-static char cwd[PATH_MAX];
-static int cwd_known;
+// The working directory, as each thread last read it, and the number of changes to it then:
+// one more at each `chdir` of any thread. A thread reads it again only after a change, with
+// no lock and nothing shared written; a signal handler that reads it meanwhile leaves the
+// thread's copy whole or marks it unknown.
+static _Atomic uint64_t cwd_changes = 1;
+static __thread char cwd[PATH_MAX];
+static __thread uint64_t cwd_as_of;
+
+static void cwd_changed(void) {
+    atomic_fetch_add_explicit(&cwd_changes, 1, memory_order_release);
+}
 
 static void reverse(char *path);
 
@@ -338,15 +360,23 @@ static int absolute(int dirfd, const char *path, char *out) {
         strcpy(out, path);
     } else if (dirfd == AT_FDCWD) {
         char base[PATH_MAX];
-        os_unfair_lock_lock(&cwd_lock);
-        if (!cwd_known && getcwd(cwd, sizeof cwd)) {
-            reverse(cwd);
-            cwd_known = 1;
+        uint64_t now = atomic_load_explicit(&cwd_changes, memory_order_acquire);
+        int known = 0;
+        if (cwd_as_of == now) {
+            strcpy(base, cwd);
+            atomic_signal_fence(memory_order_seq_cst);
+            known = cwd_as_of == now;
         }
-        int known = cwd_known;
-        if (known) strcpy(base, cwd);
-        os_unfair_lock_unlock(&cwd_lock);
-        if (!known || join(out, base, path) < 0) return -1;
+        if (!known) {
+            if (!getcwd(base, sizeof base)) return -1;
+            reverse(base);
+            cwd_as_of = 0;
+            atomic_signal_fence(memory_order_seq_cst);
+            strcpy(cwd, base);
+            atomic_signal_fence(memory_order_seq_cst);
+            cwd_as_of = now;
+        }
+        if (join(out, base, path) < 0) return -1;
     } else {
         char base[PATH_MAX];
         if (fcntl(dirfd, F_GETPATH, base) < 0) return -1;
@@ -752,23 +782,6 @@ static int configured(void) {
     return alive && !busy;
 }
 
-static void fork_prepare(void) {
-    os_unfair_lock_lock(&seen_lock);
-    os_unfair_lock_lock(&cwd_lock);
-}
-
-static void fork_after(void) {
-    os_unfair_lock_unlock(&cwd_lock);
-    os_unfair_lock_unlock(&seen_lock);
-}
-
-// The child's thread is another Mach thread than the one that took the locks, and an unfair
-// lock aborts the process that unlocks one it does not own: the child starts them afresh.
-static void fork_child(void) {
-    cwd_lock = OS_UNFAIR_LOCK_INIT;
-    seen_lock = OS_UNFAIR_LOCK_INIT;
-}
-
 static void image_added(const struct mach_header *header, intptr_t slide) {
     (void)slide;
     Dl_info info;
@@ -908,7 +921,6 @@ __attribute__((constructor)) static void start(void) {
     unsetenv("__BLAZE_SANDBOX");
     unsetenv("__BLAZE_SANDBOX_EXEC");
     unsetenv(SCOPE_VAR);
-    pthread_atfork(fork_prepare, fork_after, fork_child);
     alive = 1;
     if (record_reads) _dyld_register_func_for_add_image(image_added);
     busy = 0;
@@ -1404,18 +1416,12 @@ static int my_chdir(const char *p) {
     BEGIN
     enum answer a = resolve(AT_FDCWD, p, READ, real, virt, &root);
     int r = a == FAIL ? -1 : a == USE ? chdir(real) : chdir(p);
-    os_unfair_lock_lock(&cwd_lock);
-    cwd_known = 0;
-    os_unfair_lock_unlock(&cwd_lock);
+    cwd_changed();
     END(r);
 }
 static int my_fchdir(int fd) {
     int r = fchdir(fd);
-    if (alive) {
-        os_unfair_lock_lock(&cwd_lock);
-        cwd_known = 0;
-        os_unfair_lock_unlock(&cwd_lock);
-    }
+    if (alive) cwd_changed();
     return r;
 }
 static char *my_getcwd(char *buf, size_t size) {

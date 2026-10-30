@@ -58,12 +58,15 @@ use serde_derive::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 /// The statement the code of a function is of from `offset` on, as an index into the
-/// statements the function was built from.
+/// statements the function was built from. 8 bytes; a function's rows are one array of
+/// exactly their number, in the order of the offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct LineRow {
     pub(super) offset: CodeOffset,
     pub(super) span: u32,
 }
+
+const _: () = assert!(size_of::<LineRow>() == 8);
 
 impl LineRow {
     /// The first source location that stands for a statement: 0 is that of none.
@@ -80,17 +83,23 @@ impl LineRow {
 
     /// The rows of a function from the source location its code has from each offset on, in
     /// the order of the offsets. Code of no statement goes with the statement before it.
-    pub(super) fn of_ranges(
-        ranges: impl IntoIterator<Item = (CodeOffset, ir::SourceLoc)>,
-    ) -> Vec<LineRow> {
-        let mut rows: Vec<LineRow> = Vec::new();
-        for (offset, loc) in ranges {
-            let Some(span) = Self::span_of(loc) else { continue };
-            if rows.last().is_none_or(|last| last.span != span) {
-                rows.push(LineRow { offset, span });
-            }
-        }
-        rows
+    /// The ranges are walked twice, to count the rows and then to write them into an array
+    /// of that length.
+    pub(super) fn of_ranges<I>(ranges: I) -> Vec<LineRow>
+    where
+        I: IntoIterator<Item = (CodeOffset, ir::SourceLoc), IntoIter: Clone>,
+    {
+        let ranges = ranges.into_iter();
+        let rows = || {
+            let mut last = None;
+            ranges.clone().filter_map(move |(offset, loc)| {
+                let span = Self::span_of(loc)?;
+                (last.replace(span) != Some(span)).then_some(LineRow { offset, span })
+            })
+        };
+        let mut out = Vec::with_capacity(rows().count());
+        out.extend(rows());
+        out
     }
 }
 
@@ -224,14 +233,18 @@ impl SlotPlaces {
         // Every slot of the function is in the layout, but one read back from Cranelift's
         // incremental cache leaves out the slots at its end that are at the bottom of the
         // frame, as a `SecondaryMap` written out leaves out its default entries (#242).
-        let slots = slots
-            .filter(|&slot| func.sized_stack_slots.is_valid(slot))
-            .map(|slot| {
-                let offset = i64::from(frame.stackslots[slot].offset) - to_fp;
-                (slot.as_u32(), VariablePlace::Frame(offset))
-            })
-            .collect();
-        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + register.0 as u8], slots }
+        let slots = slots.filter(|&slot| func.sized_stack_slots.is_valid(slot));
+        let mut places = Vec::with_capacity(slots.size_hint().1.unwrap_or(0));
+        places.extend(slots.map(|slot| {
+            let offset = i64::from(frame.stackslots[slot].offset) - to_fp;
+            (slot.as_u32(), VariablePlace::Frame(offset))
+        }));
+        // A frame base no variable is told from would be read by nothing: every variable
+        // told of is where one of these slots is.
+        if places.is_empty() {
+            return SlotPlaces::default();
+        }
+        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + register.0 as u8], slots: places }
     }
 }
 
@@ -240,20 +253,39 @@ impl VariablePlace {
     /// debugger cannot read the address in has no place for the value.
     pub(super) fn pointee(&self, offset: u32) -> VariablePlace {
         let ranges = match self {
-            VariablePlace::Frame(offset) => {
-                let mut held = vec![gimli::DW_OP_fbreg.0];
-                // An expression of one operation writes nowhere it can fail.
-                let _ = gimli::leb128::write::signed(&mut held, *offset);
-                vec![(0, CodeOffset::MAX, held)]
+            // What `pointee_expression` makes of `DW_OP_fbreg`, written once into an
+            // expression of its exact length.
+            &VariablePlace::Frame(at) => {
+                let plus = if offset == 0 { 0 } else { 1 + uleb_size(offset) };
+                let mut pointee = Vec::with_capacity(1 + sleb_size(at) + 1 + plus);
+                pointee.push(gimli::DW_OP_fbreg.0);
+                // Writing to a `Vec` cannot fail.
+                let _ = gimli::leb128::write::signed(&mut pointee, at);
+                pointee.push(gimli::DW_OP_deref.0);
+                if offset != 0 {
+                    pointee.push(gimli::DW_OP_plus_uconst.0);
+                    let _ = gimli::leb128::write::unsigned(&mut pointee, u64::from(offset));
+                }
+                vec![(0, CodeOffset::MAX, pointee)]
             }
-            VariablePlace::Ranges(ranges) => ranges.clone(),
+            VariablePlace::Ranges(ranges) => ranges
+                .iter()
+                .filter_map(|(from, to, held)| {
+                    Some((*from, *to, pointee_expression(held, offset)?))
+                })
+                .collect(),
         };
-        let ranges = ranges
-            .into_iter()
-            .filter_map(|(from, to, held)| Some((from, to, pointee_expression(&held, offset)?)))
-            .collect();
         VariablePlace::Ranges(ranges)
     }
+}
+
+fn sleb_size(value: i64) -> usize {
+    let bits = 64 - if value < 0 { value.leading_ones() } else { value.leading_zeros() };
+    (bits as usize + 1).div_ceil(7)
+}
+
+fn uleb_size(value: u32) -> usize {
+    (32 - (value | 1).leading_zeros()).div_ceil(7) as usize
 }
 
 /// The expression of the memory `offset` bytes from an address, from the one of where the
@@ -1551,5 +1583,77 @@ impl Writer for SectionWriter {
             addend: val as i64,
         });
         self.write_udata_at(offset, 0, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// The rows as they were made before they were counted first: one push at a time.
+    fn rows_one_at_a_time(ranges: &[(CodeOffset, ir::SourceLoc)]) -> Vec<LineRow> {
+        let mut rows: Vec<LineRow> = Vec::new();
+        for &(offset, loc) in ranges {
+            let Some(span) = LineRow::span_of(loc) else { continue };
+            if rows.last().is_none_or(|last| last.span != span) {
+                rows.push(LineRow { offset, span });
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn line_rows_are_the_rows_pushed_one_at_a_time() {
+        for seed in 0..300 {
+            let mut next = seeded(seed);
+            let mut offset = 0;
+            let ranges: Vec<_> = (0..next() % 200)
+                .map(|_| {
+                    let bits = next();
+                    offset += (bits % 9) as u32;
+                    let span = ((bits >> 8) % 6) as u32;
+                    let loc = match bits >> 16 & 7 {
+                        0 => ir::SourceLoc::default(),
+                        1 => ir::SourceLoc::new(0),
+                        2 => super::super::unwind::seh::guarded(LineRow::source_loc(span)),
+                        _ => LineRow::source_loc(span),
+                    };
+                    (offset, loc)
+                })
+                .collect();
+            let rows = LineRow::of_ranges(ranges.iter().copied());
+            assert_eq!(rows, rows_one_at_a_time(&ranges), "seed {seed}");
+            assert_eq!(rows.capacity(), rows.len(), "seed {seed}");
+            assert_eq!(LineRow::of_ranges(ranges.clone()), rows, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_pointee_of_a_frame_place_is_what_the_expression_of_its_address_gives() {
+        let mut next = seeded(7);
+        let edges = [0, 1, -1, 63, 64, -64, -65, 8191, 8192, -8192, -8193, i64::MAX, i64::MIN];
+        let offsets = edges.into_iter().chain((0..500).map(|_| next() as i64 >> (next() % 64)));
+        for at in offsets {
+            for offset in [0, 1, 127, 128, 0x3fff, 0x4000, u32::MAX] {
+                let mut held = vec![gimli::DW_OP_fbreg.0];
+                gimli::leb128::write::signed(&mut held, at).expect("written");
+                let expected = pointee_expression(&held, offset).expect("a pointee");
+                let VariablePlace::Ranges(ranges) = VariablePlace::Frame(at).pointee(offset) else {
+                    panic!("a frame place's pointee is in ranges");
+                };
+                assert_eq!(ranges, vec![(0, CodeOffset::MAX, expected)], "{at} + {offset}");
+                assert_eq!(ranges[0].2.capacity(), ranges[0].2.len(), "{at} + {offset}");
+            }
+        }
     }
 }

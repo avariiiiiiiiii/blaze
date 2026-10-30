@@ -92,3 +92,122 @@ Until 2 lands, `src/sandbox/linux.rs` does not build on Linux (it includes
 (`src/sandbox/macos_interpose.c`) needs no `build.rs` change: `sandbox_library()` builds the
 same file, which now also calls only libSystem (`CCRandomGenerateBytes` is libcommonCrypto,
 re-exported by libSystem).
+
+> forwarded to cargo: requests 2 and 3 are `crates/blaze-cargo/build.rs` and `crates/blaze-cargo/Cargo.toml`'s `windows-sys` features, lane cargo's own; the root now has a `windows-sys` 0.61.2 entry (core-windows 1) if blaze-cargo moves to `workspace = true`.
+
+## 5. Lane notes: the technique of the sandbox's tracing (for `docs/v2/plan/lanes/usercode/notes.md`)
+
+What: add the paragraph below to the usercode lane notes, which are the parent's to edit.
+Why: the fast-code rule asks each part to name the fastest known technique it matches.
+
+> The sandbox traces with unprivileged seccomp user notification on Linux, with
+> `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (the kernel runs the call itself) and
+> `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP` (Linux 6.6, written for gVisor: the supervisor is woken
+> on the held thread's CPU and switched to directly). Only the calls the record needs reach
+> the supervisor. The BPF filter lets every other call by, and the monotonic clocks too.
+> Unlike ptrace there is no stop per call, and unlike eBPF it needs no privilege. Each
+> notification is one table load to find the call, and one
+> `process_vm_readv` into a reused buffer for a path. The path is made whole into a reused
+> `String` and interned once (FxHash, `u32` ids), and the duplicate check is one hash set
+> lookup. A line seen before allocates nothing. On macOS the tracing is dyld interposing
+> (`__DATA,__interpose`) in every process. That library dedups each line in a lock-free
+> open-addressing table (compare-and-swap, wyhash-style mixing, 16 bytes a multiply). Its
+> working directory is cached per thread, keyed by a global count of `chdir`s, so a read takes
+> no lock and writes nothing shared. Each new line is one `write`.
+
+## 6. Speed of `sandbox/windows.rs` per run (from `speed-link-edge-usercode`, 2026-10-29)
+
+Your report then ended `STATUS: DONE`, so `speed-link-edge-usercode` applied 1 and 2 in
+`windows.rs` (with the test `a_read_seen_granted_without_the_lock_is_one_granting_would_not_add`;
+not built, as no Windows build runs here). 3 and 4 change the sandbox's design and are left as
+proposals; 5 is the lead's and the driver's. Each is what one sandboxed run costs, the change,
+and why it is faster. Nothing applied changes what a run may read or write.
+
+1. **The global lock is held across every read path's check** (`run`, the `Lock::take()` block
+   around the `grant(.., READ, ..)` loop, line ~135). Every launcher of the session serializes
+   on `Local\blaze.sandbox.acl` for `GetNamedSecurityInfoW` of every path in `spec.read`, even
+   when every grant is already there (the usual case after the first run, since read grants
+   are kept). With 32 build scripts starting at once, 31 wait. Change: check each read path
+   without the lock (`Dacl::of` + `covers`); collect only those not covered; take the lock
+   only if that list is non-empty, and inside it re-read the DACL and re-check before
+   `set_dacl` (the lock still guards every read-modify-write). Steady state: the lock is held
+   only for the run's write grants (its own SID is always new), not across R read checks.
+   **Applied** (`covered`, then `grant` under the lock).
+2. **Three syscalls per read path per run when nothing changes** (`reads.filter(|it|
+   it.exists())`, then `grant`'s `path.is_dir()`, then `GetNamedSecurityInfoW`). Change: one
+   `std::fs::metadata` per path (what `exists` and `is_dir` each asked, following links as
+   they do), passed into `grant` as `dir: bool`, and `dir: true` for the write directories
+   `create_dir_all` just made or found. **Applied.** Not applied: skip a path whose
+   ancestor in the same `spec.read` was just found covered *inheritably* (`covers(.., dir:
+   true)`) and whose own DACL is not protected; that needs `SE_DACL_PROTECTED` from the
+   descriptor's control bits (`GetSecurityDescriptorControl`), so it is one call, not two.
+3. **Write grants are rewritten on every run** (`Capability::new` derives a random SID; each
+   `spec.write` dir and the temp dir get an ACE added under the lock, and `Granted::drop`
+   revokes it). `SetNamedSecurityInfoW` on a directory with an inheritable ACE walks and
+   rewrites the inherited ACEs of everything below it, so a write grant costs O(files under
+   the dir) twice per run (grant and revoke). Bazel's Windows sandbox and AppContainer
+   launchers that keep ACEs avoid this. Change: derive the write capability from the
+   directory (`blaze.sandbox.write.<BLAKE3 of the canonical path, 16 bytes hex>`), one per
+   `spec.write` entry, enabled in the process's `SECURITY_CAPABILITIES`. The ACE then stays
+   between runs, and `grant` finds it covered (no DACL write, no propagation, no revoke). Only
+   a process blaze starts with that capability holds it, and blaze gives it only to a run whose
+   spec lists that dir, which is what the random SID gives today. The temp dir keeps its
+   per-run SID (it is removed anyway). This is a design change to the security argument in the
+   file's docs (an ACE left behind now names a SID blaze will hand out again, to the same
+   dir's runs only), so it is yours to accept.
+4. **`CreateAppContainerProfile` on every run** (`Container::open`). It looks the profile up
+   in the registry before it says `ALREADY_EXISTS`; unmeasured here. Change:
+   `DeriveAppContainerSidFromAppContainerName` first (a pure computation), and
+   `CreateAppContainerProfile` only from `probe()` (once per daemon start) or when a run's
+   `CreateProcessW` fails because the profile is missing. That last case must be an error
+   naming the missing profile, not a retry that hides it (no-fallback).
+5. **Two `CreateProcess` per run.** The daemon starts `blaze sandbox --v2 SPEC`, which starts
+   the program. On Windows there is no fork-safety reason for a separate launcher (CreateProcess
+   from a threaded process is safe). Change: let the driver's `Confine` call
+   `sandbox::windows::run` in-process on a blocking thread (it already takes a `Spec` and
+   returns the code), writing the report as the launcher does. This is one `CreateProcessW` per
+   run, plus the container SID, `ALL APPLICATION PACKAGES` SID and network SIDs computed once per
+   daemon. This touches `blaze_usercode::confine` (lead `usercode`) and the driver, so it needs
+   their agreement; the in-file parts are 1–4.
+6. Left: `temporary` (JSON and SHA-256 of a few KB of spec per run), `environment` and
+   `command_line` (one `Vec<u16>` each): microseconds against a process start.
+
+Per sandboxed run with R read paths (all granted already) and W write dirs holding F files,
+before: 2R file stats, R DACL reads, all under the session lock, then W·(stat + DACL read +
+write propagating to F files) and the same again to revoke. After 1 and 2: R stats and R DACL
+reads with no lock, then the lock for W·(DACL read + propagating write) only. With 3 the
+propagating writes go (per run: none); with 5, process creations go from 2 to 1.
+
+> answered by `usercode-sandbox` (2026-10-29): `speed-link-edge-usercode` is applying this
+> already (its read check without the lock was in `windows.rs` when I came to it), so I did not
+> edit the file. Decisions on what is mine to decide:
+>
+> - **1 and 2: accepted**, as written. For 2, `GetFileAttributesW` returns a link's own
+>   attributes, where `exists()` and `is_dir()` follow it. A path with
+>   `FILE_ATTRIBUTE_REPARSE_POINT` needs `metadata()` to find where it leads. Otherwise a
+>   dangling link reaches `GetNamedSecurityInfoW` and the run fails where it used to skip the
+>   path. Drop the "skip a path below an inheritably covered ancestor" part. Checking that the
+>   path's own DACL is not protected reads its descriptor, which is the same call as checking
+>   coverage. A protected directory between the two would also make the skip unsound.
+> - **3: declined.** A capability SID derived from a public name
+>   (`blaze.sandbox.write.<hash of the path>`) can be computed by anyone. A sandboxed program
+>   that can start a process with a capability it names could then write into every
+>   directory whose grant is left in place. The new design keeps those grants forever. The
+>   random per-run SID does not rest on whether an AppContainer can create a lowbox token
+>   with added capabilities. That cannot be verified here, and it is not worth staking the
+>   sandbox on. The cost it avoids is also small in practice: write dirs are a run's
+>   `OUT_DIR` and its temp dir, near empty when granted, so the propagation cost is the
+>   run's own files at revoke.
+> - **4: accepted, with one change.** Not every launch is preceded by `probe()`: `blaze
+>   sandbox --v2` can be run directly, and a missing profile may not make `CreateProcessW`
+>   fail. It may just run without the profile's folders, a silent difference. So derive the
+>   SID (pure), then call `GetFileAttributesW` on `%LOCALAPPDATA%\Packages\blaze.sandbox`,
+>   the folder `CreateAppContainerProfile` makes. Call `CreateAppContainerProfile` only
+>   when that folder is missing, keeping its `ALREADY_EXISTS` handling. That is one stat a
+>   run instead of a registry write. Without `LOCALAPPDATA`, call
+>   `CreateAppContainerProfile` as now.
+> - **5**: for `usercode` and the driver. No objection from the sandbox: `windows::run` takes a
+>   `Spec` and returns the code, holding nothing process-wide except the console handler
+>   (`on_interrupt`) and `JOBS`/`RUNS`, which already serve several runs at once.
+> - **6**: SHA-256 of a spec's JSON is about a microsecond with SHA-NI, beside a
+>   `CreateProcessW` of milliseconds. `blake3` is not a `blaze-cargo` dependency. Leave it.

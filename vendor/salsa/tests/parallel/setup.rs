@@ -3,8 +3,8 @@
 use salsa::{Database, Storage};
 
 use super::signal::Signal;
-use super::sync::Arc;
-use super::sync::atomic::{AtomicUsize, Ordering};
+use super::sync::thread::{self, ThreadId};
+use super::sync::{Arc, Mutex};
 
 /// Various "knobs" and utilities used by tests to force
 /// a certain behavior.
@@ -18,8 +18,8 @@ pub(crate) trait KnobsDatabase: Database {
 }
 
 /// A database containing various "knobs" that can be used to customize how the queries
-/// behave on one specific thread. Note that this state is
-/// intentionally thread-local (apart from `signal`).
+/// behave. One database is shared by `&` between the threads of a test; the knobs that
+/// customize one thread are keyed by that thread.
 #[salsa::db]
 pub(crate) struct Knobs {
     storage: salsa::Storage<Self>,
@@ -28,34 +28,18 @@ pub(crate) struct Knobs {
     /// threads to ensure we reach various weird states.
     pub(crate) signal: Arc<Signal>,
 
-    /// When this database is about to block, send this signal.
-    signal_on_will_block: Arc<AtomicUsize>,
-
-    /// When this database has set the cancellation flag, send this signal.
-    signal_on_did_cancel: Arc<AtomicUsize>,
+    /// When a thread listed here is about to block, send its signal.
+    signal_on_will_block: Arc<Mutex<Vec<(ThreadId, usize)>>>,
 }
 
 impl Knobs {
-    pub fn signal_on_did_cancel(&self, stage: usize) {
-        self.signal_on_did_cancel.store(stage, Ordering::Release);
-    }
-
+    /// When the calling thread is about to block, send `stage`.
     pub fn signal_on_will_block(&self, stage: usize) {
-        self.signal_on_will_block.store(stage, Ordering::Release);
-    }
-}
-
-impl Clone for Knobs {
-    #[track_caller]
-    fn clone(&self) -> Self {
-        // To avoid mistakes, check that when we clone, we haven't customized this behavior yet
-        assert_eq!(self.signal_on_will_block.load(Ordering::Acquire), 0);
-        assert_eq!(self.signal_on_did_cancel.load(Ordering::Acquire), 0);
-        Self {
-            storage: self.storage.clone(),
-            signal: self.signal.clone(),
-            signal_on_will_block: self.signal_on_will_block.clone(),
-            signal_on_did_cancel: self.signal_on_did_cancel.clone(),
+        let id = thread::current().id();
+        let mut knobs = self.signal_on_will_block.lock().unwrap();
+        match knobs.iter_mut().find(|(thread, _)| *thread == id) {
+            Some((_, old)) => *old = stage,
+            None => knobs.push((id, stage)),
         }
     }
 }
@@ -63,27 +47,26 @@ impl Clone for Knobs {
 impl Default for Knobs {
     fn default() -> Self {
         let signal = <Arc<Signal>>::default();
-        let signal_on_will_block = Arc::new(AtomicUsize::new(0));
-        let signal_on_did_cancel = Arc::new(AtomicUsize::new(0));
+        let signal_on_will_block = Arc::new(Mutex::new(Vec::<(ThreadId, usize)>::new()));
 
         Self {
             storage: Storage::new(Some(Box::new({
                 let signal = signal.clone();
                 let signal_on_will_block = signal_on_will_block.clone();
-                let signal_on_did_cancel = signal_on_did_cancel.clone();
-                move |event| match event.kind {
-                    salsa::EventKind::WillBlockOn { .. } => {
-                        signal.signal(signal_on_will_block.load(Ordering::Acquire));
+                move |event| {
+                    if let salsa::EventKind::WillBlockOn { .. } = event.kind {
+                        let stage = signal_on_will_block
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|(thread, _)| *thread == event.thread_id)
+                            .map_or(0, |&(_, stage)| stage);
+                        signal.signal(stage);
                     }
-                    salsa::EventKind::DidSetCancellationFlag => {
-                        signal.signal(signal_on_did_cancel.load(Ordering::Acquire));
-                    }
-                    _ => {}
                 }
             }))),
             signal,
             signal_on_will_block,
-            signal_on_did_cancel,
         }
     }
 }

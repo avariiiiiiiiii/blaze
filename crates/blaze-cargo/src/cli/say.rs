@@ -31,7 +31,24 @@ pub fn paint(style: &str, text: &str, color: bool) -> String {
 
 /// `   Compiling foo v0.1.0 (/w/foo)`: cargo's `Shell::status`, with its newline.
 pub fn status(word: &str, rest: &str, color: bool) -> String {
-    format!("{} {rest}\n", paint(GOOD, &format!("{word:>12}"), color))
+    let mut line = String::with_capacity(rest.len() + 24);
+    status_word(&mut line, word, color);
+    line.push_str(rest);
+    line.push('\n');
+    line
+}
+
+/// The start of a [`status`] line in `out`: `word` right-aligned in twelve columns, then a space.
+pub fn status_word(out: &mut String, word: &str, color: bool) {
+    if color {
+        out.push_str(GOOD);
+    }
+    out.extend(std::iter::repeat_n(' ', 12usize.saturating_sub(word.len())));
+    out.push_str(word);
+    if color {
+        out.push_str(RESET);
+    }
+    out.push(' ');
 }
 
 /// `error: what`: cargo's `Shell::error`, with its newline.

@@ -3,9 +3,11 @@
 //! Follows `compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs` (`warn_if_unreachable`: "unreachable
 //! {kind}" at what is unreachable, "any code following this expression is unreachable" or the
 //! custom note at what diverged) and its callers in `expr.rs`, `_match.rs` and
-//! `fn_ctxt/checks.rs`, which give the kind, the span and the node of each (MIT or
-//! Apache-2.0). Which code is unreachable is type checking's (`InferenceResult::unreachable`,
-//! hir-ty's port of rustc's `Diverges`).
+//! `fn_ctxt/checks.rs`, which give the kind, the span and the node of each, and
+//! `compiler/rustc_mir_transform/src/lint_and_remove_uninhabited.rs` with its
+//! `UnreachableDueToUninhabited` of `diagnostics.rs` (MIT or Apache-2.0). Which code is
+//! unreachable is type checking's (`InferenceResult::unreachable`, hir-ty's port of rustc's
+//! `Diverges`) and MIR lowering's (`MirBody::unreachable_after_calls`).
 
 use hir::InFile;
 use hir_def::hir::{Expr, ExprId, Statement};
@@ -20,6 +22,31 @@ use crate::{
 
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     b.infer.unreachable().iter().filter_map(|it| lint(b, it)).collect()
+}
+
+/// `LintAndRemoveUninhabited`, in `mir_promoted`: what follows a call of a type that is
+/// uninhabited but not `!`, which type checking does not see (`MirBody::unreachable_after_calls`).
+/// None when the call is in a macro of another crate.
+pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
+    if b.tainted {
+        return Vec::new();
+    }
+    let Some(mir) = b.mir() else { return Vec::new() };
+    let mut found = Vec::new();
+    for it in &mir.unreachable_after_calls {
+        let (Some(call), Some(next)) = (b.mir_node(it.call), b.mir_node(it.next)) else { continue };
+        if b.in_external_macro(call) {
+            continue;
+        }
+        let (Some(call_span), Some(next_span)) = (b.mir_span(it.call), b.mir_span(it.next)) else { continue };
+        let message = format!("unreachable {}", it.descr);
+        let mut diag = Diag::lint("unreachable_code", message.clone(), next_span.clone());
+        diag.span_label(next_span, message);
+        diag.span_label(call_span.clone(), "any code following this expression is unreachable");
+        diag.span_note(call_span, format!("this expression has type `{}`, which is uninhabited", b.ty(it.ty.as_ref())));
+        found.push(b.lint(diag, Phase::Mir, next));
+    }
+    found
 }
 
 fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
@@ -44,8 +71,8 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
         }
         UnreachableAt::Call(expr) => {
             let node = b.expr_node(expr)?;
-            let span = match &store[expr] {
-                Expr::Call { callee, .. } => b.expr_span(*callee)?,
+            let span = match store.expr(expr) {
+                Expr::Call { callee, .. } => b.expr_span(callee)?,
                 Expr::MethodCall { .. } => {
                     let call = b.cx.syntax(node);
                     let name = ast::MethodCallExpr::cast(call.value)?.name_ref()?;
@@ -56,22 +83,22 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
             ("call", span, node)
         }
         UnreachableAt::Stmt { block, index } => {
-            let Expr::Block { statements, .. } = &store[block] else { return None };
+            let Expr::Block { statements, .. } = store.expr(block) else { return None };
             let node = statement_node(b, statements.get(index as usize)?)?;
             ("statement", b.cx.span_of(node), node)
         }
         UnreachableAt::Arm { match_expr, index } => {
-            let Expr::Match { arms, .. } = &store[match_expr] else { return None };
+            let Expr::Match { arms, .. } = store.expr(match_expr) else { return None };
             let body = arms.get(index as usize)?.expr;
             let node = b.expr_node(body)?;
             ("arm", b.cx.span_of(node), node)
         }
         UnreachableAt::IfBlock(if_expr) => {
-            let Expr::If { condition, then_branch, .. } = store[if_expr] else { return None };
+            let Expr::If { condition, then_branch, .. } = store.expr(if_expr) else { return None };
             ("block in `if` or `while` expression", b.expr_span(then_branch)?, b.expr_node(condition)?)
         }
         UnreachableAt::LetInit(let_expr) => {
-            let Expr::Let { expr, .. } = store[let_expr] else { return None };
+            let Expr::Let { expr, .. } = store.expr(let_expr) else { return None };
             let node = b.expr_node(expr)?;
             ("block in `let` expression", b.cx.span_of(node), node)
         }
@@ -88,8 +115,11 @@ fn statement_node(b: &BodyCx<'_, '_>, statement: &Statement) -> Option<InFile<Sy
     let syntax = b.cx.syntax(node);
     let found = match is_let {
         true => syntax.value.ancestors().find(|it| ast::LetStmt::can_cast(it.kind()))?,
-        false => match syntax.value.parent().filter(|it| ast::ExprStmt::can_cast(it.kind())) {
-            Some(stmt) => stmt,
+        false => match syntax.value.parent().and_then(ast::ExprStmt::cast) {
+            Some(stmt) => match stmt.expr() {
+                Some(ast::Expr::MacroExpr(call)) => call.syntax().clone(),
+                _ => stmt.syntax().clone(),
+            },
             None => syntax.value.clone(),
         },
     };

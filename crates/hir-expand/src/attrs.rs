@@ -43,13 +43,19 @@ pub trait AstPathExt {
     fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)>;
 }
 
+/// `f` of the text of the path's one segment, without `r#`, read in place.
+fn with_one_segment<R>(path: &ast::Path, f: impl FnOnce(&str) -> R) -> Option<R> {
+    let name_ref = path.as_single_name_ref()?;
+    Some(f(name_ref.text().trim_start_matches("r#")))
+}
+
 impl AstPathExt for ast::Path {
     fn is1(&self, segment: &str) -> bool {
-        self.as_one_segment().is_some_and(|it| it == segment)
+        with_one_segment(self, |it| it == segment).unwrap_or(false)
     }
 
     fn as_one_segment(&self) -> Option<SmolStr> {
-        Some(self.as_single_name_ref()?.text().trim_start_matches("r#").into())
+        with_one_segment(self, |it| SmolStr::new(it))
     }
 
     fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
@@ -200,10 +206,9 @@ pub fn collect_item_tree_attrs<'a, BreakValue>(
                     }
                     true
                 }
-                _ => attr
-                    .path()
-                    .and_then(|path| path.as_one_segment())
-                    .is_some_and(|segment| is_item_tree_filtered_attr(&segment)),
+                _ => attr.path().is_some_and(|path| {
+                    with_one_segment(&path, is_item_tree_filtered_attr) == Some(true)
+                }),
             };
             if !filter && let ControlFlow::Break(v) = on_attr(attr, top_attr) {
                 return ControlFlow::Break(Either::Left(v));

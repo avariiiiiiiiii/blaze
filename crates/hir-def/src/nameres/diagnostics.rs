@@ -2,7 +2,7 @@
 
 use std::ops::Not;
 
-use cfg::{CfgExpr, CfgOptions};
+use cfg::CfgExpr;
 use hir_expand::{ErasedAstId, ExpandErrorKind, MacroCallKind, attrs::AttrId, mod_path::ModPath};
 use la_arena::Idx;
 use syntax::ast;
@@ -14,7 +14,9 @@ pub enum DefDiagnosticKind {
     UnresolvedModule { ast: AstId<ast::Module>, candidates: Box<[String]> },
     UnresolvedExternCrate { ast: AstId<ast::ExternCrate> },
     UnresolvedImport { id: AstId<ast::Use>, index: Idx<ast::UseTree> },
-    UnconfiguredCode { ast_id: ErasedAstId, cfg: CfgExpr, opts: CfgOptions },
+    /// Code `cfg` leaves out under its crate's cfg options (`Crate::cfg_options`), which are not
+    /// copied into each diagnostic: a crate like `std` has thousands of these.
+    UnconfiguredCode { ast_id: ErasedAstId, cfg: CfgExpr },
     UnresolvedMacroCall { ast: MacroCallKind, path: ModPath },
     UnimplementedBuiltinMacro { ast: AstId<ast::Macro> },
     InvalidDeriveTarget { ast: AstId<ast::Item>, id: AttrId },
@@ -86,16 +88,8 @@ impl DefDiagnostic {
         Self { in_module: container, kind: DefDiagnosticKind::MacroError { ast, path, err } }
     }
 
-    pub fn unconfigured_code(
-        container: ModuleId,
-        ast_id: ErasedAstId,
-        cfg: CfgExpr,
-        opts: CfgOptions,
-    ) -> Self {
-        Self {
-            in_module: container,
-            kind: DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts },
-        }
+    pub fn unconfigured_code(container: ModuleId, ast_id: ErasedAstId, cfg: CfgExpr) -> Self {
+        Self { in_module: container, kind: DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } }
     }
 
     // FIXME: Whats the difference between this and unresolved_proc_macro

@@ -257,6 +257,18 @@
 //! that carry the database lifetime should normally derive `SalsaValue`. See its safety
 //! documentation before implementing it manually or exempting a field from the generated checks.
 //!
+//! # Threads and tasks
+//!
+//! A database is [`Sync`]: one database is read through `&` from any number of threads at once,
+//! and written through `&mut`, which excludes every reader, so a write never cancels or waits for
+//! a running query. There are no second handles to a database.
+//!
+//! Each *task* has its own query stack: a thread runs one task, or more when a work pool runs
+//! another job on a thread whose task waits (the job is a task above it). [`set_task_depth`]
+//! tells salsa which one runs. A task's reads are dependencies of its own queries only. A task
+//! that asks for a query a task below it on its thread runs unwinds with
+//! [`Cancelled::WouldWaitOnItself`]; a task that asks for one another thread runs waits for it.
+//!
 //! [`Deref`]: std::ops::Deref
 //! [`Hash`]: std::hash::Hash
 //! [`'db` database lifetime]: https://salsa-rs.github.io/salsa/plumbing/db_lifetime.html

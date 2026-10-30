@@ -3,14 +3,22 @@
 
 //! A pending write must not leave reusable provisional memos behind.
 //!
-//! `cycle_a` and `cycle_b` establish a fixpoint cycle. The test interrupts that cycle
-//! with an explicit cancellation that does not advance the revision. The retry must start from a
-//! fresh cycle initial value.
+//! `cycle_a` and `cycle_b` establish a fixpoint cycle. The host abandons that cycle for a write
+//! (it throws `Cancelled::PendingWrite`), and the write does not advance the revision. The retry
+//! must start from a fresh cycle initial value.
+
+use std::cell::Cell;
+use std::panic::resume_unwind;
 
 use salsa::{Cancelled, Database};
 
 use crate::setup::{Knobs, KnobsDatabase};
-use crate::sync::thread;
+
+std::thread_local! {
+    /// Whether `cycle_a` abandons its work for a pending write when it reaches its
+    /// cancellation point.
+    static ABANDON: Cell<bool> = const { Cell::new(false) };
+}
 
 #[salsa::input]
 struct Input {
@@ -22,8 +30,9 @@ struct Input {
 fn cycle_a(db: &dyn KnobsDatabase, input: Input) -> u32 {
     let value = cycle_b(db, input);
 
-    db.signal(1);
-    db.wait_for(2);
+    if ABANDON.with(Cell::get) {
+        resume_unwind(Box::new(Cancelled::PendingWrite));
+    }
     cancellation_point(db, input);
 
     value
@@ -56,31 +65,15 @@ fn cycle_fn(
 
 #[test]
 fn same_revision_cancellation_leaves_fixpoint_cycle_reusable() {
-    let db = Knobs::default();
-    let db_writer = db.clone();
-    let db_t1 = db.clone();
-    let db_waiter = db.clone();
+    let mut db = Knobs::default();
     let input = Input::new(&db, 3);
 
-    db.signal_on_did_cancel(2);
-    drop(db);
+    ABANDON.with(|abandon| abandon.set(true));
+    let abandoned = Cancelled::catch(|| cycle_a(&db, input));
+    ABANDON.with(|abandon| abandon.set(false));
+    assert!(matches!(abandoned, Err(Cancelled::PendingWrite)));
 
-    let t1 = thread::spawn(move || Cancelled::catch(|| cycle_a(&db_t1, input)));
+    db.trigger_cancellation();
 
-    db_waiter.wait_for(1);
-    drop(db_waiter);
-
-    let t2 = thread::spawn({
-        let mut db_writer = db_writer;
-        move || {
-            db_writer.trigger_cancellation();
-            db_writer
-        }
-    });
-
-    assert!(matches!(t1.join().unwrap(), Err(Cancelled::PendingWrite)));
-
-    let db_after = t2.join().unwrap();
-
-    assert_eq!(cycle_a(&db_after, input), 3);
+    assert_eq!(cycle_a(&db, input), 3);
 }

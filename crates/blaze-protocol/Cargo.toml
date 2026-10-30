@@ -13,6 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+# `cbor::reference`: the codec as it was before it wrote in place and read in one pass, the
+# oracle of the differential tests here and in blaze-api. Tests only.
+reference = []
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 

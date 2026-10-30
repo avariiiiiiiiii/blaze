@@ -144,22 +144,40 @@ pub(super) fn function(
     let mut bytes = vec![0; info.emit_size()];
     info.emit(&mut bytes);
     let bytes = with_saves(&bytes)?;
-    let guarded: Vec<_> = code
-        .buffer
-        .get_srclocs_sorted()
-        .iter()
-        .filter(|it| is_guarded(it.loc))
-        .map(|it| it.start..it.end)
-        .collect();
     let mut calls = Pads::default();
+    let mut ranges = Ranges { ranges: code.buffer.get_srclocs_sorted(), at: 0, last: 0 };
     for call_site in code.buffer.call_sites() {
         // The call ends where it returns to, which may be where the next thing starts.
-        if guarded.iter().any(|it| it.contains(&(call_site.ret_addr - 1))) {
+        if ranges.of(call_site.ret_addr - 1).is_some_and(|it| is_guarded(it.loc)) {
             calls.returning(call_site.ret_addr);
         }
     }
     let frame = Frame { len: code.buffer.data().len() as u32, info: bytes };
     Ok((frame, calls.finish()))
+}
+
+/// Finds the source location of each of offsets that mostly come in order, in ranges that are
+/// in order and do not overlap: from where the one before was found, so the calls of a
+/// function are matched to their statements in one walk over both.
+struct Ranges<'a> {
+    ranges: &'a [SrcLoc],
+    at: usize,
+    last: u32,
+}
+
+type SrcLoc = cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>;
+
+impl<'a> Ranges<'a> {
+    fn of(&mut self, offset: u32) -> Option<&'a SrcLoc> {
+        if offset < self.last {
+            self.at = 0;
+        }
+        self.last = offset;
+        while self.ranges.get(self.at).is_some_and(|it| it.end <= offset) {
+            self.at += 1;
+        }
+        self.ranges.get(self.at).filter(|it| it.start <= offset)
+    }
 }
 
 const UWOP_PUSH_NONVOL: u8 = 0;
@@ -671,4 +689,36 @@ fn release(shim: &mut Shim<'_>) {
     let exception = shim.param(0);
     shim.free(exception);
     shim.builder.ins().return_(&[]);
+}
+
+#[test]
+fn ranges_find_what_a_search_of_all_of_them_finds() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |below: u32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % u64::from(below)) as u32
+    };
+    for _ in 0..200 {
+        let mut ranges = Vec::new();
+        let mut at = 0;
+        for line in 0..next(40) {
+            let start = at + next(4);
+            let end = start + next(12);
+            ranges.push(SrcLoc { start, end, loc: ir::SourceLoc::new(line) });
+            at = end;
+        }
+        let mut found = Ranges { ranges: &ranges, at: 0, last: 0 };
+        let mut offset = 0;
+        for _ in 0..60 {
+            // Mostly onwards, as calls come, and now and then back.
+            offset = match next(8) {
+                0 => next(at + 1),
+                _ => offset + next(6),
+            };
+            let all = ranges.iter().find(|it| (it.start..it.end).contains(&offset));
+            assert_eq!(found.of(offset), all, "{offset} in {ranges:?}");
+        }
+    }
 }

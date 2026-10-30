@@ -607,3 +607,291 @@ appended to `<serve::state()>/serve.log`, and waits up to 10 s for `serve::socke
 - the workspace's member count in `Response::Built` (cargo's `needs_spec_flag`): the CLI puts
   `-p foo` in "to rerun pass" when `-p` was given or the built tests are of more than one
   path package.
+
+> applied: lane ci is DONE. `crates/blaze-api/src/lib.rs`: `Request::Stop`, `UnitOf::test`, `Artifact::{runner, env, harness}` as written; the session answers `Stop` with `Done { ok: true }` alone (`session.rs`, test `stop_is_answered_done_at_once`). The two asked: `Response::UnitEnded(UnitOf)` (after a unit's last diagnostic) and `Response::Built { artifacts, profile, members: u32 }` (the workspace's member count); every `Response::Built { .. }` lane cargo writes now needs `members`, and the daemon sends `UnitEnded`. `SCHEMA` is 6. `blaze-ui` renders `Fetched` as cargo does and `UnitEnded` as nothing; `blaze-ci` ignores both.
+
+## 10. From cargo-std (to cargo-load): `#![forbid(unsafe_code)]` for blaze-units (docs/v2/plan/design/unsafe.md)
+
+No module of `crates/blaze-units` has `unsafe` (`rg unsafe crates/blaze-units` finds none). Put
+`#![forbid(unsafe_code)]` at the top of `crates/blaze-units/src/lib.rs`, unless `load/` brings
+an unsafe module. Until then, `stdlib.rs` forbids it for itself and `stdlib/` with a module-level
+`#![forbid(unsafe_code)]`. `crates/project-model` now forbids it crate-wide: its only `unsafe`
+was a test's `std::env::set_var`, which is unsound beside parallel tests, and the test now gives
+those variables through `extra_env`.
+
+> forwarded to cargo: `crates/blaze-units/src/lib.rs` is lane cargo's (cargo-load); lane cargo is still running.
+
+## 12. From cargo-daemon-lower (to cargo-std, and to db)
+
+`crates/load-cargo/src/v2.rs` is written against both of these; it does not compile until they
+are in.
+
+**To cargo-std, `crates/blaze-units/src/stdlib/target.rs`:** a public
+`pub fn data_layout(triple: &str) -> Result<String, String>`, the `"data-layout"` of the
+recorded target spec of `triple` (what `Target::spec` reads from `target_spec_json`; the error
+`target(triple)` gives for a triple with no data, and one naming the triple when the spec has no
+`data-layout`). Why: every crate's `CrateWorkspaceData::target` needs the target's LLVM data
+layout for layout and const eval, and blaze runs no `rustc --print target-spec-json`
+(no-rustc); `rustc.json` already has it, but `Spec` and `spec` are private. Add `data_layout`
+to `Spec` (`#[serde(rename = "data-layout")]`) and expose it.
+
+**To db, `crates/base-db/src/input.rs`:** `impl BuiltDependency { pub fn with_prelude(name:
+CrateName, crate_id: Crate, prelude: bool, sysroot: bool) -> Self }`, as `DependencyBuilder`
+has. Why: v2 makes crates with `Crate::create` (to give the standard library's crates
+`Durability::HIGH`, which `CrateGraphBuilder::set_in_db` cannot), and cargo's build-std
+passes the standard library's crates as `noprelude`, which `BuiltDependency::new` (always in
+the extern prelude) cannot say; the fields are private.
+
+**Known gap, to db:** a module a member reads by `#[path]` outside its package's directory
+(rustc reads any path) is in no source root the crate can resolve from, since v2 gives each
+package its own source root (so an edit invalidates only its package, and a build script's
+`OUT_DIR` is read by its package alone). `SourceDatabase::resolve_path` would need to find a file
+of the view by absolute path in another source root. The standard library, which does this
+(`core` reads `library/stdarch`), is one source root and is not affected.
+
+> forwarded to cargo: `stdlib/target.rs` `data_layout` is inside lane cargo (cargo-std). > forwarded to db: `BuiltDependency::with_prelude` (`crates/base-db/src/input.rs`) and the `#[path]` outside the package gap are lane db's.
+
+## 13. From cargo-daemon (to ci, core, coordinator, cargo-load and cargo-cli)
+
+`crates/blaze-cargo/src/serve/` is written against the first two; it does not compile until
+they are in.
+
+**To ci, `crates/blaze-api/src/lib.rs` and `src/session.rs`:**
+
+```rust
+pub enum Request {
+    // ... as request 11 has it:
+    Stop,
+}
+
+pub enum Response {
+    // ... every variant as it is, and:
+    /// cargo's `Updating crates.io index` / `Downloaded serde v1.0.219` as the daemon fetches
+    /// what the load asked for: once for each source a job fetches, once for each index or
+    /// git repository it updates.
+    Fetched { verb: FetchVerb, what: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FetchVerb {
+    Updating,
+    Downloaded,
+}
+```
+
+The session answers `Request::Stop` with `Done { ok: true }` and nothing else; the daemon sees
+the `Stop` arrive, writes its image and estimates, waits for the image to be mapped, then stops
+listening and exits (`serve/daemon.rs`). `Response::Fetched` is reported by a job like any other
+response (`Session::report` passes it on); the CLI prints it as cargo does.
+**Why:** `blaze stop` (request 11), and cargo's fetch lines, which in v2 only the daemon knows.
+
+**Also to ci (asked, not written against):** the session opens each job's database view with
+`Database::open` (no config), and keeps that view for `Request::Why`. The daemon's builds run in
+views it opens itself with `Database::open_with(view, BuildConfig::encode())` (the load reads its
+invocation and mounts from the config), so `Why` reads a view no build ran in. Proposed:
+`Session::finish_in(cx, job, ok, error, queries: Option<ViewId>, out)`, `queries` the database
+view the job built in, which the session then keeps for `Why` in place of its own (and closes
+when it lets it go); the daemon hands it over instead of closing it.
+
+**To core, `crates/blaze-core/src/{uring,kqueue,threads,iocp}.rs`:** on each driver
+`pub fn scratch(self, dir: PathBuf) -> Self`: where a confined spawn's scratch directory is made
+(`<dir>/<pid>-<n>`) in place of `<root>/.blaze-spawn`. **Why:** the daemon's driver root is `/`
+(every path it is asked of is absolute: sockets, checkouts, the state directory, outputs), and
+`/.blaze-spawn` is not writable; `serve.rs` passes `<state>/spawn`.
+
+**To coordinator, the `blaze` binary (`crates/blaze/src/main.rs`):**
+`#[global_allocator] static ALLOC: blaze_graph::arena::Counting<std::alloc::System> =
+blaze_graph::arena::Counting(std::alloc::System);`. **Why:** the plane admits tasks by memory
+(`arena::measure` of each task's peak feeds `Estimates::observe`; `arena::held` is the plane's
+`Held` and `Status::memory_bytes`); without the counting allocator both read 0.
+
+**Notes to cargo-load (`crates/blaze-units/src/load*`):**
+- An `IndexFile` fetch's `what` is what cargo prints after `Updating`: the registry's name
+  (`crates.io index`); the daemon reports each distinct `what` once per job.
+- The daemon never decides it is offline: `--offline`/`--frozen`/`net.offline` with a source
+  missing is the load's `Planned::Failed` with cargo's error. A `Needs` that names a source
+  already mounted for that view is refused as a loop ("asked for ... again after it was fetched
+  and mounted").
+- The view is mounted at `invocation.root` (the checkout's path for the CLI, else
+  `<state>/views/<root hex>` for an agent's view), every fetched source at its `Fetch::at`, the
+  standard library at `BuildConfig::library`; mounts are sorted by `at`.
+
+**To cargo-cli:** `blaze_cargo::serve::{socket, state, main}` are as request 11 uses them.
+`blaze serve` takes `--socket PATH` and `--http ADDR` (token in `BLAZE_API_TOKEN`). A second
+`blaze serve` on a socket something listens on fails naming it; a stale socket file is removed.
+
+**To cargo-daemon-units, `serve/unit.rs`:** `load_cargo::v2::Lower` has one more field,
+`host_cpu: Option<&HostCpu>` (from `hir_ty_codegen::host_cpu()`); without it a
+`-C target-cpu=native` in the rustflags is an error. `Lowered::ran` and `Lowered::macros` wait
+until every snapshot is dropped, including one held in a `HirFrontend`'s `Databases` closure,
+so drop those before the loop applies a run. The rest is in
+`/tmp/blaze-lanes/v2-cargo-daemon-lower.md`.
+
+**From cargo-daemon-lower (to cargo, `crates/load-cargo/src/lib.rs`), docs/v2/plan/design/unsafe.md:**
+`crates/load-cargo` cannot say `#![forbid(unsafe_code)]` crate-wide while v1's `lib.rs` has its
+two `unsafe { SyntaxContext::from_u32(ctx) }` (lines ~1024, ~1071). `v2` is `#![deny(unsafe_code)]`,
+with `forbid` on `v2/crates.rs`, `v2/files.rs` and `v2/tests.rs`, and a scoped
+`#[allow(unsafe_code)]` on `mod db` only for the `unsafe impl`s salsa's macros expand to. When v1's
+load goes at integration, forbid it in `lib.rs` (still `allow` on `v2::db` for salsa).
+
+> applied: lane ci is DONE. `Request::Stop` (request 11), `Response::Fetched { verb: FetchVerb, what: String }` and `FetchVerb` in `crates/blaze-api/src/lib.rs`; `Session::report` passes it on as any response. The asked `Session::finish_in(cx, job, ok, error, queries: Option<ViewId>, out)` is in `session.rs`: the session keeps the handed view for `Why` in place of its own (closing its own), and closes it at once when the job's view is not kept or the job is unknown; `finish` is `finish_in(.., None, ..)` (test `why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over`). The daemon calls `finish_in` and stops closing that view. > forwarded to core: `scratch(dir)` on each driver. > forwarded to coordinator: `crates/blaze/src/main.rs`'s counting `#[global_allocator]` is integration, not among the paths `requests` applies. The notes to cargo-load, cargo-cli and cargo-daemon-units are inside lane cargo.
+
+## 14. From cargo-load (to lane cargo, with request 1): the offline note, `-Z bindeps` and artifact dependencies (#601)
+
+`crates/blaze-units/src/load/` is written against these three; it does not compile until they
+are in.
+
+**`crates/blaze-resolve/src/workspace_resolve.rs`:** `Workspace` gets
+`pub offline_flag: Option<&'a str>` (`--offline`, `--frozen`, or `net.offline` as `--offline`),
+and `resolve_ws` passes it on: `ResolveSettings { offline_flag: ws.offline_flag,
+..ResolveSettings::default() }` in place of `ResolveSettings::default()` (line ~737). **Why:**
+cargo's "note: offline mode (via `--offline`) can sometimes cause surprising resolution
+failures" is in `errors.rs` already but nothing sets it; `load/resolve.rs` fills the field.
+
+**`crates/blaze-manifest/src/config/mod.rs`:**
+
+```rust
+impl Config {
+    /// cargo's `CliUnstable` of the `-Z` flags (each as given after `-Z`, `name` or
+    /// `name=value`) and of the `[unstable]` table, as cargo's `GlobalContext::configure` reads
+    /// them on a nightly. A flag blaze does not read is cargo's "unknown `-Z` flag specified: {name}".
+    pub fn cli_unstable(&mut self, flags: &[String]) -> anyhow::Result<()>;
+    /// `-Z bindeps`.
+    pub fn bindeps(&self) -> bool;
+}
+```
+
+**`crates/blaze-manifest/src/manifest.rs` and `dependency.rs`:** with `config.bindeps()`, a
+dependency's `artifact`, `lib` and `target` are read as cargo's `to_dependency` reads them
+(`Artifact::parse`: the kinds `bin`, `bin:<name>`, `cdylib`, `staticlib`; `lib` defaulting to
+false; `target` a triple or `"target"`; cargo's errors for an empty or unknown kind), into
+
+```rust
+pub struct Dependency {
+    // ... every field as it is, and:
+    pub artifact: Option<Artifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Artifact {
+    /// As written: `bin`, `bin:<name>`, `cdylib`, `staticlib`.
+    pub kinds: Vec<String>,
+    pub lib: bool,
+    /// `target = "<triple>"`, or `"target"` for the build's own.
+    pub target: Option<String>,
+}
+```
+
+and `SerializedDependency` writes it as cargo metadata does (`"artifact": {"kinds": [...],
+"lib": .., "target": ..}`, left out when `None`). Without `-Z bindeps` the error stays cargo's
+"`artifact = …` requires `-Z bindeps` ({name})". **Why:** #601 asks that a workspace with an
+artifact dependency load and resolve, and that only a unit that depends on one be refused
+(`load/units.rs` `artifact_refusal`, which reads `dep.artifact`). `load/config.rs` calls
+`config.cli_unstable(&read.unstable)` after `start`, and `load.rs` accepts `-Zbindeps`.
+
+**Done in cargo-load's own paths (no action):** `sha2 = "0.10"` (optional, in `query`) for
+cargo-load-source's `tree.rs` (request 10); `#![forbid(unsafe_code)]` in
+`crates/blaze-units/src/lib.rs` and `crates/blaze-tree/src/lib.rs` (cargo-std's request 10).
+`StdKey.{host, rustflags, profile_root}` are as cargo-std's request 6 has them.
+
+## From cargo-daemon-units (`crates/blaze-cargo/src/serve/unit.rs`, `serve/unit/`)
+
+`serve/unit*` calls each item below by this signature already; each waits on the lane named.
+The full list, with why, is in `/tmp/blaze-lanes/v2-cargo-daemon-units.md`.
+
+**To cargo-daemon-lower (inside lane cargo, `crates/load-cargo/src/v2.rs`):**
+`Lowered::identity(&self, unit: usize) -> Option<ContentId>`: the identity of everything the
+unit's crate is made from, deeply (its files' contents, cfgs, env, edition, its dependencies'
+identities and the results of the build script runs it was given). The unit's record in the
+store is keyed by it; `None` means "keep nothing".
+
+**To cargo-load (inside lane cargo, `crates/blaze-units/src/query.rs` and the load):**
+- `UnitPlan::unsandboxed: bool`: the package is named in the workspace's
+  `unsandboxed-build-scripts` (or a member's `build-script = false`), as docs/cargo.md says.
+- `UnitPlan::runner: Vec<String>`: `target.<triple>.runner` / `CARGO_TARGET_<TRIPLE>_RUNNER`
+  of the unit's platform, program then arguments; empty for none (`Artifact::runner`).
+- `UnitPlan::harness: bool`: the target's `harness` (`Artifact::harness`).
+- `PackagePlan::default_run: Option<String>`: the manifest's `package.default-run`.
+- `Units::link_dirs: Vec<String>`: the workspace's `build-script-link-dirs`.
+
+**To cargo-std (inside lane cargo):** `blaze_units::stdlib::library(launcher: &Path) ->
+Result<Library { at: String, files: Vec<LibraryFile { path, bytes, executable: bool }> }, String>`.
+
+**To cargo-daemon (inside lane cargo, `serve.rs`, `serve/work.rs`, `crates/blaze-cargo/Cargo.toml`):**
+- Dependencies of blaze-cargo: `blaze-diagnostics`, `blaze-items`, `hir`, `hir-def`, `hir-ty`
+  (`workspace = true`).
+- The test queue's root is `Paths::state` (`tests/<tags hex>` under it); say if it is not.
+- A loop hook after a proc-macro unit's compile, to apply its expanders with
+  `Lowered::macros(unit, result)` (it waits for every snapshot to drop, so not on a worker):
+  e.g. `Front::built(&self, unit: usize, compiled: &Compiled) -> Result<(), ApiError>`.
+
+**To lane codegen (`crates/hir-ty-codegen/v2*`, `crates/blaze-codegen`):**
+- `hir_ty_codegen::v2::toolchain(target: &str, rustflags: &[String]) -> Result<Toolchain, String>`.
+- `hir_ty_codegen::v2::ItemHashes::new(Box<dyn Fn(base_db::FileId) -> Option<String> + Send + Sync>)`
+  implementing the driver's `Hashes` (with lane items).
+- `RootKind { Executable, Test, Library, Shared, ProcMacro }` and
+  `HirFrontend::roots(&self, krate: base_db::Crate, RootKind) -> Result<Roots { roots: Vec<HirInstance>,
+  tests: Vec<RootTest { name, root: usize, ignore: bool, should_panic: Option<Option<String>>,
+  bench: bool, outside: bool }> }, CodegenError>`; a test binary's roots include libtest's
+  start with the fork server.
+- `HirFrontend::linked(&self, krate) -> Result<Vec<NativeLib>, CodegenError>`: the crate's
+  `#[link]`s, in order.
+- `HirFrontend::link_inputs(&self, &Built) -> Result<LinkInputs { spans: Vec<(ContentId, Vec<u8>)>,
+  debug_names: Vec<(InstanceKey, String)> }, CodegenError>`.
+- `Built::reached(&self, root: &InstanceKey) -> Vec<CodeHash>`: the code a root reaches, for
+  test selection.
+- `blaze_codegen::{NativeLib { name, kind: NativeLibKind, verbatim: bool },
+  NativeLibKind { Dylib, Static { whole, bundle }, Framework }}`, `PartialEq + Debug`.
+- A proc-macro crate built for `wasm32-wasip1` with blaze-macro-wasm's `GUEST` (docs: proc macros
+  run as wasm); until then a proc-macro unit is linked as a native shared library and not loaded.
+
+**To lane link (`crates/blaze-link`):**
+- `blaze_link::target::output(triple: &str, shared: Option<(String, Vec<String>)>, debug: Debug,
+  incremental: bool) -> Result<Output, LinkError>`.
+- `blaze_link::target::natives(&Output, &[NativeLib], &[PathBuf]) -> Result<Vec<OwnedNative { id,
+  name, bytes, kind }>, LinkError>`: C runtime objects first, the libraries in order, the
+  system's last.
+- `Image::bytes(&mut self, Staged) -> Result<Vec<u8>, LinkError>`.
+
+**To lane usercode (`crates/blaze-usercode`):** a way for `test::Queue` to run a binary outside
+the sandbox, for `BLAZE_SANDBOX=off` and `unsandboxed-tests`; until then either is an error naming it.
+
+**To lane no-rustc / cargo-cli:** the launcher started as `rustc` or `rustdoc` (the stand-ins a
+build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as blaze v2, not v1's
+`as_rustc`.
+
+## From speed-runtime-plane: `crates/blaze-cargo/src/serve/plane.rs`, one output buffer (2026-10-29)
+
+- What: `blaze_graph::Plane` gained `step_into(&mut self, PlaneInput, &mut Vec<PlaneOutput>) ->
+  Result<(), Error>` (appends; nothing on an error) beside `step`. In `serve::plane::Plane`, keep a
+  `said: Vec<PlaneOutput>` field and write `fn step` as
+  `let mut said = std::mem::take(&mut self.said); let taken = self.graph.step_into(input, &mut said);
+  if taken.is_ok() { self.outputs(said.drain(..)) } self.said = said; taken`, with `outputs`
+  taking `impl Iterator<Item = PlaneOutput>` (its body is unchanged).
+- Why: the daemon steps the plane once per task; this takes the one allocation per step the
+  plane still made, with the same outputs.
+
+## From safety (lane safety, 2026-10-29): `blaze test --ub`, and `-Zsanitizer` once codegen has it
+
+1. **`blaze test --ub [--ub-seed N] [--ub-schedules K]`** (`crates/blaze-cargo/src/cli/args.rs`,
+   `cli/test.rs`, and the daemon's test path): opt-in; without the flag nothing changes. With it,
+   each selected test function (the same selection `blaze test` makes: filters, `--exact`,
+   `#[ignore]`) runs in blaze's MIR evaluator under `hir_ty_ub::run_test(db, test_fn,
+   &hir_ty_ub::Config { seed, schedules, ..Default::default() })` instead of a compiled
+   binary, one plane task per test, with the daemon's `HirDatabase`. `hir_ty_ub::Outcome`
+   maps to a test result: `Passed` passes; `Failed { message }` fails as a panicking test does
+   (honoring `#[should_panic]`); `Ub { report, seed, .. }` fails with `report` as its output
+   and the seed to replay; `Unsupported { what }` fails, naming what the evaluator can't run
+   (no-fallback: never a pass, never a compiled run in its place). Nothing is compiled or
+   linked for these tests, and no rustc runs. If the CLI reaches the daemon through
+   `blaze-api`'s test request, that request gains the three fields (an interface change: ask the
+   coordinator in your request file). `hir-ty-ub` as a dependency of `blaze-cargo`: the workspace
+   entry is requested in `v2/requests/safety.md` item 2.
+   Why: docs/v2/plan/design/unsafe.md "Our own Miri": every unsafe module's tests run under it.
+   A superset feature: opt-in, and Rust's behavior is unchanged (superset-of-rust).
+2. **`-Zsanitizer` and `-Zsanitizer-coverage`** (`crates/blaze-cargo/src/unstable.rs:237-243`):
+   when codegen's `v2/requests/codegen.md` "From safety" S2 lands (the LLVM back end
+   instruments and links the runtimes), change `sanitizer`, `sanitizer-recover`,
+   `sanitizer-memory-track-origins` and the coverage flags from `Refused(INSTRUMENTS)` to
+   passed to codegen, and keep refusing what codegen still doesn't do (CFI, KCFI, dataflow) with
+   that reason. Until then they stay refused.

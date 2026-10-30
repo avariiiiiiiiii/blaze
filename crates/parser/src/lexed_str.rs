@@ -8,6 +8,7 @@
 //! Note that these tokens, unlike the tokens we feed into the parser, do
 //! include info about comments and whitespace.
 
+#[allow(unsafe_code)]
 mod scan;
 
 use std::{borrow::Cow, ops};

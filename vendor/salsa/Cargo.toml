@@ -133,10 +133,6 @@ name = "backtrace"
 path = "tests/backtrace.rs"
 
 [[test]]
-name = "cancellation-event-panic"
-path = "tests/cancellation-event-panic.rs"
-
-[[test]]
 name = "cancellation_token"
 path = "tests/cancellation_token.rs"
 
@@ -423,6 +419,10 @@ path = "tests/supertype_overlap.rs"
 [[test]]
 name = "synthetic_write"
 path = "tests/synthetic_write.rs"
+
+[[test]]
+name = "task_sync"
+path = "tests/task_sync.rs"
 
 [[test]]
 name = "tracked-struct-entries"

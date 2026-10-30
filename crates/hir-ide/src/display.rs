@@ -34,7 +34,6 @@ use hir_def::{
 use hir_expand::{mod_path::PathKind, name::Name};
 use intern::{Internable, Interned, sym};
 use itertools::Itertools;
-use la_arena::ArenaMap;
 use rustc_abi::ExternAbi;
 use rustc_apfloat::{
     Float,
@@ -51,7 +50,7 @@ use span::Edition;
 use stdx::never;
 
 use crate::{
-    FieldType, GenericPredicates, ImplTraitId, MemoryMap, ParamEnvAndCrate, consteval,
+    FieldTypes, GenericPredicates, ImplTraitId, MemoryMap, ParamEnvAndCrate, consteval,
     db::{GeneralConstId, HirDatabase},
     generics::{ProvenanceSplit, generics},
     layout::Layout,
@@ -1228,7 +1227,7 @@ fn render_const_scalar_from_valtree_inner<'db>(
 fn render_variant_after_name<'db>(
     data: &VariantFields,
     f: &mut HirFormatter<'_, 'db>,
-    field_types: &'db ArenaMap<LocalFieldId, FieldType>,
+    field_types: &'db FieldTypes,
     param_env: ParamEnv<'db>,
     layout: &Layout,
     args: GenericArgs<'db>,

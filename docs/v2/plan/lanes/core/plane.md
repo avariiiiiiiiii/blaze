@@ -42,14 +42,14 @@ with.
 | effect | Linux (`uring.rs`) | macOS (`kqueue.rs`) | Windows (`iocp.rs`) | `Sim` |
 | --- | --- | --- | --- | --- |
 | read, read at, append, sync, truncate | the ring | file threads, `F_FULLFSYNC` | the port | in memory, a log of unsynced changes |
-| write at an offset | the ring, on a descriptor without `O_APPEND` | file threads | file threads | in the log |
-| whole-file write (temporary, sync, rename) | the ring + `renameat` | file threads | file threads | all or nothing over a crash |
+| write at an offset | the ring, on a descriptor without `O_APPEND` | file threads | the port | in the log |
+| whole-file write (temporary, sync, rename) | the ring + `renameat` | file threads | file threads, `MoveFileExW` written through | all or nothing over a crash |
 | rename, mode, stat, list, remove, link | where submitted, or a thread for a list | file threads | file threads | in memory |
 | clone | `FICLONE` | `clonefile` | ReFS block cloning | shares the bytes |
-| map | `mmap` | `mmap` | file threads | the bytes |
-| timer | the ring | `EVFILT_TIMER` | the port | the virtual clock |
+| map | `mmap` | `mmap` | `MapViewOfFile` | the bytes |
+| timer | the ring | `EVFILT_TIMER` | the port's wait, to the next due | the virtual clock |
 | watch | fanotify, inotify when fanotify is refused for privilege (`EPERM`) | FSEvents | `ReadDirectoryChangesW` | changes the test makes |
-| spawn, kill | `pidfd`, the ring polls it and the pipes | `EVFILT_PROC`, `EVFILT_READ`/`WRITE` | job objects on the port | a program the test gives |
+| spawn, kill | `pidfd`, the ring polls it and the pipes | `EVFILT_PROC`, `EVFILT_READ`/`WRITE` | a job object each; its end from a thread-pool wait on the process, posted to the port | a program the test gives |
 | listen, connect, recv, send, hang up | the ring | `EVFILT_READ`/`WRITE` | Winsock on the port | pairs of ends in memory |
 
 A clone where the file system cannot clone is an error that names it: no copy. A file system
@@ -68,8 +68,10 @@ given no `Confine` fails every sandboxed spawn naming it.
 the kernel holds: on Linux a cgroup v2 of its own (`memory.max`, swap 0, the child joins it
 before `exec`; its `memory.peak` is the `Exit`'s peak; Linux 5.19 or newer, else an error
 before it runs); on macOS `RLIMIT_DATA` and `RLIMIT_AS` where macOS holds them, and always a
-watch of its physical footprint that kills it past the limit; on Windows a job object's memory
-limit. The watch stops before the process is reaped, so no kill reaches a reused pid.
+watch of its physical footprint that kills it past the limit; on Windows its job object's
+memory limit, which refuses any commit past it (so its peak is at most the limit; the job's
+port messages, which Windows does not promise, only say it went over). The watch stops before
+the process is reaped, so no kill reaches a reused pid.
 
 **The simulation's files** keep a log of changes since their last covering sync (appends,
 writes at an offset, truncations): a crash keeps a random prefix of it, the last change maybe

@@ -22,7 +22,7 @@ use hir::{
 use hir_def::{ItemContainerId, Lookup as _, attrs::AttrFlags, signatures::FunctionSignature};
 use intern::{Symbol, sym};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
+    AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
     ast::{self, HasAttrs as _},
 };
 
@@ -41,7 +41,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
     let found = match d.lint {
         UnsafeLint::HardError => Found::new(requires_unsafe(cx, &op, &node, span, ptr), Phase::Mir),
         UnsafeLint::UnsafeOpInUnsafeFn => {
-            let mut diag = op.diag(cx, Diag::lint, "unsafe_op_in_unsafe_fn", "block", true, span);
+            let mut diag = op.diag(cx, Some("unsafe_op_in_unsafe_fn"), "block", span);
             unsafe_fn_note(cx, &mut diag, &node);
             op.facts(cx, &mut diag);
             code_fact(cx, &mut diag, ptr);
@@ -87,20 +87,12 @@ impl Op {
         }
     }
 
-    /// The diagnostic of the operation, made by `make` (an error or a lint named `name`), that
-    /// it "requires unsafe {needs}", the callee named by its whole path when `untrimmed`.
-    fn diag(
-        &self,
-        cx: &Cx<'_, '_>,
-        make: fn(&str, String, Span) -> Diag,
-        name: &str,
-        needs: &str,
-        untrimmed: bool,
-        span: Span,
-    ) -> Diag {
-        let path = |function: hir::Function| match untrimmed {
-            true => untrimmed_path(cx, function),
-            false => cx.def_path(ModuleDef::Function(function)),
+    /// The diagnostic that the operation "requires unsafe {needs}": the error E0133, or the
+    /// lint `lint`, which names a callee by its untrimmed path as rustc's lints do.
+    fn diag(&self, cx: &Cx<'_, '_>, lint: Option<&str>, needs: &str, span: Span) -> Diag {
+        let path = |function: hir::Function| match lint {
+            Some(_) => untrimmed_path(cx, function),
+            None => cx.def_path(ModuleDef::Function(function)),
         };
         let (what, label) = match self {
             Op::Call(Some(function)) => (format!("call to unsafe function `{}`", path(*function)), "call to unsafe function"),
@@ -115,7 +107,11 @@ impl Op {
             Op::RawPtrDeref => ("dereference of raw pointer".to_owned(), "dereference of raw pointer"),
             Op::UnionField(_) => ("access to union field".to_owned(), "access to union field"),
         };
-        let mut diag = make(name, format!("{what} is unsafe and requires unsafe {needs}"), span.clone());
+        let message = format!("{what} is unsafe and requires unsafe {needs}");
+        let mut diag = match lint {
+            Some(lint) => Diag::lint(lint, message, span.clone()),
+            None => Diag::error(Some("E0133"), message, span.clone()),
+        };
         diag.span_label(span, label);
         match self {
             Op::CallWithFeatures { missing, build_enabled, .. } => {
@@ -198,8 +194,7 @@ fn requires_unsafe(cx: &Cx<'_, '_>, op: &Op, node: &InFile<SyntaxNode>, span: Sp
         true => "function or block",
         false => "block",
     };
-    let error = |_: &str, message: String, span: Span| Diag::error(Some("E0133"), message, span);
-    let mut diag = op.diag(cx, error, "", needs, false, span);
+    let mut diag = op.diag(cx, None, needs, span);
     if let Some(head) = not_inherited(cx, node) {
         diag.span_label(head, "items do not inherit unsafety from separate enclosing items");
     }
@@ -220,28 +215,25 @@ fn op_in_unsafe_fn_allowed(cx: &Cx<'_, '_>) -> bool {
 /// item: rustc's `UnsafeNotInheritedNote`. Closures and inline consts are checked with their
 /// body, so one in a block is never in error.
 fn not_inherited(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Span> {
-    ancestors(cx, node).into_iter().skip(1).find_map(|it| {
-        let unsafe_ = match_ast_unsafe(&it.value)?;
-        let range = item_range(&it.value);
-        Some(cx.span(it.with_value(head_range(&it.value, range, unsafe_))))
-    })
+    let around = ancestors(cx, node).into_iter().skip(1).find(|it| is_unsafe(&it.value))?;
+    Some(cx.span(around.with_value(head_range(&around.value))))
 }
 
-/// Whether `node` is an `unsafe` block or an `unsafe fn`, and so where its head starts.
-fn match_ast_unsafe(node: &SyntaxNode) -> Option<()> {
-    if let Some(block) = ast::BlockExpr::cast(node.clone()) {
-        return block.unsafe_token().map(drop);
+/// Whether `node` is an `unsafe` block or an `unsafe fn`.
+fn is_unsafe(node: &SyntaxNode) -> bool {
+    match ast::BlockExpr::cast(node.clone()) {
+        Some(block) => block.unsafe_token().is_some(),
+        None => ast::Fn::cast(node.clone()).is_some_and(|it| it.unsafe_token().is_some()),
     }
-    ast::Fn::cast(node.clone())?.unsafe_token().map(drop)
 }
 
-/// rustc's `guess_head_span` of `range` of `node`: up to its first `{`, without the white
-/// space before it, when that is on one line and not empty.
-fn head_range(node: &SyntaxNode, range: TextRange, _: ()) -> TextRange {
-    let text = node.text();
+/// rustc's `guess_head_span` of `node` (from after its attributes): up to its first `{`,
+/// without the white space before it, when that is on one line and not empty.
+fn head_range(node: &SyntaxNode) -> TextRange {
+    let range = item_range(node);
+    let text = node.to_string();
     let base = node.text_range().start();
-    let local = TextRange::new(range.start() - base, range.end() - base);
-    let written = text.slice(local).to_string();
+    let written = &text[usize::from(range.start() - base)..usize::from(range.end() - base)];
     let head = written.split('{').next().unwrap_or("").trim_end();
     match !head.is_empty() && !head.contains('\n') {
         true => TextRange::at(range.start(), TextSize::of(head)),
@@ -253,9 +245,8 @@ fn head_range(node: &SyntaxNode, range: TextRange, _: ()) -> TextRange {
 /// in each closure and inline const it, from what it was where that starts): the function's
 /// signature, and the tool-only suggestion to wrap its body in an `unsafe` block.
 fn unsafe_fn_note(cx: &Cx<'_, '_>, diag: &mut Diag, node: &InFile<SyntaxNode>) {
-    let Some(function) = ancestors(cx, node).into_iter().find_map(|it| it.map(ast::Fn::cast).transpose()) else {
-        return;
-    };
+    let function = ancestors(cx, node).into_iter().find_map(|it| ast::Fn::cast(it.value.clone()).map(|f| it.with_value(f)));
+    let Some(function) = function else { return };
     if function.value.unsafe_token().is_none() || !first_in_function(cx, node, &function) {
         return;
     }
@@ -278,8 +269,8 @@ fn unsafe_fn_note(cx: &Cx<'_, '_>, diag: &mut Diag, node: &InFile<SyntaxNode>) {
 /// what is linted in one leaves the flag of what it is in set.
 fn first_in_function(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, function: &InFile<ast::Fn>) -> bool {
     let Some(def) = cx.sema.to_def2(function.as_ref()) else { return true };
-    let Some(scopes) = scopes(cx, node) else { return true };
-    let position = position(cx, node);
+    let Some(chain) = scopes(cx, node) else { return true };
+    let at = position(cx, node);
     let own = key(node);
     let ops = cx.sema.get_unsafe_ops(hir::DefWithBody::Function(def).into());
     !ops.iter().any(|other| {
@@ -287,8 +278,8 @@ fn first_in_function(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, function: &InFi
         if key(&other) == own {
             return false;
         }
-        let Some(other_scopes) = scopes(cx, &other) else { return false };
-        other_scopes.first().is_some_and(|scope| scopes.contains(scope)) && self::position(cx, &other) < position
+        let Some(other_chain) = scopes(cx, &other) else { return false };
+        other_chain.first().is_some_and(|scope| chain.contains(scope)) && position(cx, &other) < at
     })
 }
 
@@ -399,8 +390,7 @@ fn audit_that(cx: &Cx<'_, '_>, function: hir::Function) -> Option<String> {
 /// an `extern` block, one safe only before 2024), of one with `#[target_feature]`, or through
 /// a pointer.
 fn call(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, at: InFile<SyntaxNodePtr>) -> Op {
-    let function = match_callee(cx, &node.value);
-    let Some(function) = function else { return Op::Call(None) };
+    let Some(function) = callee(cx, &node.value) else { return Op::Call(None) };
     let Ok(id) = hir_def::FunctionId::try_from(function) else { return Op::Call(Some(function)) };
     let signature = FunctionSignature::of(cx.db, id);
     let extern_ = matches!(id.lookup(cx.db).container, ItemContainerId::ExternBlockId(_));
@@ -427,7 +417,7 @@ fn call(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, at: InFile<SyntaxNodePtr>) -
 
 /// The function a call or a method call calls, by the type of its callee: `None` through a
 /// pointer.
-fn match_callee(cx: &Cx<'_, '_>, node: &SyntaxNode) -> Option<hir::Function> {
+fn callee(cx: &Cx<'_, '_>, node: &SyntaxNode) -> Option<hir::Function> {
     if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
         return cx.sema.resolve_method_call(&call);
     }
@@ -481,26 +471,23 @@ fn lint_at(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> InFile<SyntaxNodePtr> 
 /// type's path, then the rest as rustc prints it.
 fn untrimmed_path(cx: &Cx<'_, '_>, function: hir::Function) -> String {
     let trimmed = cx.def_path(ModuleDef::Function(function));
-    match function.as_assoc_item(cx.db).map(|it| it.container(cx.db)) {
-        None => full_path(cx, ItemInNs::Values(ModuleDef::Function(function))).unwrap_or(trimmed),
-        Some(AssocItemContainer::Trait(trait_)) => {
-            let trimmed_trait = cx.def_path(ModuleDef::Trait(trait_));
-            match (full_path(cx, ItemInNs::Types(ModuleDef::Trait(trait_))), trimmed.strip_prefix(&trimmed_trait)) {
-                (Some(full), Some(rest)) => format!("{full}{rest}"),
-                _ => trimmed,
-            }
-        }
+    let container = match function.as_assoc_item(cx.db).map(|it| it.container(cx.db)) {
+        None => return full_path(cx, ItemInNs::Values(ModuleDef::Function(function))).unwrap_or(trimmed),
+        Some(AssocItemContainer::Trait(trait_)) => ModuleDef::Trait(trait_),
         Some(AssocItemContainer::Impl(impl_)) => {
-            let Some(adt) = impl_.trait_(cx.db).is_none().then(|| impl_.self_ty(cx.db).as_adt()).flatten() else {
-                return trimmed;
-            };
-            let trimmed_adt = cx.def_path(ModuleDef::Adt(adt));
-            match (full_path(cx, ItemInNs::Types(ModuleDef::Adt(adt))), trimmed.strip_prefix(&trimmed_adt)) {
-                (Some(full), Some(rest)) => format!("{full}{rest}"),
-                _ => trimmed,
+            match impl_.trait_(cx.db).is_none().then(|| impl_.self_ty(cx.db).as_adt()).flatten() {
+                Some(adt) => ModuleDef::Adt(adt),
+                None => return trimmed,
             }
         }
+    };
+    let trimmed_container = cx.def_path(container);
+    if let Some(full) = full_path(cx, ItemInNs::Types(container))
+        && let Some(rest) = trimmed.strip_prefix(trimmed_container.as_str())
+    {
+        return format!("{full}{rest}");
     }
+    trimmed
 }
 
 /// The path of an item from the crate's root, as rustc's untrimmed paths name it, else where
@@ -516,11 +503,10 @@ fn full_path(cx: &Cx<'_, '_>, item: ItemInNs) -> Option<String> {
     if let Some(path) = root.find_path(cx.db, item, config) {
         return Some(path.display(cx.db, cx.edition).to_string());
     }
-    let def = match item {
-        ItemInNs::Types(it) | ItemInNs::Values(it) => it,
-        ItemInNs::Macros(_) => return None,
-    };
-    def.canonical_path(cx.db, cx.edition)
+    match item {
+        ItemInNs::Types(def) | ItemInNs::Values(def) => def.canonical_path(cx.db, cx.edition),
+        ItemInNs::Macros(_) => None,
+    }
 }
 
 /// rustc's `DiagArgValue::StrListSepByAnd` in English: `a`, `a and b`, `a, b, and c`.

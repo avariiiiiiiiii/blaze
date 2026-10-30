@@ -110,8 +110,8 @@ fn infer_defs<'db>(
                 closure_kind: ClosureKind::Coroutine { .. },
                 body: closure_body,
                 ..
-            } = body[root_expr]
-            && let Expr::Block { tail: Some(tail), .. } = body[closure_body]
+            } = body.expr(root_expr)
+            && let Expr::Block { tail: Some(tail), .. } = body.expr(closure_body)
         {
             // async fns etc. lower to coroutines without source as the root expr.
             root_expr = tail;
@@ -227,7 +227,7 @@ fn check_impl(
 
             for (pat, ty) in inference_result.type_of_pat.iter() {
                 let mut ty = ty.as_ref();
-                if let Pat::Bind { id, .. } = store[pat] {
+                if let Pat::Bind { id, .. } = store.pat(pat) {
                     ty = inference_result.type_of_binding[id].as_ref();
                 }
                 let node = match pat_node(source_map, pat, &db) {
@@ -430,7 +430,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
             }
 
             for (pat, mut ty) in inference_result.type_of_pat.iter() {
-                if let Pat::Bind { id, .. } = store[pat] {
+                if let Pat::Bind { id, .. } = store.pat(pat) {
                     ty = &inference_result.type_of_binding[id];
                 }
                 let node = match source_map.pat_syntax(pat) {

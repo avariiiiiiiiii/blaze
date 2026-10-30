@@ -1,6 +1,6 @@
 # Requests from lane usercode-macros
 
-Proc-macro expansions as traced runs of user code (docs/v2/plan/lanes/usercode.md section 6.5, #1297,
+Proc-macro expansions as traced runs of user code (docs/v2/plan/lanes/usercode.md, #1297,
 #805). The code in `crates/blaze-expand/`, `crates/blaze-macro-wasm/`, `crates/proc-macro-api/`
 and `crates/proc-macro-srv/` is written against exactly the items below. None of it has been
 built: the lane may not build.
@@ -91,7 +91,32 @@ manifest lint reports them missing until then), and register `native::describe_w
 `BLAZE_NATIVE_MACROS` is unset (its default, `on`), naming the macro; that is the intended
 no-fallback behavior, not something to paper over.
 
-## 6. Workspace
+> applied in part: see `v2/requests/usercode-macros-native.md` (`native-proc-macro` is in; the five vendored entries and the vendoring are the coordinator's; the hook is codegen's and cargo's). Since `crates/blaze-expand/Cargo.toml` already names all six, the workspace does not load until the vendoring lands.
+
+## 6. Speed: what the expansion path still waits on outside my paths
+
+Under "everything is ours, for the best performance possible" (docs/v2/plan/goals/principles.md).
+The target is an expansion found in the store, which is cheaper than rustc's in-process bridge
+run of the same macro. That cost is one BLAKE3 of the call, one lookup, a stat of each traced
+file, and a decode of the expansion in place.
+
+- **store** (`crates/blaze-cas`): a lock-free read view. `Expansions::store` is
+  `Arc<RwLock<Store>>`, so every expansion's lookup takes a shared lock, and every `keep` stalls
+  all of them. Give readers an epoch or `ArcSwap` snapshot (`fn view(&self) -> View<'_>` with
+  `get`) and batch writers. I'll switch `Expansions` to it the day it exists.
+- **usercode** (`crates/blaze-usercode/src/inputs.rs`): a shared, lock-free stat-keyed hash
+  cache in `Disk`, or file hashes taken from the VFS, which has already hashed every source
+  file. The expansion path now keeps one `Disk` per thread, so there is no lock, but each
+  thread hashes a file once.
+- **usercode-sandbox**: send the live trace record over the warm server's socket, or through a
+  shared-memory ring, instead of a file that the client reads after every expansion. That
+  saves a `read` syscall per expansion and the wait for the record to be flushed.
+- **vendor/proc-macro-srv**: run expansions on a pool of threads that it reuses, instead of a
+  scoped thread per expansion. The scope markers are per-thread, so this keeps them correct.
+
+> forwarded to concurrency (the store's lock-free read view: lane concurrency is writing `blaze_cas::Reader`), to usercode (`blaze-usercode`'s `Disk`, the sandbox trace record) and to coordinator (`vendor/proc-macro-srv` has no owner, as usercode-macros 3).
+
+## 7. Workspace
 
 The crates' own manifests now name `blaze-core`, `blaze-ids`, `blaze-usercode`, `blaze-cas`,
 `blaze-expand` and `blake3` with `workspace = true`; all are in the root `[workspace.dependencies]`

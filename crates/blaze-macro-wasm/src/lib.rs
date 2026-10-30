@@ -1458,8 +1458,11 @@ impl Inputs for Now<'_> {
     }
 }
 
-/// The machine's files, hashed once per change of what `stat` says of them.
-static DISK: Mutex<Option<Disk>> = Mutex::new(None);
+thread_local! {
+    /// The machine's files, hashed once per change of what `stat` says of them: one per
+    /// expanding thread, so no check of an expansion's inputs waits on another's.
+    static DISK: std::cell::RefCell<Disk> = std::cell::RefCell::new(Disk::new(Vec::new()));
+}
 
 /// Expands the macro at `index` of the module whose expansions are kept under `code` in a
 /// fresh instance: what is kept of it when the store has it, else by running it in what
@@ -1523,12 +1526,30 @@ fn expand<'a>(
     let found = match keeping {
         Some(keeping) => {
             let store = keeping.expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            let mut disk = DISK.lock().unwrap_or_else(|it| it.into_inner());
-            let disk = disk.get_or_insert_with(|| Disk::new(Vec::new()));
-            let mut now = Now { root: root.as_deref(), disk, env: &env, shapes: &shapes, db };
-            match index::find(&store, &run, &mut now) {
-                Ok(Found::Hit { value, .. }) => Some(value.to_vec()),
-                Ok(Found::Miss { .. }) => None,
+            // Taken out while in use: a question asked of the database can expand another
+            // macro on this thread, which then gets a fresh one.
+            let mut disk = DISK.replace(Disk::new(Vec::new()));
+            let mut now =
+                Now { root: root.as_deref(), disk: &mut disk, env: &env, shapes: &shapes, db };
+            let found = match index::find(&store, &run, &mut now) {
+                // Read in place, under the lock: a hit copies nothing out of the store.
+                Ok(Found::Hit { value, .. }) if keeping.mode == Mode::Keep => {
+                    Ok(Err(shapes.read(value)))
+                }
+                Ok(Found::Hit { value, .. }) => Ok(Ok(Some(value.to_vec()))),
+                Ok(Found::Miss { .. }) => Ok(Ok(None)),
+                Err(error) => Err(error),
+            };
+            DISK.set(disk);
+            match found {
+                Ok(Ok(found)) => found,
+                Ok(Err(kept)) => {
+                    let output = kept
+                        .map(&restore)
+                        .ok_or_else(|| failed("the store's expansion of it is not one".to_owned()));
+                    FOUND.add(start.elapsed());
+                    return Ran { output, found: true, retained: false, took: start.elapsed() };
+                }
                 Err(error) => {
                     let why = match error {
                         FindError::Corrupt(corrupt) => corrupt.to_string(),
@@ -1544,16 +1565,6 @@ fn expand<'a>(
         }
         None => None,
     };
-    if let (Some(kept), Some(keeping)) = (&found, keeping)
-        && keeping.mode == Mode::Keep
-    {
-        let output = shapes
-            .read(kept)
-            .map(&restore)
-            .ok_or_else(|| failed("the store's expansion of it is not one".to_owned()));
-        FOUND.add(start.elapsed());
-        return Ran { output, found: true, retained: false, took: start.elapsed() };
-    }
     let ran = wasm().map_err(ProcMacroExpansionError::System).and_then(|wasm| {
         let mut state = State::empty();
         state.anchors = shapes.anchors.clone();

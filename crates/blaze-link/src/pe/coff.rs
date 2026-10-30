@@ -2,20 +2,29 @@
 //! (the first and second linker members), and import libraries, whose short import members
 //! (`IMPORT_OBJECT_HEADER`) and long ones (an object with `.idata$` sections) are read as one
 //! `Shared` per DLL with no `__imp_` names: `__imp_X` is `Special::Got("X")`.
+//!
+//! Cost: one pass over an object's section headers and one over its symbol table, with section
+//! names and `.drectve` words borrowed from the input; a symbol's object index is a `u32` column
+//! by COFF index. What is copied is what the contract owns: each symbol's and section's name,
+//! each section's bytes (`Data::Bytes`), each import's `"<hint> <name>"`. A short import member
+//! is read in place, never copied for alignment.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::fmt;
+use std::sync::Mutex;
 
 use object::LittleEndian as LE;
 use object::pe;
+use object::read::SymbolIndex;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 use object::read::coff::{CoffHeader, ImageSymbol, SectionTable, SymbolTable};
-use object::read::SymbolIndex;
+use rustc_hash::FxHashMap;
 
 use super::{OBJ_PDATA, Pe};
 use crate::NativeKind;
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Group, Member, NativeFile, NativeFixup,
-    Object, Section, SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind, Writer,
+    Apply, Archive, Binding, Class, Data, Directive, Group, Member, NativeFile, NativeFixup, Object, Section,
+    SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind, Writer,
 };
 
 /// The size of an archive member's header.
@@ -25,16 +34,74 @@ const BIGOBJ: [u8; 16] = [
     0xC7, 0xA1, 0xBA, 0xD1, 0xEE, 0xBA, 0xA9, 0x4B, 0xAF, 0x20, 0xFA, 0xF6, 0x6A, 0xA4, 0xDC, 0xB8,
 ];
 
-pub(super) fn read(
-    pe: &Pe,
-    name: &str,
-    bytes: &[u8],
-    kind: &NativeKind,
-) -> Result<NativeFile, String> {
+/// No object symbol: a COFF index that is an aux record or a symbol no relocation can name.
+const NONE: u32 = u32::MAX;
+
+/// The DLL of each `__IMPORT_DESCRIPTOR_<lib>`, by that name.
+pub(crate) type Descriptors = FxHashMap<String, String>;
+
+/// What errors call an input: a file, or a member of an archive (`lib(member)`). Formatted only
+/// when an error is.
+#[derive(Clone, Copy)]
+pub(super) struct Input<'a> {
+    file: &'a str,
+    member: Option<&'a str>,
+}
+
+impl fmt::Display for Input<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.member {
+            Some(member) => write!(f, "{}({member})", self.file),
+            None => f.write_str(self.file),
+        }
+    }
+}
+
+/// Where a long import member finds the DLL its `__IMPORT_DESCRIPTOR_` names: the descriptors
+/// of every archive read so far (a member the core reads on its own), or those of the import
+/// library being read.
+#[derive(Clone, Copy)]
+enum Dlls<'a> {
+    Read(&'a Mutex<Descriptors>),
+    Library(&'a Descriptors),
+}
+
+impl<'a> Dlls<'a> {
+    fn get(self, descriptor: &str) -> Option<Cow<'a, str>> {
+        match self {
+            Dlls::Read(map) => {
+                map.lock().unwrap_or_else(|e| e.into_inner()).get(descriptor).cloned().map(Cow::Owned)
+            }
+            Dlls::Library(map) => map.get(descriptor).map(|it| Cow::Borrowed(it.as_str())),
+        }
+    }
+}
+
+/// A relocatable input as read: an object, or one import of a DLL.
+enum Parsed<'a> {
+    Object(Object),
+    Import(Cow<'a, str>, SharedSymbol),
+}
+
+fn shared(dll: String, symbol: SharedSymbol) -> Shared {
+    Shared { name: dll, symbols: vec![symbol], more: Vec::new(), inputs: Vec::new() }
+}
+
+pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
+    let input = Input { file: name, member: None };
     match kind {
-        NativeKind::Object => member(pe, name, bytes),
-        NativeKind::Archive { whole } => archive(pe, name, bytes, *whole).map(NativeFile::Archive),
-        NativeKind::Shared { .. } => import_library(pe, name, bytes).map(NativeFile::Shared),
+        NativeKind::Object => Ok(match member(pe, Dlls::Read(&pe.descriptors), input, bytes)? {
+            Parsed::Object(object) => NativeFile::Object(object),
+            Parsed::Import(dll, symbol) => NativeFile::Shared(shared(dll.into_owned(), symbol)),
+        }),
+        NativeKind::Archive { whole } => {
+            let (archive, descriptors) = archive(input, bytes, *whole)?;
+            if !descriptors.is_empty() {
+                pe.descriptors.lock().unwrap_or_else(|e| e.into_inner()).extend(descriptors);
+            }
+            Ok(NativeFile::Archive(archive))
+        }
+        NativeKind::Shared { .. } => import_library(pe, input, bytes).map(NativeFile::Shared),
     }
 }
 
@@ -79,29 +146,34 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// A relocatable input: an object, or an import member of an archive.
-fn member(pe: &Pe, name: &str, bytes: &[u8]) -> Result<NativeFile, String> {
-    let aligned = Aligned::new(bytes);
-    let data = aligned.bytes();
-    if u16_at(data, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN) && u16_at(data, 2) == Some(0xffff)
-    {
-        let version = u16_at(data, 4).ok_or_else(|| format!("{name}: a truncated COFF header"))?;
+/// A relocatable input: an object, or an import member of an archive. Only a COFF object is
+/// aligned (copied when it isn't); an import header is read where it is.
+fn member<'a>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, bytes: &'a [u8]) -> Result<Parsed<'a>, String> {
+    if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN) && u16_at(bytes, 2) == Some(0xffff) {
+        let version = u16_at(bytes, 4).ok_or_else(|| format!("{name}: a truncated COFF header"))?;
         if version == 0 {
-            return short_import(name, data).map(NativeFile::Shared);
+            let (dll, symbol) = short_import(name, bytes)?;
+            return Ok(Parsed::Import(dll, symbol));
         }
-        if version >= 2 && data.get(12..28) == Some(&BIGOBJ[..]) {
-            return coff::<pe::AnonObjectHeaderBigobj>(pe, name, data);
+        if version >= 2 && bytes.get(12..28) == Some(&BIGOBJ[..]) {
+            let aligned = Aligned::new(bytes);
+            return coff::<pe::AnonObjectHeaderBigobj>(pe, dlls, name, aligned.bytes());
         }
         return Err(format!(
             "{name}: an anonymous COFF object (one built with /GL for link-time code generation, \
              or /clr): blaze links no LTCG or CLR objects"
         ));
     }
-    coff::<pe::ImageFileHeader>(pe, name, data)
+    let aligned = Aligned::new(bytes);
+    coff::<pe::ImageFileHeader>(pe, dlls, name, aligned.bytes())
 }
 
-/// A short import member: one symbol of one DLL.
-pub(super) fn short_import(name: &str, data: &[u8]) -> Result<Shared, String> {
+fn strip(name: &str) -> &str {
+    name.strip_prefix(['?', '@', '_']).unwrap_or(name)
+}
+
+/// A short import member: one symbol of one DLL, the DLL's name borrowed from it.
+fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, SharedSymbol), String> {
     let short = || format!("{name}: a truncated import member");
     let machine = u16_at(data, 6).ok_or_else(short)?;
     if machine != pe::IMAGE_FILE_MACHINE_AMD64 {
@@ -113,23 +185,22 @@ pub(super) fn short_import(name: &str, data: &[u8]) -> Result<Shared, String> {
     let strings = data.get(20..20 + size).ok_or_else(short)?;
     let mut strings = strings.split(|it| *it == 0);
     let symbol = lossy(strings.next().ok_or_else(short)?);
-    let dll = lossy(strings.next().ok_or_else(short)?);
+    let dll = String::from_utf8_lossy(strings.next().ok_or_else(short)?);
     let kind = match types & pe::IMPORT_OBJECT_TYPE_MASK {
         pe::IMPORT_OBJECT_CODE => SymbolKind::Function,
         pe::IMPORT_OBJECT_DATA | pe::IMPORT_OBJECT_CONST => SymbolKind::Data,
         other => return Err(format!("{name}: import type {other} of {symbol}, which no DLL has")),
     };
-    let strip = |it: &str| -> String {
-        it.strip_prefix(['?', '@', '_']).unwrap_or(it).to_owned()
-    };
+    let export_as: Cow<'_, str>;
     let export = match (types >> pe::IMPORT_OBJECT_NAME_SHIFT) & pe::IMPORT_OBJECT_NAME_MASK {
         pe::IMPORT_OBJECT_ORDINAL => None,
-        pe::IMPORT_OBJECT_NAME => Some(symbol.clone()),
+        pe::IMPORT_OBJECT_NAME => Some(symbol.as_str()),
         pe::IMPORT_OBJECT_NAME_NO_PREFIX => Some(strip(&symbol)),
-        pe::IMPORT_OBJECT_NAME_UNDECORATE => {
-            Some(strip(&symbol).split('@').next().unwrap_or_default().to_owned())
+        pe::IMPORT_OBJECT_NAME_UNDECORATE => Some(strip(&symbol).split('@').next().unwrap_or_default()),
+        pe::IMPORT_OBJECT_NAME_EXPORTAS => {
+            export_as = String::from_utf8_lossy(strings.next().ok_or_else(short)?);
+            Some(&*export_as)
         }
-        pe::IMPORT_OBJECT_NAME_EXPORTAS => Some(lossy(strings.next().ok_or_else(short)?)),
         other => {
             return Err(format!("{name}: import name type {other} of {symbol}, which blaze does not link"));
         }
@@ -138,37 +209,33 @@ pub(super) fn short_import(name: &str, data: &[u8]) -> Result<Shared, String> {
         None => format!("#{ordinal_or_hint}"),
         Some(export) => format!("{ordinal_or_hint} {export}"),
     };
-    Ok(Shared {
-        name: dll,
-        symbols: vec![SharedSymbol { name: symbol, version: Some(version), kind, weak: false }],
-        more: Vec::new(),
-        inputs: Vec::new(),
-    })
+    Ok((dll, SharedSymbol { name: symbol, version: Some(version), kind, weak: false }))
 }
 
 /// How the writer names an import in the DLL's export table, as `SharedSymbol::version` and
-/// `Import::version` carry it on PE: `"<hint> <name>"` or `"#<ordinal>"`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum ImportName {
-    Name { hint: u16, name: String },
+/// `Import::version` carry it on PE: `"<hint> <name>"` or `"#<ordinal>"`. Borrows the name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImportName<'a> {
+    Name { hint: u16, name: &'a str },
     Ordinal(u16),
 }
 
-impl ImportName {
-    pub(crate) fn parse(symbol: &str, version: Option<&str>) -> Result<ImportName, String> {
+impl<'a> ImportName<'a> {
+    pub(crate) fn parse(symbol: &'a str, version: Option<&'a str>) -> Result<ImportName<'a>, String> {
         let Some(version) = version else {
-            return Ok(ImportName::Name { hint: 0, name: symbol.to_owned() });
+            return Ok(ImportName::Name { hint: 0, name: symbol });
         };
         let bad = || format!("the import {symbol} has no PE import name: {version:?}");
         if let Some(ordinal) = version.strip_prefix('#') {
             return ordinal.parse().map(ImportName::Ordinal).map_err(|_| bad());
         }
         let (hint, name) = version.split_once(' ').ok_or_else(bad)?;
-        Ok(ImportName::Name { hint: hint.parse().map_err(|_| bad())?, name: name.to_owned() })
+        Ok(ImportName::Name { hint: hint.parse().map_err(|_| bad())?, name })
     }
 }
 
-fn archive(pe: &Pe, name: &str, bytes: &[u8], whole: bool) -> Result<Archive, String> {
+/// An archive's members and index, and the DLL each import descriptor member in it names.
+fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descriptors), String> {
     let file = ArchiveFile::parse(bytes).map_err(|e| format!("{name}: not an archive: {e}"))?;
     if file.is_thin() {
         return Err(format!("{name}: a thin archive, which link.exe does not read"));
@@ -178,28 +245,33 @@ fn archive(pe: &Pe, name: &str, bytes: &[u8], whole: bool) -> Result<Archive, St
         other => return Err(format!("{name}: a {other:?} archive, not a COFF one")),
     }
     let mut members = Vec::new();
-    let mut at = BTreeMap::new();
+    // Each member's header offset, ascending as the members are in the file.
+    let mut starts = Vec::new();
     for member in file.members() {
         let member = member.map_err(|e| format!("{name}: {e}"))?;
         let (offset, size) = member.file_range();
-        at.insert(offset - MEMBER_HEADER, members.len() as u32);
-        members.push(Member {
-            name: lossy(member.name()),
-            bytes: offset as usize..(offset + size) as usize,
-        });
+        starts.push(offset - MEMBER_HEADER);
+        members.push(Member { name: lossy(member.name()), bytes: offset as usize..(offset + size) as usize });
     }
     let mut index = Vec::new();
+    let mut descriptors = Descriptors::default();
     if let Some(symbols) = file.symbols().map_err(|e| format!("{name}: {e}"))? {
         for symbol in symbols {
             let symbol = symbol.map_err(|e| format!("{name}: {e}"))?;
-            let member = at.get(&symbol.offset().0).ok_or_else(|| {
+            let offset = symbol.offset().0;
+            let member = starts.binary_search(&offset).map_err(|_| {
                 format!(
-                    "{name}: the index names {} in a member at {:#x}, where none starts",
-                    lossy(symbol.name()),
-                    symbol.offset().0
+                    "{name}: the index names {} in a member at {offset:#x}, where none starts",
+                    String::from_utf8_lossy(symbol.name())
                 )
-            })?;
-            index.push((lossy(symbol.name()), *member));
+            })? as u32;
+            let symbol_name = lossy(symbol.name());
+            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_") && !descriptors.contains_key(&symbol_name) {
+                let it = &members[member as usize];
+                let input = Input { file: name.file, member: Some(&it.name) };
+                descriptors.insert(symbol_name.clone(), descriptor_dll(input, &bytes[it.bytes.clone()])?);
+            }
+            index.push((symbol_name, member));
         }
     }
     if index.is_empty() && !members.is_empty() && !whole {
@@ -208,19 +280,11 @@ fn archive(pe: &Pe, name: &str, bytes: &[u8], whole: bool) -> Result<Archive, St
              symbol (index it with lib.exe or llvm-ranlib)"
         ));
     }
-    for (symbol, member) in &index {
-        if !symbol.starts_with("__IMPORT_DESCRIPTOR_") {
-            continue;
-        }
-        let member = &members[*member as usize];
-        let dll = descriptor_dll(&format!("{name}({})", member.name), &bytes[member.bytes.clone()])?;
-        pe.descriptors.lock().unwrap_or_else(|e| e.into_inner()).insert(symbol.clone(), dll);
-    }
-    Ok(Archive { members, index })
+    Ok((Archive { members, index }, descriptors))
 }
 
 /// The DLL an import descriptor member names: its `.idata$6`.
-fn descriptor_dll(name: &str, bytes: &[u8]) -> Result<String, String> {
+fn descriptor_dll(name: Input<'_>, bytes: &[u8]) -> Result<String, String> {
     let aligned = Aligned::new(bytes);
     let data = aligned.bytes();
     let mut offset = 0;
@@ -241,8 +305,10 @@ fn descriptor_dll(name: &str, bytes: &[u8]) -> Result<String, String> {
     Err(format!("{name}: an import descriptor naming no DLL (no .idata$6)"))
 }
 
-/// An import library linked as a shared library: every member an import of some DLL.
-fn import_library(pe: &Pe, name: &str, bytes: &[u8]) -> Result<Shared, String> {
+/// An import library linked as a shared library: every member an import of some DLL. The
+/// DLLs are found by name in a hash index (an umbrella library such as `windows.lib` has
+/// thousands of members of hundreds of DLLs), and a DLL's name is copied once.
+fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, String> {
     if !bytes.starts_with(b"!<arch>\n") {
         if bytes.starts_with(b"MZ") {
             return Err(format!(
@@ -252,23 +318,27 @@ fn import_library(pe: &Pe, name: &str, bytes: &[u8]) -> Result<Shared, String> {
         }
         return Err(format!("{name}: not an import library"));
     }
-    let archive = archive(pe, name, bytes, true)?;
+    let (archive, descriptors) = archive(name, bytes, true)?;
     let mut dlls: Vec<Shared> = Vec::new();
-    for member in &archive.members {
-        let member_name = format!("{name}({})", member.name);
-        let mut shared = match self::member(pe, &member_name, &bytes[member.bytes.clone()])? {
-            NativeFile::Shared(shared) => shared,
-            NativeFile::Object(object) if object.sections.is_empty() => continue,
-            NativeFile::Object(_) | NativeFile::Archive(_) => {
+    let mut of: FxHashMap<Cow<'_, str>, u32> = FxHashMap::default();
+    for it in &archive.members {
+        let input = Input { file: name.file, member: Some(&it.name) };
+        let (dll, symbol) = match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.clone()])? {
+            Parsed::Import(dll, symbol) => (dll, symbol),
+            Parsed::Object(object) if object.sections.is_empty() => continue,
+            Parsed::Object(_) => {
                 return Err(format!(
-                    "{member_name}: an object in a library linked as a DLL's import library; \
+                    "{input}: an object in a library linked as a DLL's import library; \
                      a library with objects is linked as an archive"
                 ));
             }
         };
-        match dlls.iter_mut().find(|it| it.name == shared.name) {
-            Some(dll) => dll.symbols.append(&mut shared.symbols),
-            None => dlls.push(shared),
+        match of.get(&*dll) {
+            Some(&at) => dlls[at as usize].symbols.push(symbol),
+            None => {
+                of.insert(dll.clone(), dlls.len() as u32);
+                dlls.push(shared(dll.into_owned(), symbol));
+            }
         }
     }
     let mut dlls = dlls.into_iter();
@@ -277,13 +347,13 @@ fn import_library(pe: &Pe, name: &str, bytes: &[u8]) -> Result<Shared, String> {
     Ok(first)
 }
 
-/// The sections of a COFF object, by its section number less one.
+/// The sections of a COFF object, by its section number less one, their names borrowed.
 struct Sections<'d> {
     table: SectionTable<'d>,
-    names: Vec<String>,
+    names: Vec<Cow<'d, str>>,
 }
 
-fn coff<'d, C: CoffHeader>(pe: &Pe, name: &str, data: &'d [u8]) -> Result<NativeFile, String> {
+fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &[u8]) -> Result<Parsed<'a>, String> {
     let mut offset = 0;
     let header = C::parse(data, &mut offset).map_err(|e| format!("{name}: not a COFF object: {e}"))?;
     match header.machine() {
@@ -296,35 +366,43 @@ fn coff<'d, C: CoffHeader>(pe: &Pe, name: &str, data: &'d [u8]) -> Result<Native
     let symbols = header.symbols(data).map_err(|e| format!("{name}: {e}"))?;
     let strings = symbols.strings();
     let mut names = Vec::with_capacity(table.len());
+    let mut import = false;
     for section in table.iter() {
         let section_name = section.name(strings).map_err(|e| format!("{name}: {e}"))?;
-        names.push(lossy(section_name));
+        import |= section_name.starts_with(b".idata$");
+        names.push(String::from_utf8_lossy(section_name));
     }
     let sections = Sections { table, names };
-    if sections.names.iter().any(|it| it.starts_with(".idata$")) {
-        return long_import(pe, name, data, &sections, &symbols);
+    if import {
+        return long_import(dlls, name, data, &sections, &symbols);
     }
-    Reader { pe, name, data, sections: &sections, symbols: &symbols }.object().map(NativeFile::Object)
+    Reader { pe, name, data, sections: &sections, symbols: &symbols }.object().map(Parsed::Object)
 }
 
 struct Reader<'a, 'd, C: CoffHeader> {
     pe: &'a Pe,
-    name: &'a str,
+    name: Input<'a>,
     data: &'d [u8],
     sections: &'a Sections<'d>,
     symbols: &'a SymbolTable<'d, &'d [u8], C>,
 }
 
-/// What a COFF symbol table entry is to the link.
+/// What a COFF symbol table is to the link, from one pass over it.
 struct Read {
     symbols: Vec<Symbol>,
-    /// The object's symbol for each COFF symbol table index (aux records and symbols no
-    /// relocation can name have none).
-    map: Vec<Option<u32>>,
+    /// The object's symbol for each COFF symbol table index, [`NONE`] for aux records and
+    /// symbols no relocation can name: 4 bytes per COFF symbol, looked up by index.
+    map: Vec<u32>,
+    /// Per section: its first and second symbols (a COMDAT's section symbol, with the
+    /// selection, and its COMDAT symbol, naming the group), and its first symbol with a
+    /// section definition record (what an associative section's parent is found by).
+    first: Vec<Option<SymbolIndex>>,
+    second: Vec<Option<SymbolIndex>>,
+    aux: Vec<Option<SymbolIndex>>,
 }
 
 impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
-    fn err(&self, what: impl std::fmt::Display) -> String {
+    fn err(&self, what: impl fmt::Display) -> String {
         format!("{}: {what}", self.name)
     }
 
@@ -338,6 +416,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let mut directives = Vec::new();
         let mut alternates = Vec::new();
         for (index, section_name) in self.sections.names.iter().enumerate() {
+            let section_name: &str = section_name;
             let header = self.header(index);
             let flags = header.characteristics.get(LE);
             if section_name == ".drectve" {
@@ -347,7 +426,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             sections.push(self.section(section_name, header, flags)?);
         }
         let read = self.symbols()?;
-        let groups = self.groups(&mut sections)?;
+        let groups = self.groups(&mut sections, &read)?;
         for (index, header) in self.sections.table.iter().enumerate() {
             if sections[index].what == SectionKind::Dropped {
                 continue;
@@ -355,6 +434,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             sections[index].fixups = self.fixups(index, header, &sections[index], &read)?;
         }
         let mut symbols = read.symbols;
+        symbols.reserve(alternates.len() * 2);
         for (from, to) in alternates {
             let target = match symbols.iter().position(|it| it.name == to && it.binding != Binding::Local) {
                 Some(at) => at as u32,
@@ -365,6 +445,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                         binding: Binding::Global,
                         kind: SymbolKind::Other,
                         hidden: true,
+                        import: None,
                     });
                     symbols.len() as u32 - 1
                 }
@@ -375,23 +456,18 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 binding: Binding::Global,
                 kind: SymbolKind::Other,
                 hidden: true,
+                import: None,
             });
         }
         Ok(Object { sections, symbols, groups, libraries, directives })
     }
 
-    fn section(
-        &self,
-        section_name: &str,
-        header: &pe::ImageSectionHeader,
-        flags: u32,
-    ) -> Result<Section, String> {
+    fn section(&self, section_name: &str, header: &pe::ImageSectionHeader, flags: u32) -> Result<Section, String> {
         let align = alignment(flags).ok_or_else(|| {
             self.err(format!("section {section_name} has alignment bits {:#x}", flags & pe::IMAGE_SCN_ALIGN_MASK))
         })?;
         let base = section_name.split('$').next().unwrap_or_default();
-        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE | pe::IMAGE_SCN_LNK_INFO) != 0
-            || dropped_name(section_name);
+        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE | pe::IMAGE_SCN_LNK_INFO) != 0 || dropped_name(section_name);
         let zero = flags & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
         let data = if dropped {
             Data::Bytes(Vec::new())
@@ -412,10 +488,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         } else {
             let write = flags & pe::IMAGE_SCN_MEM_WRITE != 0;
             let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0;
-            let (class, rank) = self
-                .pe
-                .section(section_name, write, exec, base == ".tls")
-                .map_err(|e| self.err(e))?;
+            let (class, rank) =
+                self.pe.section(section_name, write, exec, base == ".tls").map_err(|e| self.err(e))?;
             let class = match class {
                 Class::Data if zero => Class::Bss,
                 Class::Bss if !zero => Class::Data,
@@ -436,12 +510,32 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
 
     fn symbols(&self) -> Result<Read, String> {
         let strings = self.symbols.strings();
-        let mut read = Read { symbols: Vec::new(), map: vec![None; self.symbols.len()] };
+        let count = self.sections.names.len();
+        let mut read = Read {
+            symbols: Vec::with_capacity(self.symbols.len()),
+            map: vec![NONE; self.symbols.len()],
+            first: vec![None; count],
+            second: vec![None; count],
+            aux: vec![None; count],
+        };
         let mut weak = Vec::new();
-        let mut defined: Vec<Vec<(u64, usize)>> = vec![Vec::new(); self.sections.names.len()];
+        // `(section, value, symbol)` of every symbol defined in a section but the section's
+        // own, sorted once to size each by the next one.
+        let mut defined: Vec<(u32, u64, u32)> = Vec::with_capacity(self.symbols.len());
         for (index, symbol) in self.symbols.iter() {
             let class = symbol.storage_class();
             let number = symbol.section_number();
+            if number > 0 && number as usize <= count {
+                let at = number as usize - 1;
+                if read.first[at].is_none() {
+                    read.first[at] = Some(index);
+                } else if read.second[at].is_none() {
+                    read.second[at] = Some(index);
+                }
+                if read.aux[at].is_none() && symbol.has_aux_section() {
+                    read.aux[at] = Some(index);
+                }
+            }
             let linkable = matches!(
                 class,
                 pe::IMAGE_SYM_CLASS_EXTERNAL
@@ -464,21 +558,22 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 (SymbolDef::Undefined, if function { SymbolKind::Function } else { SymbolKind::Other })
             } else if number > 0 {
                 let section = number as usize - 1;
-                if section >= self.sections.names.len() {
+                if section >= count {
                     return Err(self.err(format!("symbol {symbol_name} is in section {number}, which there isn't")));
                 }
-                let flags = self.header(section).characteristics.get(LE);
-                let kind = if symbol.has_aux_section() && value == 0 {
-                    SymbolKind::Section
+                let header = self.header(section);
+                let flags = header.characteristics.get(LE);
+                let (kind, size) = if symbol.has_aux_section() && value == 0 {
+                    (SymbolKind::Section, u64::from(header.size_of_raw_data.get(LE)))
                 } else if function || flags & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0 {
-                    SymbolKind::Function
+                    (SymbolKind::Function, 0)
                 } else {
-                    SymbolKind::Data
+                    (SymbolKind::Data, 0)
                 };
                 if kind != SymbolKind::Section {
-                    defined[section].push((value, read.symbols.len()));
+                    defined.push((section as u32, value, read.symbols.len() as u32));
                 }
-                (SymbolDef::Section { section: section as u32, value, size: 0 }, kind)
+                (SymbolDef::Section { section: section as u32, value, size }, kind)
             } else if number == pe::IMAGE_SYM_ABSOLUTE {
                 (SymbolDef::Absolute(value), SymbolKind::Other)
             } else if number == pe::IMAGE_SYM_UNDEFINED {
@@ -497,29 +592,32 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL => Binding::Weak,
                 _ => Binding::Local,
             };
-            read.map[index.0] = Some(read.symbols.len() as u32);
-            read.symbols.push(Symbol { name: symbol_name, def, binding, kind, hidden: true });
+            read.map[index.0] = read.symbols.len() as u32;
+            read.symbols.push(Symbol { name: symbol_name, def, binding, kind, hidden: true, import: None });
         }
-        for (section, symbols) in defined.iter_mut().enumerate() {
-            let len = u64::from(self.header(section).size_of_raw_data.get(LE));
-            symbols.sort();
-            for (at, (value, symbol)) in symbols.iter().enumerate() {
-                let end = symbols[at..].iter().map(|it| it.0).find(|it| it > value).unwrap_or(len);
-                if let SymbolDef::Section { size, .. } = &mut read.symbols[*symbol].def {
-                    *size = end.saturating_sub(*value);
+        // A symbol's size runs to the next greater value in its section, or the section's end.
+        defined.sort_unstable();
+        for run in defined.chunk_by(|a, b| a.0 == b.0) {
+            let mut end = u64::from(self.header(run[0].0 as usize).size_of_raw_data.get(LE));
+            let mut at = None;
+            for &(_, value, symbol) in run.iter().rev() {
+                if at != Some(value) {
+                    if let Some(next) = at {
+                        end = next;
+                    }
+                    at = Some(value);
+                }
+                if let SymbolDef::Section { size, .. } = &mut read.symbols[symbol as usize].def {
+                    *size = end.saturating_sub(value);
                 }
             }
         }
-        for symbol in &mut read.symbols {
-            if let (SymbolKind::Section, SymbolDef::Section { section, size, .. }) =
-                (symbol.kind, &mut symbol.def)
-            {
-                *size = u64::from(self.header(*section as usize).size_of_raw_data.get(LE));
-            }
-        }
         for (symbol, default, search) in weak {
-            let target = read.map.get(default.0).copied().flatten().ok_or_else(|| {
-                self.err(format!("weak external {} defaults to symbol {}, which is not one", read.symbols[symbol].name, default.0))
+            let target = read.map.get(default.0).copied().filter(|it| *it != NONE).ok_or_else(|| {
+                self.err(format!(
+                    "weak external {} defaults to symbol {}, which is not one",
+                    read.symbols[symbol].name, default.0
+                ))
             })?;
             let search = match search {
                 pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY => false,
@@ -536,26 +634,31 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         Ok(read)
     }
 
+    /// The selection and parent section number of section `index`'s definition record.
+    fn selection(&self, read: &Read, index: usize) -> Option<(u8, u32)> {
+        let aux = self.symbols.aux_section(read.aux[index]?).ok()?;
+        let mut parent = u32::from(aux.number.get(LE));
+        if C::is_type_bigobj() {
+            parent |= u32::from(aux.high_number.get(LE)) << 16;
+        }
+        Some((aux.selection, parent))
+    }
+
+    /// The section number an associative COMDAT section `index` names, if it is one.
+    fn associated(&self, read: &Read, index: usize) -> Option<u32> {
+        if self.header(index).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 {
+            return None;
+        }
+        match self.selection(read, index)? {
+            (pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE, parent) => Some(parent),
+            _ => None,
+        }
+    }
+
     /// The COMDAT groups, and which sections stay whatever refers to them.
-    fn groups(&self, sections: &mut [Section]) -> Result<Vec<Group>, String> {
+    fn groups(&self, sections: &mut [Section], read: &Read) -> Result<Vec<Group>, String> {
         let strings = self.symbols.strings();
         let count = sections.len();
-        // The section symbol (with the selection) and the COMDAT symbol (naming the group):
-        // the first and second symbols of a section.
-        let mut first: Vec<Option<SymbolIndex>> = vec![None; count];
-        let mut second: Vec<Option<SymbolIndex>> = vec![None; count];
-        for (index, symbol) in self.symbols.iter() {
-            let number = symbol.section_number();
-            if number <= 0 || number as usize > count {
-                continue;
-            }
-            let at = number as usize - 1;
-            if first[at].is_none() {
-                first[at] = Some(index);
-            } else if second[at].is_none() {
-                second[at] = Some(index);
-            }
-        }
         let mut groups: Vec<Group> = Vec::new();
         let mut group_of: Vec<Option<usize>> = vec![None; count];
         let mut associate = Vec::new();
@@ -566,7 +669,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 continue;
             }
             let section_name = &self.sections.names[index];
-            let aux = first[index]
+            let aux = read.first[index]
                 .filter(|it| self.symbols.symbol(*it).is_ok_and(|it| it.has_aux_section()))
                 .ok_or_else(|| self.err(format!("COMDAT section {section_name} has no section symbol")))?;
             let aux_symbol = self.symbols.aux_section(aux).map_err(|e| self.err(e))?;
@@ -590,11 +693,11 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     )));
                 }
             };
-            let leader = second[index]
-                .and_then(|it| Some((it, self.symbols.symbol(it).ok()?)))
+            let leader = read.second[index]
+                .and_then(|it| self.symbols.symbol(it).ok())
                 .ok_or_else(|| self.err(format!("COMDAT section {section_name} has no COMDAT symbol")))?;
-            let group_name = if leader.1.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
-                lossy(leader.1.name(strings).map_err(|e| self.err(e))?)
+            let group_name = if leader.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
+                lossy(leader.name(strings).map_err(|e| self.err(e))?)
             } else {
                 format!("\0{}\0{index}", self.name)
             };
@@ -611,7 +714,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                         self.sections.names[index]
                     )));
                 }
-                match associated(self, root - 1) {
+                match self.associated(read, root - 1) {
                     Some(next) if steps < count => {
                         root = next as usize;
                         steps += 1;
@@ -636,6 +739,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         Ok(groups)
     }
 
+    /// The section's relocations: a `match` on the type per relocation, the implicit addend
+    /// read from the section's bytes, no allocation but the result's.
     fn fixups(
         &self,
         index: usize,
@@ -660,7 +765,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 continue;
             }
             let index = relocation.symbol_table_index.get(LE) as usize;
-            let symbol = read.map.get(index).copied().flatten().ok_or_else(|| {
+            let symbol = read.map.get(index).copied().filter(|it| *it != NONE).ok_or_else(|| {
                 self.err(format!(
                     "a relocation in {section_name} at {at:#x} names symbol {index}, which is \
                      not one a relocation can name"
@@ -672,9 +777,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let short = || self.err(format!("a relocation in {section_name} at {at:#x} past its end"));
             let (apply, addend) = match typ {
                 pe::IMAGE_REL_AMD64_ADDR64 => (Apply::Abs64, u64_at(bytes, at).ok_or_else(short)? as i64),
-                pe::IMAGE_REL_AMD64_ADDR32 => {
-                    (Apply::Abs32, i64::from(u32_at(bytes, at).ok_or_else(short)?))
-                }
+                pe::IMAGE_REL_AMD64_ADDR32 => (Apply::Abs32, i64::from(u32_at(bytes, at).ok_or_else(short)?)),
                 pe::IMAGE_REL_AMD64_ADDR32NB => {
                     (Apply::ImageRel32, i64::from(u32_at(bytes, at).ok_or_else(short)? as i32))
                 }
@@ -683,9 +786,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     let past = 4 + i64::from(typ - pe::IMAGE_REL_AMD64_REL32);
                     (if branch { Apply::X86Branch32 } else { Apply::Rel32 }, implicit - past)
                 }
-                pe::IMAGE_REL_AMD64_SECTION => {
-                    (Apply::Section16, i64::from(u16_at(bytes, at).ok_or_else(short)?))
-                }
+                pe::IMAGE_REL_AMD64_SECTION => (Apply::Section16, i64::from(u16_at(bytes, at).ok_or_else(short)?)),
                 pe::IMAGE_REL_AMD64_SECREL => {
                     (Apply::SecRel32, i64::from(u32_at(bytes, at).ok_or_else(short)? as i32))
                 }
@@ -716,41 +817,50 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 return Err(self.err(format!("the .drectve word {word:?} is not an option")));
             };
             let (option, arg) = match option.split_once(':') {
-                Some((option, arg)) => (option.to_ascii_lowercase(), Some(arg)),
-                None => (option.to_ascii_lowercase(), None),
+                Some((option, arg)) => (option, Some(arg)),
+                None => (option, None),
+            };
+            // The option's name lowercased on the stack: no known one is longer.
+            let mut buf = [0u8; 16];
+            let key = match buf.get_mut(..option.len()) {
+                Some(key) => {
+                    key.copy_from_slice(option.as_bytes());
+                    key.make_ascii_lowercase();
+                    &*key
+                }
+                None => &b""[..],
             };
             let need = || self.err(format!("the .drectve option /{option} needs an argument"));
-            match option.as_str() {
-                "defaultlib" => {
+            match key {
+                b"defaultlib" => {
                     let library = default_library(arg.ok_or_else(need)?);
                     if !libraries.contains(&library) {
                         libraries.push(library);
                     }
                 }
-                "include" => directives.push(Directive::Include(arg.ok_or_else(need)?.to_owned())),
-                "alternatename" => {
+                b"include" => directives.push(Directive::Include(arg.ok_or_else(need)?.to_owned())),
+                b"alternatename" => {
                     let arg = arg.ok_or_else(need)?;
-                    let (from, to) = arg.split_once('=').ok_or_else(|| {
-                        self.err(format!("/ALTERNATENAME:{arg} is not from=to"))
-                    })?;
+                    let (from, to) =
+                        arg.split_once('=').ok_or_else(|| self.err(format!("/ALTERNATENAME:{arg} is not from=to")))?;
                     alternates.push((from.to_owned(), to.to_owned()));
                 }
-                "export" => directives.push(self.export(arg.ok_or_else(need)?)?),
-                "failifmismatch" => {
+                b"export" => directives.push(self.export(arg.ok_or_else(need)?)?),
+                b"failifmismatch" => {
                     let arg = arg.ok_or_else(need)?;
-                    let (key, value) = arg.split_once('=').ok_or_else(|| {
-                        self.err(format!("/FAILIFMISMATCH:{arg} is not key=value"))
-                    })?;
+                    let (key, value) = arg
+                        .split_once('=')
+                        .ok_or_else(|| self.err(format!("/FAILIFMISMATCH:{arg} is not key=value")))?;
                     directives.push(Directive::Mismatch { key: key.to_owned(), value: value.to_owned() });
                 }
-                "nodefaultlib" => {
+                b"nodefaultlib" => {
                     directives.push(Directive::NoDefaultLib(arg.map(default_library)));
                 }
                 // These change nothing a program observes: section merging (every section of
                 // a protection is laid out together already), incremental-link padding, the
                 // control-flow-guard tables of /guard:cf (off), a check that a library is not
                 // linked.
-                "merge" | "editandcontinue" | "guardsym" | "disallowlib" => {}
+                b"merge" | b"editandcontinue" | b"guardsym" | b"disallowlib" => {}
                 _ => {
                     return Err(self.err(format!(
                         "the .drectve option {word}, which blaze does not link (it would change \
@@ -772,39 +882,16 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         }
         let mut data = false;
         for part in parts {
-            match part.to_ascii_uppercase().as_str() {
-                "DATA" => data = true,
-                "PRIVATE" => {}
-                _ => {
-                    return Err(self.err(format!(
-                        "/EXPORT:{arg}: exports by ordinal (@n, NONAME), which blaze does not link"
-                    )));
-                }
+            if part.eq_ignore_ascii_case("DATA") {
+                data = true;
+            } else if !part.eq_ignore_ascii_case("PRIVATE") {
+                return Err(self.err(format!(
+                    "/EXPORT:{arg}: exports by ordinal (@n, NONAME), which blaze does not link"
+                )));
             }
         }
         Ok(Directive::Export { name: name.to_owned(), symbol: symbol.to_owned(), data })
     }
-}
-
-/// The section number an associative COMDAT section `index` names, if it is one.
-fn associated<C: CoffHeader>(reader: &Reader<'_, '_, C>, index: usize) -> Option<u32> {
-    if reader.header(index).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 {
-        return None;
-    }
-    let number = index as i32 + 1;
-    let (symbol, _) = reader
-        .symbols
-        .iter()
-        .find(|(_, it)| it.section_number() == number && it.has_aux_section())?;
-    let aux = reader.symbols.aux_section(symbol).ok()?;
-    if aux.selection != pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE {
-        return None;
-    }
-    let mut parent = u32::from(aux.number.get(LE));
-    if C::is_type_bigobj() {
-        parent |= u32::from(aux.high_number.get(LE)) << 16;
-    }
-    Some(parent)
 }
 
 /// A COFF section's alignment: 16 when it states none, as the format says.
@@ -822,10 +909,7 @@ pub(super) fn alignment(flags: u32) -> Option<u64> {
 fn dropped_name(name: &str) -> bool {
     let base = name.split('$').next().unwrap_or_default();
     name.starts_with(".debug")
-        || matches!(
-            base,
-            ".gfids" | ".giats" | ".gljmp" | ".gehcont" | ".sxdata" | ".voltbl" | ".chks64"
-        )
+        || matches!(base, ".gfids" | ".giats" | ".gljmp" | ".gehcont" | ".sxdata" | ".voltbl" | ".chks64")
         || matches!(name, ".llvm_addrsig" | ".llvm.call-graph-profile" | ".llvmbc" | ".llvmcmd")
 }
 
@@ -835,33 +919,38 @@ fn default_library(name: &str) -> String {
     if file.contains('.') { name.to_owned() } else { format!("{name}.lib") }
 }
 
-/// The words of a `.drectve`: split at spaces outside quotes, the quotes removed.
-pub(super) fn words(text: &str) -> Vec<String> {
+/// The words of a `.drectve`: split at spaces outside quotes, the quotes (and NULs outside
+/// them) removed. A word with neither is borrowed from `text`.
+pub(super) fn words(text: &str) -> Vec<Cow<'_, str>> {
     let mut words = Vec::new();
-    let mut word = String::new();
+    let mut start = None;
+    let mut owned: Option<String> = None;
     let mut quoted = false;
-    let mut any = false;
-    for c in text.chars() {
-        match c {
+    for (at, c) in text.char_indices() {
+        let kept = match c {
             '"' => {
                 quoted = !quoted;
-                any = true;
+                false
             }
             c if c.is_whitespace() && !quoted => {
-                if any {
-                    words.push(std::mem::take(&mut word));
-                    any = false;
+                if let Some(from) = start.take() {
+                    words.push(owned.take().map_or(Cow::Borrowed(&text[from..at]), Cow::Owned));
                 }
+                continue;
             }
-            '\0' if !quoted => {}
-            c => {
-                word.push(c);
-                any = true;
-            }
+            '\0' if !quoted && start.is_none() => continue,
+            '\0' if !quoted => false,
+            _ => true,
+        };
+        let from = *start.get_or_insert(at);
+        match (&mut owned, kept) {
+            (Some(word), true) => word.push(c),
+            (None, false) => owned = Some(text[from..at].to_owned()),
+            (Some(_), false) | (None, true) => {}
         }
     }
-    if any {
-        words.push(word);
+    if let Some(from) = start {
+        words.push(owned.map_or(Cow::Borrowed(&text[from..]), Cow::Owned));
     }
     words
 }
@@ -886,65 +975,62 @@ fn relocation_name(typ: u16) -> &'static str {
 
 /// A long-format import member: an object with `.idata$` sections. One importing a function
 /// or datum is read as that import; the descriptor, null descriptor and null thunk members
-/// hold the import tables the writer makes itself, so they are read as empty objects.
-fn long_import<'d, C: CoffHeader>(
-    pe: &Pe,
-    name: &str,
+/// hold the import tables the writer makes itself, so they are read as empty objects. Names
+/// are compared as the input's bytes; only the import's own is copied.
+fn long_import<'a, 'd, C: CoffHeader>(
+    dlls: Dlls<'a>,
+    name: Input<'_>,
     data: &'d [u8],
     sections: &Sections<'d>,
     symbols: &SymbolTable<'d, &'d [u8], C>,
-) -> Result<NativeFile, String> {
+) -> Result<Parsed<'a>, String> {
     let strings = symbols.strings();
-    let mut imp = None;
-    let mut descriptor = None;
-    let mut defined_in_code = Vec::new();
-    for (index, symbol) in symbols.iter() {
-        let symbol_name = lossy(symbol.name(strings).map_err(|e| format!("{name}: {e}"))?);
-        let number = symbol.section_number();
-        let external = symbol.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL;
-        if !external {
+    let headers = sections.table.iter().as_slice();
+    let mut imp: Option<(&'d [u8], usize)> = None;
+    let mut descriptor: Option<&'d [u8]> = None;
+    let mut defined_in_code: Vec<&'d [u8]> = Vec::new();
+    for (_, symbol) in symbols.iter() {
+        if symbol.storage_class() != pe::IMAGE_SYM_CLASS_EXTERNAL {
             continue;
         }
+        let symbol_name = symbol.name(strings).map_err(|e| format!("{name}: {e}"))?;
+        let number = symbol.section_number();
         if number > 0 {
-            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_")
-                || symbol_name == "__NULL_IMPORT_DESCRIPTOR"
-                || symbol_name.ends_with("_NULL_THUNK_DATA")
+            if symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_")
+                || symbol_name == b"__NULL_IMPORT_DESCRIPTOR"
+                || symbol_name.ends_with(b"_NULL_THUNK_DATA")
             {
-                return Ok(NativeFile::Object(Object::default()));
+                return Ok(Parsed::Object(Object::default()));
             }
             let section = number as usize - 1;
-            let section_name = sections.names.get(section).map(String::as_str).unwrap_or_default();
-            if let Some(stripped) = symbol_name.strip_prefix("__imp_") {
-                if section_name.starts_with(".idata$5") {
-                    imp = Some((stripped.to_owned(), section, index));
+            if let Some(stripped) = symbol_name.strip_prefix(b"__imp_") {
+                if sections.names.get(section).is_some_and(|it| it.starts_with(".idata$5")) {
+                    imp = Some((stripped, section));
                 }
-            } else if let Some(header) = sections.table.iter().nth(section) {
+            } else if let Some(header) = headers.get(section) {
                 let flags = header.characteristics.get(LE);
                 if flags & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0 {
                     defined_in_code.push(symbol_name);
                 }
             }
-        } else if number == pe::IMAGE_SYM_UNDEFINED && symbol_name.starts_with("__IMPORT_DESCRIPTOR_") {
+        } else if number == pe::IMAGE_SYM_UNDEFINED && symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_") {
             descriptor = Some(symbol_name);
         }
     }
-    let Some((symbol, section, _)) = imp else {
+    let Some((stripped, section)) = imp else {
         return Err(format!(
             "{name}: an object with .idata$ sections that defines no __imp_ symbol in .idata$5: \
              the import tables are the linker's"
         ));
     };
-    let descriptor = descriptor.ok_or_else(|| {
+    let symbol = lossy(stripped);
+    let descriptor = String::from_utf8_lossy(descriptor.ok_or_else(|| {
         format!("{name}: the import member of {symbol} names no __IMPORT_DESCRIPTOR_ (a GNU dlltool library?)")
-    })?;
-    let dll = pe
-        .descriptors
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    })?);
+    let dll = dlls
         .get(&descriptor)
-        .cloned()
         .ok_or_else(|| format!("{name}: no archive read so far has {descriptor}, the DLL {symbol} is from"))?;
-    let header = sections.table.iter().nth(section).ok_or_else(|| format!("{name}: no .idata$5"))?;
+    let header = headers.get(section).ok_or_else(|| format!("{name}: no .idata$5"))?;
     let thunk = header.coff_data(data).map_err(|()| format!("{name}: a truncated .idata$5"))?;
     let relocations = header.coff_relocations(data).map_err(|e| format!("{name}: {e}"))?;
     let version = match relocations.first() {
@@ -954,14 +1040,14 @@ fn long_import<'d, C: CoffHeader>(
                 .map_err(|e| format!("{name}: {e}"))?;
             let number = target.section_number();
             let names = (number > 0)
-                .then(|| sections.table.iter().nth(number as usize - 1))
+                .then(|| headers.get(number as usize - 1))
                 .flatten()
                 .ok_or_else(|| format!("{name}: the import name of {symbol} is in no section"))?;
             let bytes = names.coff_data(data).map_err(|()| format!("{name}: a truncated .idata$6"))?;
             let at = target.value() as usize + u64_at(thunk, 0).unwrap_or(0) as usize;
             let hint = u16_at(bytes, at).ok_or_else(|| format!("{name}: a truncated .idata$6"))?;
             let export = bytes[at + 2..].split(|it| *it == 0).next().unwrap_or_default();
-            format!("{hint} {}", lossy(export))
+            format!("{hint} {}", String::from_utf8_lossy(export))
         }
         None => {
             let value = u64_at(thunk, 0).ok_or_else(|| format!("{name}: a truncated .idata$5"))?;
@@ -971,11 +1057,6 @@ fn long_import<'d, C: CoffHeader>(
             format!("#{}", value as u16)
         }
     };
-    let kind = if defined_in_code.contains(&symbol) { SymbolKind::Function } else { SymbolKind::Data };
-    Ok(NativeFile::Shared(Shared {
-        name: dll,
-        symbols: vec![SharedSymbol { name: symbol, version: Some(version), kind, weak: false }],
-        more: Vec::new(),
-        inputs: Vec::new(),
-    }))
+    let kind = if defined_in_code.contains(&stripped) { SymbolKind::Function } else { SymbolKind::Data };
+    Ok(Parsed::Import(dll, SharedSymbol { name: symbol, version: Some(version), kind, weak: false }))
 }

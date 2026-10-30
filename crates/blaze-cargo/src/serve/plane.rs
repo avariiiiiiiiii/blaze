@@ -10,7 +10,7 @@
 //! next task of its kind is admitted by.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::Duration,
@@ -25,7 +25,6 @@ use blaze_graph::{
 };
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rustc_hash::FxHashMap;
 
 /// The kinds of the daemon's own tasks, for their estimates: past every query kind (`u16`).
 pub mod kinds {
@@ -48,20 +47,27 @@ pub struct Did<T> {
     pub value: T,
 }
 
-/// A thread task's work: what it came to, or `None` when it gave way (a cycle of waits, a
-/// cancel, memory), to be posted again whole.
-pub type Work<T> = Arc<dyn Fn() -> Option<Did<T>> + Send + Sync>;
+/// The thread tasks of one batch of nodes: called with a task's `arg`, it says what the task
+/// came to, or `None` when it gave way (a cycle of waits, a cancel, memory), to be posted again
+/// whole. One per batch, never one per node.
+pub type Work<T> = Arc<dyn Fn(u32) -> Option<Did<T>> + Send + Sync>;
 
-pub enum Task<T> {
-    Thread { kind: TaskKind, work: Work<T> },
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Task {
+    /// The batch's [`Work`] called with `arg`.
+    Thread { kind: TaskKind, arg: u32 },
     /// Run by the loop once the plane says so ([`Happened::Run`]); it ends with
     /// [`Plane::ended`].
     Loop,
+    /// Settled, or never added.
+    Gone,
 }
 
-pub struct Node<T> {
+const _: () = assert!(std::mem::size_of::<Task>() == 12);
+
+pub struct Node {
     pub spec: Spec,
-    pub task: Task<T>,
+    pub task: Task,
 }
 
 /// What the plane did, for the loop to act on, in order.
@@ -89,7 +95,8 @@ pub struct Ran<T> {
 
 /// Runs thread tasks and hands back how each ended.
 pub trait Runner<T>: Send {
-    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>);
+    /// `work` is the batch's, shared: posting costs one reference count, not a closure.
+    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32);
     /// Moves the tasks that ended into `out`.
     fn take(&mut self, out: &mut Vec<Ran<T>>);
     /// Whether a task ended and was not taken yet: the loop then polls the driver without
@@ -111,6 +118,7 @@ struct IoJob<T> {
     id: NodeId,
     kind: TaskKind,
     work: Work<T>,
+    arg: u32,
     done: Sender<Ran<T>>,
 }
 
@@ -132,7 +140,7 @@ impl<T: Send + 'static> Threads<T> {
                         // A task that gave way runs again on this thread: an IO task waits on
                         // the world, not on another task.
                         let (did, peak) = loop {
-                            if let (Some(did), peak) = run_measured(&job.work) {
+                            if let (Some(did), peak) = run_measured(&job.work, job.arg) {
                                 break (did, peak);
                             }
                         };
@@ -146,8 +154,8 @@ impl<T: Send + 'static> Threads<T> {
 }
 
 /// Runs `work` inside a measure: `None` when it gave way, else its value or its panic.
-fn run_measured<T>(work: &Work<T>) -> (Option<Result<Did<T>, String>>, u64) {
-    let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work())));
+fn run_measured<T>(work: &Work<T>, arg: u32) -> (Option<Result<Did<T>, String>>, u64) {
+    let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work(arg))));
     match result {
         Ok(None) => (None, peak),
         Ok(Some(did)) => (Some(Ok(did)), peak),
@@ -164,28 +172,35 @@ fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("panicked: {what}")
 }
 
-fn post_work<T: Send + 'static>(id: NodeId, near: Option<u32>, kind: TaskKind, work: Work<T>, done: Sender<Ran<T>>) {
+fn post_work<T: Send + 'static>(
+    id: NodeId,
+    near: Option<u32>,
+    kind: TaskKind,
+    work: Work<T>,
+    arg: u32,
+    done: Sender<Ran<T>>,
+) {
     let pool = blaze_graph::exec::shared();
     let again = work.clone();
     pool.submit(
         near,
-        move || run_measured(&work),
+        move || run_measured(&work, arg),
         move |result| match result {
             Ok((Some(did), peak)) => _ = done.send(Ran { id, kind, did, peak }),
             // Gave way: posted again behind what is ready on the group it ran on.
-            Ok((None, _)) => post_work(id, blaze_graph::pool::group(), kind, again, done),
+            Ok((None, _)) => post_work(id, blaze_graph::pool::group(), kind, again, arg, done),
             Err(panic) => _ = done.send(Ran { id, kind, did: Err(panicked(&*panic)), peak: 0 }),
         },
     );
 }
 
 impl<T: Send + 'static> Runner<T> for Threads<T> {
-    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>) {
+    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32) {
         self.running += 1;
         match pool {
-            Pool::Work => post_work(id, near, kind, work, self.done_tx.clone()),
+            Pool::Work => post_work(id, near, kind, work, arg, self.done_tx.clone()),
             Pool::Io => {
-                let job = IoJob { id, kind, work, done: self.done_tx.clone() };
+                let job = IoJob { id, kind, work, arg, done: self.done_tx.clone() };
                 // The IO threads hold the receiver for as long as the process lives.
                 _ = self.io.send(job);
             }
@@ -212,36 +227,40 @@ impl<T: Send + 'static> Runner<T> for Threads<T> {
 /// is posted each time in a seeded order, so a run is a function of its seed.
 pub struct Inline<T> {
     rng: Rng,
-    queue: VecDeque<(NodeId, TaskKind, Work<T>)>,
+    queue: VecDeque<Posted<T>>,
+    /// Reused by every take.
+    posted: Vec<Posted<T>>,
 }
+
+type Posted<T> = (NodeId, TaskKind, Work<T>, u32);
 
 impl<T> Inline<T> {
     pub fn new(seed: u64) -> Inline<T> {
-        Inline { rng: Rng::new(seed), queue: VecDeque::new() }
+        Inline { rng: Rng::new(seed), queue: VecDeque::new(), posted: Vec::new() }
     }
 }
 
 impl<T: Send + 'static> Runner<T> for Inline<T> {
-    fn post(&mut self, id: NodeId, _: Pool, _: Option<u32>, kind: TaskKind, work: Work<T>) {
-        self.queue.push_back((id, kind, work));
+    fn post(&mut self, id: NodeId, _: Pool, _: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32) {
+        self.queue.push_back((id, kind, work, arg));
     }
 
     fn take(&mut self, out: &mut Vec<Ran<T>>) {
         if self.queue.is_empty() {
             return;
         }
-        let mut posted: Vec<_> = self.queue.drain(..).collect();
+        let mut posted = std::mem::take(&mut self.posted);
+        posted.extend(self.queue.drain(..));
         self.rng.shuffle(&mut posted);
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
-        for (id, kind, work) in posted.drain(now..) {
-            self.queue.push_back((id, kind, work));
-        }
-        for (id, kind, work) in posted {
-            match run_measured(&work) {
+        self.queue.extend(posted.drain(now..));
+        for (id, kind, work, arg) in posted.drain(..) {
+            match run_measured(&work, arg) {
                 (Some(did), peak) => out.push(Ran { id, kind, did, peak }),
-                (None, _) => self.queue.push_back((id, kind, work)),
+                (None, _) => self.queue.push_back((id, kind, work, arg)),
             }
         }
+        self.posted = posted;
     }
 
     fn ready(&self) -> bool {
@@ -253,17 +272,21 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
     }
 }
 
-/// What a node runs, kept from its add until it settles.
-enum Held<T> {
-    Thread { kind: TaskKind, work: Work<T> },
-    Loop,
+/// Nodes added together, ids `first..first + tasks.len()` (reserved at once, [`Plane::reserve`]):
+/// each one's task by offset, 12 bytes a node, and the one work their thread tasks share. Let
+/// go once every node of it settled.
+struct Batch<T> {
+    tasks: Vec<Task>,
+    live: u32,
+    work: Option<Work<T>>,
 }
 
 pub struct Plane<T> {
     graph: Graph,
     estimates: Estimates,
     runner: Box<dyn Runner<T>>,
-    held: FxHashMap<NodeId, Held<T>>,
+    /// By first id: a node's batch is the last one starting at or below it, O(log batches).
+    batches: BTreeMap<u32, Batch<T>>,
     next_node: u32,
     next_request: u32,
     happened: Vec<Happened<T>>,
@@ -280,7 +303,7 @@ impl<T: Send + 'static> Plane<T> {
             graph: Graph::new(config)?,
             estimates,
             runner,
-            held: FxHashMap::default(),
+            batches: BTreeMap::new(),
             next_node: 0,
             next_request: 0,
             happened: Vec::new(),
@@ -300,11 +323,39 @@ impl<T: Send + 'static> Plane<T> {
         self.graph.stats(request)
     }
 
-    /// A node id no other node of this plane has.
-    pub fn node_id(&mut self) -> NodeId {
-        let id = NodeId(self.next_node);
-        self.next_node = self.next_node.wrapping_add(1);
-        id
+    /// The first of `count` consecutive node ids no node of this plane has, for one
+    /// [`Plane::add`].
+    ///
+    /// # Panics
+    ///
+    /// When the ids wrapped around onto a batch that has not settled, after 2^32 nodes.
+    pub fn reserve(&mut self, count: u32) -> NodeId {
+        let first = match self.next_node.checked_add(count) {
+            Some(_) => self.next_node,
+            None => 0,
+        };
+        let end = first + count;
+        let free = self.batches.range(..end).next_back().is_none_or(|(at, batch)| at + batch.tasks.len() as u32 <= first);
+        assert!(free, "the plane's node ids wrapped onto nodes that have not settled");
+        self.next_node = end;
+        NodeId(first)
+    }
+
+    fn task(&self, id: NodeId) -> Option<(&Batch<T>, Task)> {
+        let (first, batch) = self.batches.range(..=id.0).next_back()?;
+        batch.tasks.get((id.0 - first) as usize).map(|task| (batch, *task))
+    }
+
+    fn settled(&mut self, id: NodeId) {
+        let Some((&first, batch)) = self.batches.range_mut(..=id.0).next_back() else { return };
+        let Some(task) = batch.tasks.get_mut((id.0 - first) as usize) else { return };
+        if *task != Task::Gone {
+            *task = Task::Gone;
+            batch.live -= 1;
+            if batch.live == 0 {
+                self.batches.remove(&first);
+            }
+        }
     }
 
     /// A request, of weight 1: every job's share of the threads is the same.
@@ -316,30 +367,40 @@ impl<T: Send + 'static> Plane<T> {
         request
     }
 
-    /// Nodes of `request`, each thread task's memory raised to what its kind is predicted to
-    /// hold. An error (a cycle, a dep of another request) adds none of them.
-    pub fn add(&mut self, at: Duration, request: RequestId, nodes: Vec<Node<T>>) -> Result<(), Error> {
+    /// Nodes of `request` with the ids [`Plane::reserve`] gave from `first`, in order, their
+    /// thread tasks run by `work`; each thread task's memory raised to what its kind is
+    /// predicted to hold. An error (a cycle, a dep of another request) adds none of them.
+    ///
+    /// # Panics
+    ///
+    /// When a node's id is not `first` plus its place, or a thread task has no `work`.
+    pub fn add(
+        &mut self,
+        at: Duration,
+        request: RequestId,
+        first: NodeId,
+        nodes: Vec<Node>,
+        work: Option<Work<T>>,
+    ) -> Result<(), Error> {
         let mut specs = Vec::with_capacity(nodes.len());
-        let mut held = Vec::with_capacity(nodes.len());
-        for Node { mut spec, task } in nodes {
-            let task = match task {
-                Task::Thread { kind, work } => {
-                    spec.memory = spec.memory.max(self.estimates.predict(kind));
-                    Held::Thread { kind, work }
-                }
-                Task::Loop => Held::Loop,
-            };
-            held.push((spec.id, task));
+        let mut tasks = Vec::with_capacity(nodes.len());
+        for (offset, Node { mut spec, task }) in (0u32..).zip(nodes) {
+            assert_eq!(spec.id.0, first.0 + offset, "a batch's nodes are the ids reserved for it, in order");
+            if let Task::Thread { kind, .. } = task {
+                assert!(work.is_some(), "a batch with thread tasks is given their work");
+                spec.memory = spec.memory.max(self.estimates.predict(kind));
+            }
+            tasks.push(task);
             specs.push(spec);
         }
-        let ids: Vec<NodeId> = held.iter().map(|(id, _)| *id).collect();
-        self.held.extend(held);
+        if !tasks.is_empty() {
+            let live = tasks.len() as u32;
+            self.batches.insert(first.0, Batch { tasks, live, work });
+        }
         match self.step(PlaneInput::Add { at_ns: ns(at), request, nodes: specs }) {
             Ok(()) => Ok(()),
             Err(error) => {
-                for id in ids {
-                    self.held.remove(&id);
-                }
+                self.batches.remove(&first.0);
                 Err(error)
             }
         }
@@ -368,8 +429,9 @@ impl<T: Send + 'static> Plane<T> {
 
     /// Takes the thread tasks that ended into the plane.
     pub fn poll(&mut self, at: Duration) {
-        self.runner.take(&mut self.ran);
-        for Ran { id, kind, did, peak } in std::mem::take(&mut self.ran) {
+        let mut ran = std::mem::take(&mut self.ran);
+        self.runner.take(&mut ran);
+        for Ran { id, kind, did, peak } in ran.drain(..) {
             self.estimates.observe(kind, peak);
             let outcome = match did {
                 Ok(Did { outcome, value }) => {
@@ -381,13 +443,16 @@ impl<T: Send + 'static> Plane<T> {
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
+        self.ran = ran;
         let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::held() };
         self.step(held).unwrap_or_else(|error| panic!("the plane refused what is held: {error}"));
     }
 
-    /// What happened since the last call, in order.
-    pub fn happened(&mut self) -> Vec<Happened<T>> {
-        std::mem::take(&mut self.happened)
+    /// What happened since the last call, in order, swapped into `into`, which is empty: the
+    /// two buffers trade places each call and neither is allocated again.
+    pub fn happened(&mut self, into: &mut Vec<Happened<T>>) {
+        debug_assert!(into.is_empty(), "what happened before was taken");
+        std::mem::swap(&mut self.happened, into);
     }
 
     /// Whether a thread task ended and waits to be taken.
@@ -415,7 +480,7 @@ impl<T: Send + 'static> Plane<T> {
                         continue;
                     }
                     let id = NodeId(id);
-                    self.held.remove(&id);
+                    self.settled(id);
                     let (ok, why) = match state {
                         NodeState::Built | NodeState::Cached { .. } => (true, None),
                         NodeState::Failed { why } => (false, Some(why)),
@@ -426,14 +491,14 @@ impl<T: Send + 'static> Plane<T> {
                     };
                     self.happened.push(Happened::Settled { id, ok, why });
                 }
-                PlaneOutput::Run { id, pool, near } => match self.held.get(&id) {
-                    Some(Held::Thread { kind, work }) => {
-                        let (kind, work) = (*kind, work.clone());
+                PlaneOutput::Run { id, pool, near } => match self.task(id) {
+                    Some((batch, Task::Thread { kind, arg })) => {
+                        let work = batch.work.clone().expect("checked by add");
                         self.happened.push(Happened::Started { id });
-                        self.runner.post(id, pool, near, kind, work);
+                        self.runner.post(id, pool, near, kind, work, arg);
                     }
-                    Some(Held::Loop) => self.happened.push(Happened::Run { id }),
-                    None => panic!("the plane runs node {id}, which the daemon gave no task"),
+                    Some((_, Task::Loop)) => self.happened.push(Happened::Run { id }),
+                    Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
                 },
                 PlaneOutput::Finished { request, ok } => {
                     let stats = self.graph.stats(request).unwrap_or_default();

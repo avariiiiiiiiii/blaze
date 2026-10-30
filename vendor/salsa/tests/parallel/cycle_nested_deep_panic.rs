@@ -55,44 +55,42 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 
 fn run() {
     tracing::debug!("Starting new run");
-    let db_t1 = Knobs::default();
-    let db_t2 = db_t1.clone();
-    let db_t3 = db_t1.clone();
-    let db_t4 = db_t1.clone();
+    let db = Knobs::default();
+    let db = &db;
 
-    let t1 = thread::spawn(move || {
-        let _span = tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
-        catch_unwind(|| {
-            db_t1.wait_for(1);
-            query_a(&db_t1)
-        })
-    });
-    let t2 = thread::spawn(move || {
-        let _span = tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
-        catch_unwind(|| {
-            db_t2.wait_for(1);
+    let (r_t1, r_t2, r_t3) = thread::scope(|scope| {
+        let t1 = scope.spawn(move || {
+            let _span = tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
+            catch_unwind(|| {
+                db.wait_for(1);
+                query_a(db)
+            })
+        });
+        let t2 = scope.spawn(move || {
+            let _span = tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
+            catch_unwind(|| {
+                db.wait_for(1);
 
-            query_b(&db_t2)
-        })
-    });
-    let t3 = thread::spawn(move || {
-        let _span = tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
-        catch_unwind(|| {
-            db_t3.signal(2);
-            query_d(&db_t3)
-        })
-    });
+                query_b(db)
+            })
+        });
+        let t3 = scope.spawn(move || {
+            let _span = tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
+            catch_unwind(|| {
+                db.signal(2);
+                query_d(db)
+            })
+        });
 
-    let r_t1 = t1.join().unwrap();
-    let r_t2 = t2.join().unwrap();
-    let r_t3 = t3.join().unwrap();
+        (t1.join().unwrap(), t2.join().unwrap(), t3.join().unwrap())
+    });
 
     assert_is_set_cycle_error(r_t1);
     assert_is_set_cycle_error(r_t2);
     assert_is_set_cycle_error(r_t3);
 
     // Pulling the cycle again at a later point should still result in a panic.
-    assert_is_set_cycle_error(catch_unwind(|| query_d(&db_t4)));
+    assert_is_set_cycle_error(catch_unwind(|| query_d(db)));
 }
 
 #[test_log::test]

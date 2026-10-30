@@ -148,19 +148,38 @@ fn invocation_time(run_dir: &Path) -> std::io::Result<SystemTime> {
 impl Ran {
     /// What cargo shows of the run when it fails: each line of its output that starts with
     /// `cargo::error=`, `cargo:warning=` or `cargo::warning=`, as cargo watches it stream by.
+    ///
+    /// The lines are those of `str::lines` over the output read lossily, found by memchr's
+    /// search in the bytes; only a message is read as text, alone, which is the same, since
+    /// a replaced sequence never spans a line break.
     pub fn logged(&self) -> Vec<(Severity, String)> {
-        String::from_utf8_lossy(&self.stdout)
-            .lines()
-            .filter_map(|line| {
-                if let Some(error) = line.strip_prefix("cargo::error=") {
-                    return Some((Severity::Error, error.to_owned()));
+        let mut logged = Vec::new();
+        let mut rest = Some(self.stdout.as_slice());
+        while let Some(bytes) = rest {
+            let line = match memchr::memchr(b'\n', bytes) {
+                Some(at) => {
+                    rest = Some(&bytes[at + 1..]);
+                    let line = &bytes[..at];
+                    line.strip_suffix(b"\r").unwrap_or(line)
                 }
-                let warning = line
-                    .strip_prefix("cargo:warning=")
-                    .or_else(|| line.strip_prefix("cargo::warning="))?;
-                Some((Severity::Warning, warning.to_owned()))
-            })
-            .collect()
+                None => {
+                    rest = None;
+                    bytes
+                }
+            };
+            let (severity, message) = if let Some(error) = line.strip_prefix(b"cargo::error=") {
+                (Severity::Error, error)
+            } else if let Some(warning) = line
+                .strip_prefix(b"cargo:warning=")
+                .or_else(|| line.strip_prefix(b"cargo::warning="))
+            {
+                (Severity::Warning, warning)
+            } else {
+                continue;
+            };
+            logged.push((severity, String::from_utf8_lossy(message).into_owned()));
+        }
+        logged
     }
 
     /// What cargo makes of the run: what the script printed, once it succeeded and logged no

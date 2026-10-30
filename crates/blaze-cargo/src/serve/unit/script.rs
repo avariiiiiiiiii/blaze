@@ -108,22 +108,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
     let manifest_path = PathBuf::from(&package.manifest_path);
     let manifest_dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let targets = units
-        .graph
-        .units
-        .iter()
-        .filter(|it| it.pkg_id == unit.pkg_id)
-        .map(|it| bs::Target {
-            name: it.target.name.clone(),
-            kind: it.target.kind.clone(),
-            crate_types: it.target.crate_types.clone(),
-        })
-        .fold(Vec::<bs::Target>::new(), |mut all, it| {
-            if !all.contains(&it) {
-                all.push(it);
-            }
-            all
-        });
+    let targets = targets(units, &unit.pkg_id);
     let text = |name: &str| var(plan, name).filter(|it| !it.is_empty()).map(str::to_owned);
     let descr = match &package.source {
         Some(source) if super::compile::local(Some(source)) => {
@@ -213,6 +198,26 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         },
         jobserver: None,
     })
+}
+
+/// The target of `unit`, as `blaze_build_script` names it.
+pub(crate) fn target_of(unit: &Unit) -> bs::Target {
+    bs::Target {
+        name: unit.target.name.clone(),
+        kind: unit.target.kind.clone(),
+        crate_types: unit.target.crate_types.clone(),
+    }
+}
+
+/// The targets of package `pkg_id` the build has a unit of, each once, in the graph's order.
+pub(crate) fn targets(units: &Units, pkg_id: &str) -> Vec<bs::Target> {
+    let mut all = Vec::new();
+    for it in units.graph.units.iter().filter(|it| it.pkg_id == pkg_id).map(target_of) {
+        if !all.contains(&it) {
+            all.push(it);
+        }
+    }
+    all
 }
 
 fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {

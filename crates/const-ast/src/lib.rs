@@ -25,6 +25,7 @@
 //! evaluator and compares what they read with the same code compiled.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 mod kinds;
 mod views;

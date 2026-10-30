@@ -19,10 +19,14 @@ use inkwell::{
     AddressSpace, GlobalVisibility, OptimizationLevel,
     attributes::{Attribute, AttributeLoc},
     context::Context,
-    llvm_sys::support::LLVMParseCommandLineOptions,
+    llvm_sys::{
+        support::LLVMParseCommandLineOptions,
+        transforms::pass_builder::{
+            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeOpaquePasses, LLVMBlazeRunPasses,
+        },
+    },
     memory_buffer::MemoryBuffer,
     module::{Linkage, Module},
-    passes::PassBuilderOptions,
     targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
     },
@@ -343,20 +347,10 @@ fn compiled(
             .time(Phase::Verify, || module.verify())
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
         if let Some(pipeline) = optimization.pipeline() {
-            tally
-                .time(Phase::Optimize, || {
-                    // rustc vectorizes straight-line code at `-O2` and `-O3`.
-                    let options = PassBuilderOptions::create();
-                    options.set_loop_slp_vectorization(true);
-                    module.run_passes(pipeline, machine, options)
-                })
-                .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+            // rustc vectorizes straight-line code at `-O2` and `-O3`.
+            tally.time(Phase::Optimize, || machine.run(&module, pipeline, true))?;
             if rebase::rebase(&module) {
-                tally
-                    .time(Phase::Optimize, || {
-                        module.run_passes(REBASED, machine, PassBuilderOptions::create())
-                    })
-                    .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+                tally.time(Phase::Optimize, || machine.run(&module, REBASED, false))?;
             }
         }
         // What a compile alone imports is only there to be built in: a body LLVM did not
@@ -365,9 +359,7 @@ fn compiled(
         let mut kept = Vec::new();
         if !imports.is_empty() {
             let pass = if alone.is_some() { "elim-avail-extern" } else { "globaldce" };
-            module
-                .run_passes(pass, machine, PassBuilderOptions::create())
-                .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+            machine.run(&module, pass, false)?;
         }
         if alone.is_none() {
             for import in imports {
@@ -513,7 +505,7 @@ pub(super) fn export(
     pointees: &[(u32, super::fragment::Pointee)],
     hint: Hint,
     optimization: Optimization,
-) -> Result<(Vec<u8>, usize), Unhandled> {
+) -> Result<(std::sync::Arc<[u8]>, usize), Unhandled> {
     if func.dfg.num_insts() > super::LARGE {
         return Err(Unhandled::Shape("a body too large to export"));
     }
@@ -543,11 +535,9 @@ pub(super) fn export(
             None,
         )?;
         module.verify().map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-        module
-            .run_passes(exported(optimization), machine, PassBuilderOptions::create())
-            .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+        machine.run(&module, exported(optimization), false)?;
         let size = function.get_basic_blocks().into_iter().map(|it| it.get_instructions().count());
-        Ok((module.write_bitcode_to_memory().as_slice().to_vec(), size.sum()))
+        Ok((module.write_bitcode_to_memory().as_slice().into(), size.sum()))
     })
 }
 
@@ -958,6 +948,82 @@ fn diagnosed() -> Context {
     context
 }
 
+/// LLVM's pass builder for one target machine, with its analysis managers, instrumentation
+/// and parsed pipelines (`vendor/llvm-sys/wrappers/passes.cpp`): what `LLVMRunPasses` builds
+/// and tears down on every call, a process-wide lock among it, kept so that running a
+/// module's passes costs what the passes do. Bound to the first context it runs a module of.
+struct Kept(std::ptr::NonNull<LLVMBlazeOpaquePasses>);
+
+impl Kept {
+    fn of(machine: &TargetMachine) -> Kept {
+        // SAFETY: the machine outlives what is made for it: [`Machinery`] drops this first.
+        let made = unsafe { LLVMBlazeCreatePasses(machine.as_mut_ptr()) };
+        Kept(std::ptr::NonNull::new(made).expect("LLVM made no passes"))
+    }
+
+    /// Runs `passes` over `module`, vectorizing straight-line code if `slp`, as
+    /// `Module::run_passes` would with `PassBuilderOptions::set_loop_slp_vectorization(slp)`
+    /// and nothing else set.
+    fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
+        use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
+        // SAFETY: `self` is used by its one thread, with modules of the context it is bound to
+        // (the wrapper refuses another); the text is read for its length, during the call.
+        let failed = unsafe {
+            LLVMBlazeRunPasses(
+                self.0.as_ptr(),
+                module.as_mut_ptr(),
+                passes.as_ptr().cast(),
+                passes.len(),
+                i32::from(slp),
+            )
+        };
+        if failed.is_null() {
+            return Ok(());
+        }
+        // SAFETY: an error LLVM gave, taken once; its message is disposed of once read.
+        let message = unsafe {
+            let message = LLVMGetErrorMessage(failed);
+            let text = std::ffi::CStr::from_ptr(message).to_string_lossy().into_owned();
+            LLVMDisposeErrorMessage(message);
+            text
+        };
+        Err(Unhandled::Llvm(message))
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        // SAFETY: made by `LLVMBlazeCreatePasses`, disposed of once.
+        unsafe { LLVMBlazeDisposePasses(self.0.as_ptr()) }
+    }
+}
+
+/// A target machine and the passes kept for it ([`Kept`]).
+pub(super) struct Machinery {
+    // Before the machine, which has to outlive them.
+    passes: Kept,
+    machine: TargetMachine,
+}
+
+impl Machinery {
+    fn new(machine: TargetMachine) -> Machinery {
+        Machinery { passes: Kept::of(&machine), machine }
+    }
+
+    /// Runs the pipeline `passes` over `module`, vectorizing straight-line code if `slp`.
+    fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
+        self.passes.run(module, passes, slp)
+    }
+}
+
+impl std::ops::Deref for Machinery {
+    type Target = TargetMachine;
+
+    fn deref(&self) -> &TargetMachine {
+        &self.machine
+    }
+}
+
 /// The target as LLVM knows it, one per thread and level: making one costs more than a
 /// small function does. The context the modules are made in is kept with them, as a
 /// machine holds on to things of the last context it compiled a module of: the instruction
@@ -965,8 +1031,8 @@ fn diagnosed() -> Context {
 /// go of it at the next function, by when a context of that one module would be gone.
 #[derive(Default)]
 struct Machine {
-    // Before the context, which has to outlive them.
-    machines: FxHashMap<Optimization, TargetMachine>,
+    // Before the context, which has to outlive them and their passes.
+    machines: FxHashMap<Optimization, Machinery>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -979,7 +1045,7 @@ impl Machine {
 
     fn with<T>(
         optimization: Optimization,
-        work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
+        work: impl FnOnce(&Context, &Machinery) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
             static MACHINE: RefCell<Machine> = RefCell::default();
@@ -991,7 +1057,7 @@ impl Machine {
             this.modules += 1;
             let machine = match this.machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),
-                Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
+                Entry::Vacant(slot) => slot.insert(Machinery::new(Self::create(optimization)?)),
             };
             let context = this.context.get_or_insert_with(diagnosed);
             DIAGNOSED.with_borrow_mut(Vec::clear);
@@ -1216,7 +1282,7 @@ impl fmt::Display for Unhandled {
 
 #[cfg(test)]
 mod tests {
-    use inkwell::{memory_buffer::MemoryBuffer, values::AnyValue};
+    use inkwell::{memory_buffer::MemoryBuffer, passes::PassBuilderOptions, values::AnyValue};
 
     use super::*;
 
@@ -1291,7 +1357,7 @@ define void @"blaze.own"(ptr %to, i64 %from) {
 
     fn exported(context: &Context, text: &str, funcs: Vec<u32>, id: u32) -> Import {
         let export = super::super::imports::Export {
-            bitcode: parsed(context, text).write_bitcode_to_memory().as_slice().to_vec(),
+            bitcode: parsed(context, text).write_bitcode_to_memory().as_slice().into(),
             requests: Default::default(),
             signature: ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV),
             size: 3,
@@ -1350,7 +1416,8 @@ define void @"blaze.own"(ptr %to, i64 %from) {
     #[test]
     fn an_import_is_of_the_compiles_requests_and_built_in() {
         let context = Context::create();
-        let bitcode = parsed(&context, EXPORTED).write_bitcode_to_memory().as_slice().to_vec();
+        let bitcode: std::sync::Arc<[u8]> =
+            parsed(&context, EXPORTED).write_bitcode_to_memory().as_slice().into();
         let export = super::super::imports::Export {
             bitcode,
             requests: Default::default(),
@@ -1551,7 +1618,7 @@ attributes #0 = { alwaysinline }
         let llvm = Context::create();
         let import = |text, id: FuncId| Import {
             export: std::sync::Arc::new(super::super::imports::Export {
-                bitcode: parsed(&llvm, text).write_bitcode_to_memory().as_slice().to_vec(),
+                bitcode: parsed(&llvm, text).write_bitcode_to_memory().as_slice().into(),
                 requests: Default::default(),
                 signature: sig.clone(),
                 size: 2,
@@ -1582,6 +1649,57 @@ attributes #0 = { alwaysinline }
     fn assembly_llvm_cannot_encode_is_an_error() {
         let refused = assemble("mov ah, sil\nret").unwrap_err();
         assert!(refused.contains("can't encode 'ah'"), "{refused}");
+    }
+
+    /// What the kept passes make of a module is what LLVM's own run of the pipeline, with
+    /// everything built for the one call, makes of it, whatever they ran before.
+    #[test]
+    fn kept_passes_do_what_passes_built_for_each_run_do() {
+        let optimization =
+            Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
+        let context = Context::create();
+        let machinery = Machinery::new(Machine::create(optimization).unwrap());
+        let fresh = Machine::create(optimization).unwrap();
+        let pipelines = [
+            optimization.pipeline().unwrap(),
+            Optimization { passes: Passes::Default, ..optimization }.pipeline().unwrap(),
+            super::exported(optimization),
+            "thinlto<O2>",
+            "thinlto<O3>",
+            "default<O1>",
+            REBASED,
+            "elim-avail-extern",
+            "cgscc(function-attrs)",
+            "cgscc(inline,function(sroa,instsimplify,sroa,jump-threading,early-cse<memssa>)),\
+             thinlto<O3>",
+        ];
+        let samples = [EXPORTED, PASSES_AN_ADDRESS, WRITES, SHORT_OF_A_FIXPOINT];
+        for pipeline in pipelines {
+            for slp in [false, true] {
+                // Twice, so that each sample also runs after every other.
+                for _ in 0..2 {
+                    for sample in samples {
+                        let kept = parsed(&context, sample);
+                        machinery.run(&kept, pipeline, slp).unwrap();
+                        let alone = parsed(&context, sample);
+                        let options = PassBuilderOptions::create();
+                        options.set_loop_slp_vectorization(slp);
+                        alone.run_passes(pipeline, &fresh, options).unwrap();
+                        assert_eq!(
+                            kept.print_to_string().to_string(),
+                            alone.print_to_string().to_string(),
+                            "{pipeline}, slp {slp}"
+                        );
+                    }
+                }
+            }
+        }
+        // A module of another context is refused, not run.
+        let other = Context::create();
+        assert!(machinery.run(&parsed(&other, WRITES), "thinlto<O2>", false).is_err());
+        // A pipeline LLVM cannot parse is an error, and the passes work after it.
+        assert!(machinery.run(&parsed(&context, WRITES), "no-such-pass", false).is_err());
+        machinery.run(&parsed(&context, WRITES), "thinlto<O2>", false).unwrap();
     }
 
     #[test]

@@ -1,34 +1,46 @@
 //! [`ExpressionStore`], [`Body`] and their source maps as [`blaze_format`] buffers
 //! (docs/v2/plan/lanes/format.md section 5), in the encoding of [`crate::hir::persist`].
 //!
-//! A store's buffer is one [`Node`] column per arena, its side tables as columns of plain
-//! records, and the words every node's fields are written in. Its source map is a buffer of its
-//! own, so that spans stay out of what is hashed: the maps back from an id to its syntax as
-//! dense columns of [`Src`], everything else in words, hash maps sorted by key so that equal
-//! maps are equal bytes.
+//! A store's expressions and patterns are written as the columns they are in memory
+//! ([`HirColumns`]): the kind bytes, the data words, `extra` and the list arrays copied as they
+//! are, the statements, arms and record fields as records of words (a field's name a [`Str`]),
+//! and the cold side tables (names, paths, literals, generic args, `offset_of!`, `asm!`) in the
+//! words, as [`Code`] writes them. Type refs are written the same way, as the columns of
+//! [`TypeColumns`]: kinds, data words, `extra` and the list array copied, the side tables
+//! (bounds, paths, references, arrays, fn pointers, type params) in the words. Bindings, labels
+//! and lifetimes are one [`Node`] column per arena, their fields in the same words. Its source
+//! map is a buffer of its own, so that spans stay out of what is hashed: the maps back from an
+//! id to its syntax as dense columns of [`Src`], the maps from syntax to an id as two columns
+//! each, the keys as [`Src`]s in the [`SourceTable`]'s order and the ids beside them, and
+//! everything else in words.
 //!
-//! What is read from a buffer is checked before it is used: a node's kind and where its fields
-//! begin, each column's ids, when the buffer is read; each id in a node's fields, when it is
-//! decoded. An id past the arena it indexes is a [`FormatError::Invalid`], never a later panic.
-//! The ids of a source map index its store, which is another buffer: they are not checked.
+//! What is read from a buffer is checked before it is used: each kind and each column's ids,
+//! and the order of each source table's keys, when the buffer is read; each id in a record or a
+//! side table, and the columns as a whole ([`HirColumns::check`], [`TypeColumns::check`]), when
+//! it is decoded. An id past the arena it indexes is a [`FormatError::Invalid`], never a later
+//! panic. The ids of a source map index its store, which is another buffer: they are not
+//! checked.
 
-use std::{hash::Hash, mem::offset_of};
+use std::mem::{offset_of, size_of};
 
-use blaze_format::{FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
+};
 use cfg::{CfgAtom, CfgOptions};
 use either::Either;
 use hir_expand::{
-    HirFileId, InFile, MacroCallStyles, MacroDefId, MacroDefKind,
+    HirFileId, InFile, MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
+    name::Name,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
-use intern::sym;
+use intern::{Symbol, sym};
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
-use span::{Edition, SyntaxContext};
+use span::Edition;
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use crate::{
@@ -39,8 +51,8 @@ use crate::{
     expr_store::{
         Body, BodySourceMap, ExprOrPatSource, ExprRoot, ExpressionOnlySourceMap,
         ExpressionOnlyStore, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
-        FormatTemplate, HygieneId, IdTable, LabelSource, LifetimeSource, MissingBodyItemKind, NO_OWNER,
-        TypeSource,
+        ExprSource, FormatTemplate, HygieneId, IdTable, LabelSource, LifetimeSource, MacroCallPtr,
+        MissingBodyItemKind, NO_OWNER, PatSource, SourceTable, TypeSource,
         body::Param,
         path::{
             AssociatedTypeBinding, GenericArg, GenericArgs, GenericArgsParentheses, NormalPath,
@@ -48,18 +60,17 @@ use crate::{
         },
     },
     hir::{
-        ArithOp, Array, AsmOperand, AsmOptions, AsmPiece, BinaryOp, Binding, BindingAnnotation,
-        BindingId, BindingProblems, CaptureBy, ClosureKind, CmpOp, CoroutineKind, CoroutineSource,
-        Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass, Item, Label, LabelId, Literal, LogicOp, LoopSource, MatchArm,
-        Movability, OffsetOf, Pat, PatId, RangeOp, RecordFieldPat, RecordLitField, RecordSpread,
-        Statement, UnaryOp, Unsafe,
-        persist::{Code, Column, Node, Placed, Read, Words, WordsRec},
+        AsmOperand, AsmOptions, AsmPiece, Binding, BindingAnnotation, BindingId, BindingProblems,
+        ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
+        InlineAsmRegOrRegClass, Item, Label, LabelId, Literal, MatchArm, OffsetOf, PatId,
+        RecordFieldPat, RecordLitField, Statement,
+        columns::{self, Frozen, HirColumns},
+        persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
     },
     lang_item::LangItemTarget,
     type_ref::{
-        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
-        RefType, TraitBoundModifier, TypeBound, TypeRef, TypeRefId, UseArgRef,
+        self, ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId,
+        RefType, TraitBoundModifier, TypeBound, TypeColumns, TypeRefId, UseArgRef,
     },
 };
 
@@ -84,14 +95,73 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// The root of an [`ExpressionStore`]'s buffer.
+    /// A [`Statement`]: its kind ([`LET`] to [`MACRO_DEF`]), then its ids, each `Option` as the
+    /// raw id plus one, 0 for `None`. `id` is the pattern of a `let`, the expression of an
+    /// expression statement, or the word a macro definition is written at; a word the kind has
+    /// no use for is 0.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct StatementRec: 1 {
+        pub(crate) kind: u32,
+        pub(crate) id: u32,
+        pub(crate) type_ref: u32,
+        pub(crate) initializer: u32,
+        pub(crate) else_branch: u32,
+    }
+}
+
+blaze_format::record! {
+    /// A [`MatchArm`], its guard the raw id plus one, 0 for none.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct ArmRec: 1 {
+        pub(crate) pat: u32,
+        pub(crate) guard: u32,
+        pub(crate) expr: u32,
+    }
+}
+
+blaze_format::record! {
+    /// A [`RecordLitField`] (`id` its expression) or a [`RecordFieldPat`] (`id` its pattern).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct FieldRec: 1 {
+        pub(crate) name: Str,
+        pub(crate) id: u32,
+    }
+}
+
+/// [`StatementRec::kind`]s.
+const LET: u32 = 0;
+const SUPER_LET: u32 = 1;
+const EXPR: u32 = 2;
+const EXPR_SEMI: u32 = 3;
+const OTHER_ITEM: u32 = 4;
+const MACRO_DEF: u32 = 5;
+
+blaze_format::record! {
+    /// The root of an [`ExpressionStore`]'s buffer: [`HirColumns`] and [`TypeColumns`] as they
+    /// are in memory, each id a raw `u32`, the side tables in the words from `side` and
+    /// `ty_side` on.
     #[derive(Clone, Copy)]
-    pub(crate) struct StoreRoot: 1 {
-        pub(crate) exprs: Slice<Node>,
-        pub(crate) pats: Slice<Node>,
+    pub(crate) struct StoreRoot: 3 {
+        pub(crate) expr_kind: Slice<u8>,
+        pub(crate) expr_data: Slice<u32>,
+        pub(crate) pat_kind: Slice<u8>,
+        pub(crate) pat_data: Slice<u32>,
+        pub(crate) extra: Slice<u32>,
+        pub(crate) expr_lists: Slice<u32>,
+        pub(crate) pat_lists: Slice<u32>,
+        pub(crate) statements: Slice<StatementRec>,
+        pub(crate) arms: Slice<ArmRec>,
+        pub(crate) record_fields: Slice<FieldRec>,
+        pub(crate) field_pats: Slice<FieldRec>,
+        /// Each `Option<TypeRefId>` as the raw id plus one, 0 for `None`.
+        pub(crate) type_lists: Slice<u32>,
         pub(crate) bindings: Slice<Node>,
         pub(crate) labels: Slice<Node>,
-        pub(crate) types: Slice<Node>,
+        pub(crate) ty_kind: Slice<u8>,
+        pub(crate) ty_data: Slice<u32>,
+        pub(crate) ty_extra: Slice<u32>,
+        /// The tuples' element ids, raw.
+        pub(crate) ty_lists: Slice<u32>,
         pub(crate) lifetimes: Slice<Node>,
         /// The owner of each binding, or [`NO_OWNER`]; empty when the top level owns them all.
         pub(crate) binding_owners: Slice<u32>,
@@ -106,6 +176,12 @@ blaze_format::record! {
         /// The type and the syntax context, by type in increasing order.
         pub(crate) type_hygiene: Slice<IdPair>,
         pub(crate) words: WordsRec,
+        /// The word the side tables begin at: names, paths, literals, generic args,
+        /// `offset_of!`s and `asm!`s, each a count and its values.
+        pub(crate) side: u32,
+        /// The word the type side tables begin at: bounds, paths, references, arrays, fn
+        /// pointers and type params, each a count and its values.
+        pub(crate) ty_side: u32,
         /// [`HAS_EXPRS`] and [`HAS_TYPE_HYGIENE`].
         pub(crate) flags: u32,
     }
@@ -114,7 +190,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// The root of a [`Body`]'s buffer.
     #[derive(Clone, Copy)]
-    pub(crate) struct BodyRoot: 1 {
+    pub(crate) struct BodyRoot: 3 {
         pub(crate) store: StoreRoot,
         /// Each parameter's formal and user-written pattern.
         pub(crate) params: Slice<IdPair>,
@@ -139,13 +215,28 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// The root of an [`ExpressionStoreSourceMap`]'s buffer. The back maps are dense, by id.
+    /// Each [`SourceTable`] is its keys, in strictly increasing order of [`Src::key`], and the
+    /// value of each beside it: an id raw (a packed one for expressions and patterns), a macro
+    /// call's salsa id as its bits.
     #[derive(Clone, Copy)]
-    pub(crate) struct SourceMapRoot: 1 {
+    pub(crate) struct SourceMapRoot: 2 {
         pub(crate) expr_map_back: Slice<Src>,
         pub(crate) pat_map_back: Slice<Src>,
         pub(crate) label_map_back: Slice<Src>,
         pub(crate) types_map_back: Slice<Src>,
         pub(crate) lifetime_map_back: Slice<Src>,
+        pub(crate) expr_map: Slice<Src>,
+        pub(crate) expr_map_ids: Slice<u32>,
+        pub(crate) pat_map: Slice<Src>,
+        pub(crate) pat_map_ids: Slice<u32>,
+        pub(crate) label_map: Slice<Src>,
+        pub(crate) label_map_ids: Slice<u32>,
+        pub(crate) types_map: Slice<Src>,
+        pub(crate) types_map_ids: Slice<u32>,
+        pub(crate) lifetime_map: Slice<Src>,
+        pub(crate) lifetime_map_ids: Slice<u32>,
+        pub(crate) expansions: Slice<Src>,
+        pub(crate) expansion_calls: Slice<u64>,
         pub(crate) words: WordsRec,
         /// [`HAS_EXPRS`].
         pub(crate) flags: u32,
@@ -155,7 +246,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// The root of a [`BodySourceMap`]'s buffer.
     #[derive(Clone, Copy)]
-    pub(crate) struct BodySourceMapRoot: 1 {
+    pub(crate) struct BodySourceMapRoot: 2 {
         pub(crate) store: SourceMapRoot,
         /// The pointer to `self`, when there is one.
         pub(crate) self_param: Slice<Src>,
@@ -190,8 +281,28 @@ macro_rules! kinds {
     )*};
 }
 
+/// Asserts each variant of `ours` has the number of the same variant of `theirs`: a kind
+/// read in place from a buffer is the byte of the column it was copied from.
+macro_rules! same_numbers {
+    ($($ours:ident = $theirs:path { $($variant:ident),* $(,)? })*) => {$(
+        const _: () = {
+            $(::core::assert!(
+                $ours::$variant as u8 == <$theirs>::$variant as u8,
+                ::core::concat!(
+                    ::core::stringify!($ours), "::", ::core::stringify!($variant),
+                    " is not the column's number",
+                ),
+            );)*
+            ::core::assert!(
+                $ours::ALL.len() == [$($ours::$variant),*].len(),
+                ::core::concat!(::core::stringify!($ours), " is not listed whole"),
+            );
+        };
+    )*};
+}
+
 kinds! {
-    /// Which [`Expr`] variant a node of a buffer is, read in place.
+    /// Which [`crate::hir::Expr`] variant an expression of a buffer is, read in place.
     ExprKind {
         Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
         Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
@@ -199,13 +310,13 @@ kinds! {
         IncludeBytes,
     }
 
-    /// Which [`Pat`] variant a node of a buffer is, read in place.
+    /// Which [`crate::hir::Pat`] variant a pattern of a buffer is, read in place.
     PatKind {
         Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
         Box, Deref, NotNull, Expr,
     }
 
-    /// Which [`TypeRef`] variant a node of a buffer is, read in place.
+    /// Which [`type_ref::TypeRef`] variant a type of a buffer is, read in place.
     TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
         TypeParam, PatternType, Error,
@@ -214,6 +325,23 @@ kinds! {
     /// Which [`LifetimeRef`] variant a node of a buffer is, read in place.
     LifetimeRefKind {
         Named, Static, Placeholder, Param, Error,
+    }
+}
+
+same_numbers! {
+    ExprKind = columns::ExprKind {
+        Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
+        Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
+        Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
+        IncludeBytes,
+    }
+    PatKind = columns::PatKind {
+        Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
+        Box, Deref, NotNull, Expr,
+    }
+    TypeRefKind = type_ref::TypeRefKind {
+        Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
+        TypeParam, PatternType, Error,
     }
 }
 
@@ -269,16 +397,24 @@ fn check_nodes(
     })
 }
 
+fn check_kinds(
+    kinds: &[u8],
+    count: usize,
+    buffer: &[u8],
+    what: &'static str,
+) -> Result<(), FormatError> {
+    match kinds.iter().find(|&&kind| kind as usize >= count) {
+        Some(kind) => Err(FormatError::Invalid { at: at_of(kind, buffer), what }),
+        None => Ok(()),
+    }
+}
+
 fn hygiene_bits(hygiene: HygieneId) -> u32 {
     hygiene.0.into_u32()
 }
 
 fn hygiene_of(bits: u32) -> HygieneId {
-    debug_assert_ne!(bits, u32::MAX, "checked when the buffer was read");
-    // SAFETY: `bits` is what `into_u32` gave for a context of the database that wrote the
-    // buffer, which is the one reading it (`crate::hir::persist`'s docs); `u32::MAX`, which
-    // `from_u32` refuses, was refused when the buffer was read.
-    HygieneId(unsafe { SyntaxContext::from_u32(bits) })
+    HygieneId(syntax_context(bits).expect("a syntax context of u32::MAX, refused when the buffer was read"))
 }
 
 fn packed_bits(id: ExprOrPatIdPacked) -> u32 {
@@ -292,9 +428,24 @@ fn packed_bits(id: ExprOrPatIdPacked) -> u32 {
 fn packed_of(bits: u32) -> ExprOrPatIdPacked {
     const PAT_BIT: u32 = 1 << (u32::BITS - 1);
     match bits & PAT_BIT {
-        0 => ExprOrPatIdPacked::from(idx::<Expr>(bits)),
-        _ => ExprOrPatIdPacked::from(idx::<Pat>(bits & !PAT_BIT)),
+        0 => {
+            let expr: ExprId = idx(bits);
+            ExprOrPatIdPacked::from(expr)
+        }
+        _ => {
+            let pat: PatId = idx(bits & !PAT_BIT);
+            ExprOrPatIdPacked::from(pat)
+        }
     }
+}
+
+/// An optional id as a word: the raw id plus one, 0 for `None`.
+fn opt_raw<T>(id: Option<Idx<T>>) -> u32 {
+    id.map_or(0, |id| raw(id) + 1)
+}
+
+fn opt_idx<T>(word: u32) -> Option<Idx<T>> {
+    word.checked_sub(1).map(idx)
 }
 
 fn edition_of(bits: u32) -> Option<Edition> {
@@ -326,34 +477,6 @@ fn get_bytes(r: &mut Read<'_>) -> Result<Box<[u8]>, FormatError> {
     }
     bytes.truncate(len);
     Ok(bytes.into_boxed_slice())
-}
-
-/// Writes `map`'s entries in increasing order of `key`, which differs for different keys.
-fn put_hash<K: Code, V: Code, S: Ord>(
-    w: &mut Words,
-    map: &FxHashMap<K, V>,
-    key: impl Fn(&K) -> S,
-) {
-    let mut entries: Vec<(&K, &V)> = map.iter().collect();
-    entries.sort_unstable_by_key(|&(k, _)| key(k));
-    w.len(entries.len());
-    for (k, v) in entries {
-        k.put(w);
-        v.put(w);
-    }
-}
-
-fn get_hash<K: Code + Eq + Hash, V: Code>(r: &mut Read<'_>) -> Result<FxHashMap<K, V>, FormatError> {
-    let len = r.len()?;
-    let mut map = FxHashMap::default();
-    map.reserve(len);
-    for _ in 0..len {
-        let (k, v) = (K::get(r)?, V::get(r)?);
-        if map.insert(k, v).is_some() {
-            return Err(r.invalid("a key twice in one map"));
-        }
-    }
-    Ok(map)
 }
 
 /// Writes `table` in its order, which is by id.
@@ -411,14 +534,13 @@ fn file_bits(file: HirFileId) -> (u32, u64) {
     }
 }
 
-/// The order the keys of a map of syntax pointers are written in.
-fn src_key<N: AstNode>(src: &InFile<AstPtr<N>>) -> (u32, u64, u32, u32, u16) {
-    let (file_kind, file) = file_bits(src.file_id);
-    let range = src.value.text_range();
-    (file_kind, file, range.start().into(), range.end().into(), src.value.kind().into())
-}
-
 impl Src {
+    /// The order of a [`SourceTable`]'s keys: the file (files before macro files, each by its
+    /// salsa id), the range, the syntax kind.
+    fn key(&self) -> (u32, u64, u32, u32, u32) {
+        (self.file_kind, self.file, self.start, self.end, self.kind)
+    }
+
     fn of<N: AstNode>(src: &InFile<AstPtr<N>>) -> Src {
         let (file_kind, file) = file_bits(src.file_id);
         let range = src.value.text_range();
@@ -488,14 +610,74 @@ fn back_map<T, N: AstNode>(
     Ok(map)
 }
 
+/// A [`SourceTable`]'s keys and the word of each value, in the table's order.
+fn table_columns<N: AstNode, V, W>(
+    table: &SourceTable<InFile<AstPtr<N>>, V>,
+    word: impl Fn(&V) -> W,
+) -> (Vec<Src>, Vec<W>) {
+    let (keys, words): (Vec<Src>, Vec<W>) =
+        table.entries().iter().map(|(src, value)| (Src::of(src), word(value))).unzip();
+    debug_assert!(
+        keys.windows(2).all(|pair| pair[0].key() < pair[1].key()),
+        "a source table not in the order of `Src::key`, which no reader accepts"
+    );
+    (keys, words)
+}
+
+/// Checks a [`SourceTable`]'s columns in place: a value for each key, each key a pointer of its
+/// type, the keys in strictly increasing order of [`Src::key`].
+fn check_table<N: AstNode, W>(
+    keys: &[Src],
+    values: &[W],
+    root: &SourceMapRoot,
+    buffer: &[u8],
+) -> Result<(), FormatError> {
+    let paired = keys.len() == values.len();
+    ensure(paired, root, buffer, "a source table that is not one value for each key")?;
+    for src in keys {
+        let found =
+            src.get::<N>().map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
+        ensure(found.is_some(), src, buffer, "an empty key in a source table")?;
+    }
+    keys.windows(2).try_for_each(|pair| {
+        let ordered = pair[0].key() < pair[1].key();
+        ensure(ordered, &pair[1], buffer, "a source table out of order, or a key twice")
+    })
+}
+
+/// The [`SourceTable`] of columns [`check_table`] accepted, in their order.
+fn source_table<N: AstNode, W: Copy, V>(
+    keys: &[Src],
+    values: &[W],
+    buffer: &[u8],
+    value: impl Fn(W) -> V,
+) -> Result<SourceTable<InFile<AstPtr<N>>, V>, FormatError> {
+    let entries = (keys.iter().zip(values))
+        .map(|(src, &word)| {
+            let at = at_of(src, buffer);
+            let found = src.get::<N>().map_err(|what| FormatError::Invalid { at, what })?;
+            let found =
+                found.ok_or(FormatError::Invalid { at, what: "an empty key in a source table" })?;
+            Ok((found, value(word)))
+        })
+        .collect::<Result<Box<[_]>, FormatError>>()?;
+    let at = keys.first().map_or(0, |src| at_of(src, buffer));
+    SourceTable::from_sorted(entries)
+        .ok_or(FormatError::Invalid { at, what: "a source table out of order, or a key twice" })
+}
+
+/// The word of `src`'s value in a [`SourceTable`]'s checked columns, by binary search.
+fn table_get<N: AstNode, W: Copy>(keys: &[Src], values: &[W], src: &InFile<AstPtr<N>>) -> Option<W> {
+    let at = keys.binary_search_by_key(&Src::of(src).key(), Src::key).ok()?;
+    values.get(at).copied()
+}
+
 /// The ids a store's nodes may name: what each of its arenas holds.
 struct Ids<'s> {
     exprs: u32,
     pats: u32,
-    bindings: u32,
-    labels: u32,
     lifetimes: u32,
-    types: &'s Arena<TypeRef>,
+    types: &'s TypeColumns<Frozen>,
 }
 
 type Checked = Result<(), &'static str>;
@@ -516,28 +698,8 @@ impl Ids<'_> {
         expr.map_or(Ok(()), |expr| self.expr(expr))
     }
 
-    fn exprs(&self, exprs: &[ExprId]) -> Checked {
-        exprs.iter().try_for_each(|&expr| self.expr(expr))
-    }
-
     fn pat(&self, pat: PatId) -> Checked {
         below(raw(pat), self.pats, "a pattern id past its arena")
-    }
-
-    fn pat_opt(&self, pat: Option<PatId>) -> Checked {
-        pat.map_or(Ok(()), |pat| self.pat(pat))
-    }
-
-    fn pats(&self, pats: &[PatId]) -> Checked {
-        pats.iter().try_for_each(|&pat| self.pat(pat))
-    }
-
-    fn binding(&self, binding: BindingId) -> Checked {
-        below(raw(binding), self.bindings, "a binding id past its arena")
-    }
-
-    fn label_opt(&self, label: Option<LabelId>) -> Checked {
-        label.map_or(Ok(()), |label| below(raw(label), self.labels, "a label id past its arena"))
     }
 
     fn lifetime(&self, lifetime: LifetimeRefId) -> Checked {
@@ -545,7 +707,7 @@ impl Ids<'_> {
     }
 
     fn ty(&self, ty: TypeRefId) -> Checked {
-        below(raw(ty), self.types.len() as u32, "a type id past its arena")
+        below(raw(ty), self.types.kind.len() as u32, "a type id past its arena")
     }
 
     fn ty_opt(&self, ty: Option<TypeRefId>) -> Checked {
@@ -553,10 +715,10 @@ impl Ids<'_> {
     }
 
     fn path_id(&self, path: PathId) -> Checked {
-        self.ty(path.type_ref())?;
-        match self.types[path.type_ref()] {
-            TypeRef::Path(_) => Ok(()),
-            _ => Err("a path id of a type that is not a path"),
+        match self.types.kind.get(raw(path.type_ref()) as usize) {
+            Some(&kind) if kind == TypeRefKind::Path as u8 => Ok(()),
+            Some(_) => Err("a path id of a type that is not a path"),
+            None => Err("a type id past its arena"),
         }
     }
 
@@ -613,161 +775,44 @@ impl Ids<'_> {
         }
     }
 
-    fn expr_node(&self, expr: &Expr) -> Checked {
-        match expr {
-            Expr::Missing | Expr::Literal(_) | Expr::Underscore | Expr::IncludeBytes => Ok(()),
-            Expr::Path(path) => self.path(path),
-            &Expr::If { condition, then_branch, else_branch } => {
-                self.expr(condition)?;
-                self.expr(then_branch)?;
-                self.expr_opt(else_branch)
+    fn asm(&self, asm: &InlineAsm) -> Checked {
+        asm.operands.iter().try_for_each(|(_, operand)| match operand {
+            &AsmOperand::In { reg: _, expr }
+            | &AsmOperand::InOut { reg: _, expr, late: _ }
+            | &AsmOperand::Label(expr)
+            | &AsmOperand::Const(expr) => self.expr(expr),
+            &AsmOperand::Out { reg: _, expr, late: _ } => self.expr_opt(expr),
+            &AsmOperand::SplitInOut { reg: _, in_expr, out_expr, late: _ } => {
+                self.expr(in_expr)?;
+                self.expr_opt(out_expr)
             }
-            &Expr::Let { pat, expr } => {
-                self.pat(pat)?;
-                self.expr(expr)
-            }
-            Expr::Block { id: _, statements, tail, label, unsafe_: _ } => {
-                statements.iter().try_for_each(|statement| self.statement(statement))?;
-                self.expr_opt(*tail)?;
-                self.label_opt(*label)
-            }
-            &Expr::Const(expr)
-            | &Expr::Become { expr }
-            | &Expr::Field { expr, name: _ }
-            | &Expr::Await { expr }
-            | &Expr::Ref { expr, rawness: _, mutability: _ }
-            | &Expr::UnaryOp { expr, op: _ } => self.expr(expr),
-            &Expr::Loop { body, label, source: _ } => {
-                self.expr(body)?;
-                self.label_opt(label)
-            }
-            Expr::Call { callee, args } => {
-                self.expr(*callee)?;
-                self.exprs(args)
-            }
-            Expr::MethodCall { receiver, method_name: _, args, generic_args } => {
-                self.expr(*receiver)?;
-                self.exprs(args)?;
-                generic_args.iter().try_for_each(|args| self.generic_args(args))
-            }
-            Expr::Match { expr, arms } => {
-                self.expr(*expr)?;
-                arms.iter().try_for_each(|&MatchArm { pat, guard, expr }| {
-                    self.pat(pat)?;
-                    self.expr_opt(guard)?;
-                    self.expr(expr)
-                })
-            }
-            &Expr::Continue { label } => self.label_opt(label),
-            &Expr::Break { expr, label } => {
-                self.expr_opt(expr)?;
-                self.label_opt(label)
-            }
-            &Expr::Return { expr } | &Expr::Yield { expr } | &Expr::Yeet { expr } => {
-                self.expr_opt(expr)
-            }
-            Expr::RecordLit { path, fields, spread } => {
-                self.path(path)?;
-                fields.iter().try_for_each(|field| self.expr(field.expr))?;
-                match *spread {
-                    RecordSpread::Expr(expr) => self.expr(expr),
-                    RecordSpread::None | RecordSpread::FieldDefaults => Ok(()),
-                }
-            }
-            &Expr::Cast { expr, type_ref } => {
-                self.expr(expr)?;
-                self.ty(type_ref)
-            }
-            &Expr::BinaryOp { lhs, rhs, op: _ } | &Expr::Index { base: lhs, index: rhs } => {
-                self.expr(lhs)?;
-                self.expr(rhs)
-            }
-            &Expr::Assignment { target, value } => {
-                self.pat(target)?;
-                self.expr(value)
-            }
-            Expr::Closure { args, arg_types, ret_type, body, closure_kind: _, capture_by: _ } => {
-                self.pats(args)?;
-                arg_types.iter().try_for_each(|&ty| self.ty_opt(ty))?;
-                self.ty_opt(*ret_type)?;
-                self.expr(*body)
-            }
-            Expr::Tuple { exprs } => self.exprs(exprs),
-            Expr::Array(Array::ElementList { elements }) => self.exprs(elements),
-            &Expr::Array(Array::Repeat { initializer, repeat }) => {
-                self.expr(initializer)?;
-                self.expr(repeat)
-            }
-            Expr::OffsetOf(OffsetOf { container, fields: _ }) => self.ty(*container),
-            Expr::InlineAsm(asm) => asm.operands.iter().try_for_each(|(_, operand)| match operand {
-                &AsmOperand::In { reg: _, expr }
-                | &AsmOperand::InOut { reg: _, expr, late: _ }
-                | &AsmOperand::Label(expr)
-                | &AsmOperand::Const(expr) => self.expr(expr),
-                &AsmOperand::Out { reg: _, expr, late: _ } => self.expr_opt(expr),
-                &AsmOperand::SplitInOut { reg: _, in_expr, out_expr, late: _ } => {
-                    self.expr(in_expr)?;
-                    self.expr_opt(out_expr)
-                }
-                AsmOperand::Sym(path) => self.path(path),
-            }),
-        }
+            AsmOperand::Sym(path) => self.path(path),
+        })
     }
 
-    fn pat_node(&self, pat: &Pat) -> Checked {
-        match pat {
-            Pat::Missing | Pat::Rest | Pat::Wild | Pat::NotNull => Ok(()),
-            Pat::Tuple { args, ellipsis: _ } | Pat::Or(args) => self.pats(args),
-            Pat::Record { path, args, ellipsis: _ } => {
-                self.path(path)?;
-                args.iter().try_for_each(|field| self.pat(field.pat))
-            }
-            &Pat::Range { start, end, range_type: _ } => {
-                self.expr_opt(start)?;
-                self.expr_opt(end)
-            }
-            Pat::Slice { prefix, slice, suffix } => {
-                self.pats(prefix)?;
-                self.pat_opt(*slice)?;
-                self.pats(suffix)
-            }
-            Pat::Path(path) => self.path(path),
-            &Pat::Lit(expr) | &Pat::Expr(expr) => self.expr(expr),
-            &Pat::Bind { id, subpat } => {
-                self.binding(id)?;
-                self.pat_opt(subpat)
-            }
-            Pat::TupleStruct { path, args, ellipsis: _ } => {
-                self.path(path)?;
-                self.pats(args)
-            }
-            &Pat::Ref { pat, mutability: _ } | &Pat::Box { inner: pat } | &Pat::Deref { inner: pat } => {
-                self.pat(pat)
-            }
-        }
+    /// The ids the side tables' values hold, which [`HirColumns::check`] does not look into.
+    fn side_tables(&self, side: &SideTables) -> Checked {
+        side.paths.iter().try_for_each(|path| self.path(path))?;
+        side.generic_args.iter().try_for_each(|args| self.generic_args(args))?;
+        side.offset_ofs.iter().try_for_each(|offset_of| self.ty(offset_of.container))?;
+        side.asms.iter().try_for_each(|asm| self.asm(asm))
     }
 
-    fn type_node(&self, ty: &TypeRef) -> Checked {
-        match ty {
-            TypeRef::Never | TypeRef::Placeholder | TypeRef::TypeParam(_) | TypeRef::Error => Ok(()),
-            TypeRef::Tuple(types) => types.iter().try_for_each(|&ty| self.ty(ty)),
-            TypeRef::Path(path) => self.path(path),
-            &TypeRef::RawPtr(ty, _) | &TypeRef::Slice(ty) => self.ty(ty),
-            TypeRef::Reference(reference) => {
-                self.ty(reference.ty)?;
-                reference.lifetime.map_or(Ok(()), |lifetime| self.lifetime(lifetime))
-            }
-            TypeRef::Array(ArrayType { ty, len: ConstRef { expr } }) => {
-                self.ty(*ty)?;
-                self.expr(*expr)
-            }
-            TypeRef::Fn(fn_type) => fn_type.params.iter().try_for_each(|&(_, ty)| self.ty(ty)),
-            TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => self.bounds(bounds),
-            &TypeRef::PatternType(ty, pat) => {
-                self.ty(ty)?;
-                self.pat(pat)
-            }
-        }
+    /// The ids the type side tables' values and the tuples' lists hold, which
+    /// [`TypeColumns::check`] does not look into.
+    fn type_side(&self, types: &TypeColumns<Frozen>) -> Checked {
+        types.lists.iter().try_for_each(|&ty| self.ty(ty))?;
+        self.bounds(&types.bounds)?;
+        types.paths.iter().try_for_each(|path| self.path(path))?;
+        types.refs.iter().try_for_each(|reference| {
+            self.ty(reference.ty)?;
+            reference.lifetime.map_or(Ok(()), |lifetime| self.lifetime(lifetime))
+        })?;
+        types.arrays.iter().try_for_each(|&ArrayType { ty, len: ConstRef { expr } }| {
+            self.ty(ty)?;
+            self.expr(expr)
+        })?;
+        (types.fns.iter()).try_for_each(|fn_type| fn_type.params.iter().try_for_each(|&(_, ty)| self.ty(ty)))
     }
 }
 
@@ -805,30 +850,256 @@ fn arena<T, K>(
     Ok(arena)
 }
 
-/// Checks each value of `arena` with `check`, refusing it at its node.
-fn check_arena<T>(
-    arena: &Arena<T>,
-    nodes: &[Node],
+fn only_kind(kind: u32) -> Option<()> {
+    (kind == 0).then_some(())
+}
+
+/// A column of `hir`, empty for a store without expressions.
+fn slice<'c, T>(
+    hir: Option<&'c HirColumns<Frozen>>,
+    column: impl FnOnce(&'c HirColumns<Frozen>) -> &'c [T],
+) -> &'c [T] {
+    hir.map_or(&[][..], column)
+}
+
+/// The cold side tables of [`HirColumns`], read back from the words.
+struct SideTables {
+    names: Vec<Name>,
+    paths: Vec<Path>,
+    literals: Vec<Literal>,
+    generic_args: Vec<GenericArgs>,
+    offset_ofs: Vec<OffsetOf>,
+    asms: Vec<InlineAsm>,
+}
+
+impl SideTables {
+    /// Writes the side tables of `hir`, each a count and its values, and returns the word they
+    /// begin at.
+    fn put(w: &mut Words, hir: Option<&HirColumns<Frozen>>) -> u32 {
+        let at = w.at();
+        w.seq(slice(hir, |c| &c.names[..]).iter());
+        w.seq(slice(hir, |c| &c.paths[..]).iter());
+        w.seq(slice(hir, |c| &c.literals[..]).iter());
+        w.seq(slice(hir, |c| &c.generic_args[..]).iter());
+        w.seq(slice(hir, |c| &c.offset_ofs[..]).iter());
+        w.seq(slice(hir, |c| &c.asms[..]).iter());
+        at
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<SideTables, FormatError> {
+        Ok(SideTables {
+            names: r.seq::<Name, _>()?,
+            paths: r.seq::<Path, _>()?,
+            literals: r.seq::<Literal, _>()?,
+            generic_args: r.seq::<GenericArgs, _>()?,
+            offset_ofs: r.seq::<OffsetOf, _>()?,
+            asms: r.seq::<InlineAsm, _>()?,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        let SideTables { names, paths, literals, generic_args, offset_ofs, asms } = self;
+        names.is_empty()
+            && paths.is_empty()
+            && literals.is_empty()
+            && generic_args.is_empty()
+            && offset_ofs.is_empty()
+            && asms.is_empty()
+    }
+}
+
+/// The side tables of [`TypeColumns`], read back from the words.
+struct TypeSide {
+    bounds: Vec<TypeBound>,
+    paths: Vec<Path>,
+    refs: Vec<RefType>,
+    arrays: Vec<ArrayType>,
+    fns: Vec<FnType>,
+    type_params: Vec<TypeParamId>,
+}
+
+impl TypeSide {
+    /// Writes the side tables of `types`, each a count and its values, and returns the word they
+    /// begin at.
+    fn put(w: &mut Words, types: &TypeColumns<Frozen>) -> u32 {
+        let at = w.at();
+        w.seq(types.bounds.iter());
+        w.seq(types.paths.iter());
+        w.seq(types.refs.iter());
+        w.seq(types.arrays.iter());
+        w.seq(types.fns.iter());
+        w.seq(types.type_params.iter());
+        at
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<TypeSide, FormatError> {
+        Ok(TypeSide {
+            bounds: r.seq::<TypeBound, _>()?,
+            paths: r.seq::<Path, _>()?,
+            refs: r.seq::<RefType, _>()?,
+            arrays: r.seq::<ArrayType, _>()?,
+            fns: r.seq::<FnType, _>()?,
+            type_params: r.seq::<TypeParamId, _>()?,
+        })
+    }
+}
+
+/// The names of record fields and field patterns, each text once, for [`FieldRec`]s to point
+/// at.
+#[derive(Default)]
+struct FieldNames {
+    text: String,
+    /// Each name's start in `text` and its length.
+    by_symbol: FxHashMap<Symbol, (u32, u32)>,
+}
+
+impl FieldNames {
+    fn add(&mut self, name: &Name) {
+        let symbol = name.symbol();
+        if self.by_symbol.contains_key(symbol) {
+            return;
+        }
+        let start =
+            u32::try_from(self.text.len()).expect("more than 4 GiB of field names in one buffer");
+        let len = u32::try_from(symbol.as_str().len()).expect("a name of 4 GiB or more");
+        self.text.push_str(symbol.as_str());
+        self.by_symbol.insert(symbol.clone(), (start, len));
+    }
+
+    /// Writes `fields`, each a name and an id, as a column of [`FieldRec`]s, their names in
+    /// this text, which was written at `text_at`.
+    fn column<'f>(
+        &self,
+        out: &mut Writer,
+        text_at: u64,
+        fields: impl Iterator<Item = (&'f Name, u32)>,
+    ) -> Column {
+        let at = out.next::<FieldRec>();
+        let records: Vec<FieldRec> = (fields.enumerate())
+            .map(|(index, (name, id))| {
+                let (start, len) = self.by_symbol[name.symbol()];
+                let field_at =
+                    at + (index * size_of::<FieldRec>() + offset_of!(FieldRec, name)) as u64;
+                let name = match len {
+                    0 => Str::EMPTY,
+                    len => Str::between(field_at, text_at + u64::from(start), len as usize),
+                };
+                FieldRec { name, id }
+            })
+            .collect();
+        let column = Column::push(out, &records);
+        debug_assert_eq!(column.at, at, "`Writer::next` is not where `push_slice` writes");
+        column
+    }
+}
+
+/// The name a [`FieldRec`] holds, which is in `buffer`.
+fn field_name(field: &FieldRec, buffer: &[u8]) -> Result<Name, FormatError> {
+    let text = field.name.as_str(buffer)?;
+    ensure(!text.starts_with("r#"), field, buffer, "a name written with its `r#`")?;
+    Ok(Name::new_symbol_root(Symbol::intern(text)))
+}
+
+/// `statement` as a record, a macro definition it holds written in `w`.
+fn statement_rec(statement: &Statement, w: &mut Words) -> StatementRec {
+    let rec = |kind, id| StatementRec { kind, id, type_ref: 0, initializer: 0, else_branch: 0 };
+    match statement {
+        &Statement::Let { pat, type_ref, initializer, else_branch, is_super } => StatementRec {
+            kind: if is_super { SUPER_LET } else { LET },
+            id: raw(pat),
+            type_ref: opt_raw(type_ref),
+            initializer: opt_raw(initializer),
+            else_branch: opt_raw(else_branch),
+        },
+        &Statement::Expr { expr, has_semi } => {
+            rec(if has_semi { EXPR_SEMI } else { EXPR }, raw(expr))
+        }
+        Statement::Item(Item::Other) => rec(OTHER_ITEM, 0),
+        Statement::Item(Item::MacroDef(def)) => {
+            let at = w.at();
+            w.put(&**def);
+            rec(MACRO_DEF, at)
+        }
+    }
+}
+
+/// The statement `rec` is, which is in `buffer`, a macro definition read from `words`.
+fn statement_of(
+    rec: &StatementRec,
+    words: &Read<'_>,
     buffer: &[u8],
-    check: impl Fn(&T) -> Checked,
-) -> Result<(), FormatError> {
-    arena.values().zip(nodes).try_for_each(|(value, node)| {
-        check(value).map_err(|what| FormatError::Invalid { at: at_of(node, buffer), what })
+) -> Result<Statement, FormatError> {
+    let StatementRec { kind, id, type_ref, initializer, else_branch } = *rec;
+    let unused = |words: &[u32]| {
+        let zeros = words.iter().all(|&word| word == 0);
+        ensure(zeros, rec, buffer, "a statement word its kind has no use for that is not 0")
+    };
+    Ok(match kind {
+        LET | SUPER_LET => Statement::Let {
+            pat: idx(id),
+            type_ref: opt_idx(type_ref),
+            initializer: opt_idx(initializer),
+            else_branch: opt_idx(else_branch),
+            is_super: kind == SUPER_LET,
+        },
+        EXPR | EXPR_SEMI => {
+            unused(&[type_ref, initializer, else_branch])?;
+            Statement::Expr { expr: idx(id), has_semi: kind == EXPR_SEMI }
+        }
+        OTHER_ITEM => {
+            unused(&[id, type_ref, initializer, else_branch])?;
+            Statement::Item(Item::Other)
+        }
+        MACRO_DEF => {
+            unused(&[type_ref, initializer, else_branch])?;
+            Statement::Item(Item::MacroDef(Box::new(words.from(id).get()?)))
+        }
+        _ => {
+            let what = "a statement kind out of range";
+            return Err(FormatError::Invalid { at: at_of(rec, buffer), what });
+        }
     })
 }
 
-fn only_kind(kind: u32) -> Option<()> {
-    (kind == 0).then_some(())
+/// Each value of `records`, which are in `buffer`, as `of` makes it and `check` accepts it.
+fn decoded<R, T>(
+    records: &[R],
+    buffer: &[u8],
+    of: impl Fn(&R) -> Result<T, FormatError>,
+    check: impl Fn(&T) -> Checked,
+) -> Result<Vec<T>, FormatError> {
+    (records.iter())
+        .map(|record| {
+            let value = of(record)?;
+            check(&value).map_err(|what| FormatError::Invalid { at: at_of(record, buffer), what })?;
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Where everything of a store but its root was written.
 struct StoreColumns {
     words: Placed,
-    exprs: Column,
-    pats: Column,
+    side: u32,
+    ty_side: u32,
+    expr_kind: Column,
+    expr_data: Column,
+    pat_kind: Column,
+    pat_data: Column,
+    extra: Column,
+    expr_lists: Column,
+    pat_lists: Column,
+    statements: Column,
+    arms: Column,
+    record_fields: Column,
+    field_pats: Column,
+    type_lists: Column,
     bindings: Column,
     labels: Column,
-    types: Column,
+    ty_kind: Column,
+    ty_data: Column,
+    ty_extra: Column,
+    ty_lists: Column,
     lifetimes: Column,
     binding_owners: Column,
     block_scopes: Column,
@@ -844,23 +1115,49 @@ impl StoreColumns {
     fn write(store: &ExpressionStore, out: &mut Writer) -> StoreColumns {
         let ExpressionStore { expr_only, types, lifetimes, type_hygiene } = store;
         let expr_only = expr_only.as_deref();
+        let hir = expr_only.map(|it| &it.columns);
         let mut w = Words::new();
-        let exprs = column(&mut w, expr_only.into_iter().flat_map(|it| it.exprs.values()), put_expr);
-        let pats = column(&mut w, expr_only.into_iter().flat_map(|it| it.pats.values()), put_pat);
+        let side = SideTables::put(&mut w, hir);
+        let ty_side = TypeSide::put(&mut w, types);
+        let statements: Vec<StatementRec> = (slice(hir, |c| &c.statements[..]).iter())
+            .map(|statement| statement_rec(statement, &mut w))
+            .collect();
         let bindings =
             column(&mut w, expr_only.into_iter().flat_map(|it| it.bindings.values()), put_binding);
         let labels =
             column(&mut w, expr_only.into_iter().flat_map(|it| it.labels.values()), put_label);
-        let types = column(&mut w, types.values(), put_type);
         let lifetimes = column(&mut w, lifetimes.values(), put_lifetime);
         let words = w.place(out);
+
+        let (record_fields, field_pats) =
+            (slice(hir, |c| &c.record_fields[..]), slice(hir, |c| &c.field_pats[..]));
+        let mut names = FieldNames::default();
+        record_fields.iter().for_each(|field| names.add(&field.name));
+        field_pats.iter().for_each(|field| names.add(&field.name));
+        let text_at = out.push_str(&names.text);
+        let record_fields = names.column(
+            out,
+            text_at,
+            record_fields.iter().map(|field| (&field.name, raw(field.expr))),
+        );
+        let field_pats =
+            names.column(out, text_at, field_pats.iter().map(|field| (&field.name, raw(field.pat))));
+        let arms: Vec<ArmRec> = (slice(hir, |c| &c.arms[..]).iter())
+            .map(|arm| ArmRec { pat: raw(arm.pat), guard: opt_raw(arm.guard), expr: raw(arm.expr) })
+            .collect();
+        let expr_lists: Vec<u32> =
+            slice(hir, |c| &c.expr_lists[..]).iter().map(|&expr| raw(expr)).collect();
+        let pat_lists: Vec<u32> =
+            slice(hir, |c| &c.pat_lists[..]).iter().map(|&pat| raw(pat)).collect();
+        let type_lists: Vec<u32> =
+            slice(hir, |c| &c.type_lists[..]).iter().map(|&ty| opt_raw(ty)).collect();
+        let ty_lists: Vec<u32> = types.lists.iter().map(|&ty| raw(ty)).collect();
 
         let (mut binding_owners, mut block_scopes, mut ident_hygiene) = (vec![], vec![], vec![]);
         let (mut block_editions, mut overflow_inheriting, mut expr_roots) = (vec![], vec![], vec![]);
         if let Some(it) = expr_only {
             let ExpressionOnlyStore {
-                exprs: _,
-                pats: _,
+                columns: _,
                 bindings: _,
                 labels: _,
                 binding_owners: owners,
@@ -895,11 +1192,26 @@ impl StoreColumns {
             | (if type_hygiene.is_some() { HAS_TYPE_HYGIENE } else { 0 });
         StoreColumns {
             words,
-            exprs: Column::push(out, &exprs),
-            pats: Column::push(out, &pats),
+            side,
+            ty_side,
+            expr_kind: Column::push(out, slice(hir, |c| &c.expr_kind[..])),
+            expr_data: Column::push(out, slice(hir, |c| &c.expr_data[..])),
+            pat_kind: Column::push(out, slice(hir, |c| &c.pat_kind[..])),
+            pat_data: Column::push(out, slice(hir, |c| &c.pat_data[..])),
+            extra: Column::push(out, slice(hir, |c| &c.extra[..])),
+            expr_lists: Column::push(out, &expr_lists),
+            pat_lists: Column::push(out, &pat_lists),
+            statements: Column::push(out, &statements),
+            arms: Column::push(out, &arms),
+            record_fields,
+            field_pats,
+            type_lists: Column::push(out, &type_lists),
             bindings: Column::push(out, &bindings),
             labels: Column::push(out, &labels),
-            types: Column::push(out, &types),
+            ty_kind: Column::push(out, &types.kind[..]),
+            ty_data: Column::push(out, &types.data[..]),
+            ty_extra: Column::push(out, &types.extra[..]),
+            ty_lists: Column::push(out, &ty_lists),
             lifetimes: Column::push(out, &lifetimes),
             binding_owners: Column::push(out, &binding_owners),
             block_scopes: Column::push(out, &block_scopes),
@@ -916,11 +1228,24 @@ impl StoreColumns {
     fn rec(&self, at: u64) -> StoreRoot {
         let field = |offset: usize| at + offset as u64;
         StoreRoot {
-            exprs: self.exprs.slice(field(offset_of!(StoreRoot, exprs))),
-            pats: self.pats.slice(field(offset_of!(StoreRoot, pats))),
+            expr_kind: self.expr_kind.slice(field(offset_of!(StoreRoot, expr_kind))),
+            expr_data: self.expr_data.slice(field(offset_of!(StoreRoot, expr_data))),
+            pat_kind: self.pat_kind.slice(field(offset_of!(StoreRoot, pat_kind))),
+            pat_data: self.pat_data.slice(field(offset_of!(StoreRoot, pat_data))),
+            extra: self.extra.slice(field(offset_of!(StoreRoot, extra))),
+            expr_lists: self.expr_lists.slice(field(offset_of!(StoreRoot, expr_lists))),
+            pat_lists: self.pat_lists.slice(field(offset_of!(StoreRoot, pat_lists))),
+            statements: self.statements.slice(field(offset_of!(StoreRoot, statements))),
+            arms: self.arms.slice(field(offset_of!(StoreRoot, arms))),
+            record_fields: self.record_fields.slice(field(offset_of!(StoreRoot, record_fields))),
+            field_pats: self.field_pats.slice(field(offset_of!(StoreRoot, field_pats))),
+            type_lists: self.type_lists.slice(field(offset_of!(StoreRoot, type_lists))),
             bindings: self.bindings.slice(field(offset_of!(StoreRoot, bindings))),
             labels: self.labels.slice(field(offset_of!(StoreRoot, labels))),
-            types: self.types.slice(field(offset_of!(StoreRoot, types))),
+            ty_kind: self.ty_kind.slice(field(offset_of!(StoreRoot, ty_kind))),
+            ty_data: self.ty_data.slice(field(offset_of!(StoreRoot, ty_data))),
+            ty_extra: self.ty_extra.slice(field(offset_of!(StoreRoot, ty_extra))),
+            ty_lists: self.ty_lists.slice(field(offset_of!(StoreRoot, ty_lists))),
             lifetimes: self.lifetimes.slice(field(offset_of!(StoreRoot, lifetimes))),
             binding_owners: self.binding_owners.slice(field(offset_of!(StoreRoot, binding_owners))),
             block_scopes: self.block_scopes.slice(field(offset_of!(StoreRoot, block_scopes))),
@@ -931,6 +1256,8 @@ impl StoreColumns {
             expr_roots: self.expr_roots.slice(field(offset_of!(StoreRoot, expr_roots))),
             type_hygiene: self.type_hygiene.slice(field(offset_of!(StoreRoot, type_hygiene))),
             words: self.words.rec(field(offset_of!(StoreRoot, words))),
+            side: self.side,
+            ty_side: self.ty_side,
             flags: self.flags,
         }
     }
@@ -941,11 +1268,24 @@ impl StoreColumns {
 pub struct ExpressionStoreRef<'a> {
     buffer: &'a [u8],
     root: &'a StoreRoot,
-    exprs: &'a [Node],
-    pats: &'a [Node],
+    expr_kind: &'a [u8],
+    expr_data: &'a [u32],
+    pat_kind: &'a [u8],
+    pat_data: &'a [u32],
+    extra: &'a [u32],
+    expr_lists: &'a [u32],
+    pat_lists: &'a [u32],
+    statements: &'a [StatementRec],
+    arms: &'a [ArmRec],
+    record_fields: &'a [FieldRec],
+    field_pats: &'a [FieldRec],
+    type_lists: &'a [u32],
     bindings: &'a [Node],
     labels: &'a [Node],
-    types: &'a [Node],
+    ty_kind: &'a [u8],
+    ty_data: &'a [u32],
+    ty_extra: &'a [u32],
+    ty_lists: &'a [u32],
     lifetimes: &'a [Node],
     binding_owners: &'a [u32],
     block_scopes: &'a [u64],
@@ -962,11 +1302,24 @@ impl<'a> ExpressionStoreRef<'a> {
         let store = ExpressionStoreRef {
             buffer,
             root,
-            exprs: root.exprs.follow(buffer)?,
-            pats: root.pats.follow(buffer)?,
+            expr_kind: root.expr_kind.follow(buffer)?,
+            expr_data: root.expr_data.follow(buffer)?,
+            pat_kind: root.pat_kind.follow(buffer)?,
+            pat_data: root.pat_data.follow(buffer)?,
+            extra: root.extra.follow(buffer)?,
+            expr_lists: root.expr_lists.follow(buffer)?,
+            pat_lists: root.pat_lists.follow(buffer)?,
+            statements: root.statements.follow(buffer)?,
+            arms: root.arms.follow(buffer)?,
+            record_fields: root.record_fields.follow(buffer)?,
+            field_pats: root.field_pats.follow(buffer)?,
+            type_lists: root.type_lists.follow(buffer)?,
             bindings: root.bindings.follow(buffer)?,
             labels: root.labels.follow(buffer)?,
-            types: root.types.follow(buffer)?,
+            ty_kind: root.ty_kind.follow(buffer)?,
+            ty_data: root.ty_data.follow(buffer)?,
+            ty_extra: root.ty_extra.follow(buffer)?,
+            ty_lists: root.ty_lists.follow(buffer)?,
             lifetimes: root.lifetimes.follow(buffer)?,
             binding_owners: root.binding_owners.follow(buffer)?,
             block_scopes: root.block_scopes.follow(buffer)?,
@@ -985,11 +1338,15 @@ impl<'a> ExpressionStoreRef<'a> {
         let flags = root.flags;
         ensure(flags & !(HAS_EXPRS | HAS_TYPE_HYGIENE) == 0, root, buffer, "store flags out of range")?;
         let words = root.words.words.len;
-        check_nodes(self.exprs, ExprKind::ALL.len(), words, buffer, "an expression kind out of range")?;
-        check_nodes(self.pats, PatKind::ALL.len(), words, buffer, "a pattern kind out of range")?;
+        let datas = self.expr_data.len() == self.expr_kind.len()
+            && self.pat_data.len() == self.pat_kind.len()
+            && self.ty_data.len() == self.ty_kind.len();
+        ensure(datas, root, buffer, "a data column that is not one word for each node")?;
+        check_kinds(self.expr_kind, ExprKind::ALL.len(), buffer, "an expression kind out of range")?;
+        check_kinds(self.pat_kind, PatKind::ALL.len(), buffer, "a pattern kind out of range")?;
+        check_kinds(self.ty_kind, TypeRefKind::ALL.len(), buffer, "a type kind out of range")?;
         check_nodes(self.bindings, 1, words, buffer, "a binding kind out of range")?;
         check_nodes(self.labels, 1, words, buffer, "a label kind out of range")?;
-        check_nodes(self.types, TypeRefKind::ALL.len(), words, buffer, "a type kind out of range")?;
         check_nodes(
             self.lifetimes,
             LifetimeRefKind::ALL.len(),
@@ -997,9 +1354,19 @@ impl<'a> ExpressionStoreRef<'a> {
             buffer,
             "a lifetime kind out of range",
         )?;
+        ensure(root.side <= words, root, buffer, "side tables that begin past the words")?;
+        ensure(root.ty_side <= words, root, buffer, "type side tables that begin past the words")?;
         if flags & HAS_EXPRS == 0 {
-            let empty = self.exprs.is_empty()
-                && self.pats.is_empty()
+            let empty = self.expr_kind.is_empty()
+                && self.pat_kind.is_empty()
+                && self.extra.is_empty()
+                && self.expr_lists.is_empty()
+                && self.pat_lists.is_empty()
+                && self.statements.is_empty()
+                && self.arms.is_empty()
+                && self.record_fields.is_empty()
+                && self.field_pats.is_empty()
+                && self.type_lists.is_empty()
                 && self.bindings.is_empty()
                 && self.labels.is_empty()
                 && self.binding_owners.is_empty()
@@ -1014,7 +1381,7 @@ impl<'a> ExpressionStoreRef<'a> {
             ensure(self.type_hygiene.is_empty(), root, buffer, "type hygiene the store has not")?;
         }
         let (exprs, pats, bindings) =
-            (self.exprs.len() as u32, self.pats.len() as u32, self.bindings.len() as u32);
+            (self.expr_kind.len() as u32, self.pat_kind.len() as u32, self.bindings.len() as u32);
         let owners = self.binding_owners;
         ensure(
             owners.is_empty() || owners.len() == self.bindings.len(),
@@ -1061,7 +1428,7 @@ impl<'a> ExpressionStoreRef<'a> {
         }
         ascending(self.type_hygiene, |it| it.a, buffer, "type hygiene out of order")?;
         for pair in self.type_hygiene {
-            ensure(pair.a < self.types.len() as u32, pair, buffer, "the hygiene of a type past its arena")?;
+            ensure(pair.a < self.ty_kind.len() as u32, pair, buffer, "the hygiene of a type past its arena")?;
             ensure(pair.b != u32::MAX, pair, buffer, "a syntax context of u32::MAX")?;
         }
         Ok(())
@@ -1073,11 +1440,11 @@ impl<'a> ExpressionStoreRef<'a> {
     }
 
     pub fn exprs_len(self) -> usize {
-        self.exprs.len()
+        self.expr_kind.len()
     }
 
     pub fn pats_len(self) -> usize {
-        self.pats.len()
+        self.pat_kind.len()
     }
 
     pub fn bindings_len(self) -> usize {
@@ -1089,7 +1456,7 @@ impl<'a> ExpressionStoreRef<'a> {
     }
 
     pub fn types_len(self) -> usize {
-        self.types.len()
+        self.ty_kind.len()
     }
 
     pub fn lifetimes_len(self) -> usize {
@@ -1098,15 +1465,15 @@ impl<'a> ExpressionStoreRef<'a> {
 
     /// Which variant `expr` is, `None` past the arena.
     pub fn expr_kind(self, expr: ExprId) -> Option<ExprKind> {
-        ExprKind::from_u32(self.exprs.get(raw(expr) as usize)?.kind)
+        ExprKind::from_u32(u32::from(*self.expr_kind.get(raw(expr) as usize)?))
     }
 
     pub fn pat_kind(self, pat: PatId) -> Option<PatKind> {
-        PatKind::from_u32(self.pats.get(raw(pat) as usize)?.kind)
+        PatKind::from_u32(u32::from(*self.pat_kind.get(raw(pat) as usize)?))
     }
 
     pub fn type_kind(self, ty: TypeRefId) -> Option<TypeRefKind> {
-        TypeRefKind::from_u32(self.types.get(raw(ty) as usize)?.kind)
+        TypeRefKind::from_u32(u32::from(*self.ty_kind.get(raw(ty) as usize)?))
     }
 
     pub fn lifetime_kind(self, lifetime: LifetimeRefId) -> Option<LifetimeRefKind> {
@@ -1146,29 +1513,103 @@ impl<'a> ExpressionStoreRef<'a> {
     pub fn decode(self) -> Result<ExpressionStore, FormatError> {
         let buffer = self.buffer;
         let words = Read::new(&self.root.words, buffer);
-        let types = arena(self.types, &words, buffer, TypeRefKind::from_u32, get_type)?;
         let lifetimes = arena(self.lifetimes, &words, buffer, LifetimeRefKind::from_u32, get_lifetime)?;
-        let exprs = arena(self.exprs, &words, buffer, ExprKind::from_u32, get_expr)?;
-        let pats = arena(self.pats, &words, buffer, PatKind::from_u32, get_pat)?;
         let bindings = arena(self.bindings, &words, buffer, only_kind, get_binding)?;
         let labels = arena(self.labels, &words, buffer, only_kind, get_label)?;
+        let side = SideTables::get(&mut words.from(self.root.side))?;
+        let TypeSide { bounds, paths: type_paths, refs, arrays, fns, type_params } =
+            TypeSide::get(&mut words.from(self.root.ty_side))?;
+        let types = TypeColumns::<Frozen> {
+            kind: self.ty_kind.into(),
+            data: self.ty_data.into(),
+            extra: self.ty_extra.into(),
+            lists: self.ty_lists.iter().map(|&ty| idx(ty)).collect(),
+            bounds: bounds.into(),
+            paths: type_paths.into(),
+            refs: refs.into(),
+            arrays: arrays.into(),
+            fns: fns.into(),
+            type_params: type_params.into(),
+        };
+        let (exprs, pats) = (self.expr_kind.len(), self.pat_kind.len());
+        (types.check(exprs, pats, lifetimes.len()))
+            .map_err(|what| FormatError::Invalid { at: at_of(self.root, buffer), what })?;
         let ids = Ids {
-            exprs: exprs.len() as u32,
-            pats: pats.len() as u32,
-            bindings: bindings.len() as u32,
-            labels: labels.len() as u32,
+            exprs: exprs as u32,
+            pats: pats as u32,
             lifetimes: lifetimes.len() as u32,
             types: &types,
         };
-        check_arena(&types, self.types, buffer, |ty| ids.type_node(ty))?;
-        check_arena(&exprs, self.exprs, buffer, |expr| ids.expr_node(expr))?;
-        check_arena(&pats, self.pats, buffer, |pat| ids.pat_node(pat))?;
+        (ids.type_side(&types))
+            .map_err(|what| FormatError::Invalid { at: at_of(&self.root.words, buffer), what })?;
+        (ids.side_tables(&side))
+            .map_err(|what| FormatError::Invalid { at: at_of(&self.root.words, buffer), what })?;
+        if !self.has_exprs() {
+            ensure(side.is_empty(), self.root, buffer, "side tables in a store without expressions")?;
+        }
+
+        let statements: Vec<Statement> = decoded(
+            self.statements,
+            buffer,
+            |rec| statement_of(rec, &words, buffer),
+            |statement| ids.statement(statement),
+        )?;
+        let arms: Vec<MatchArm> = decoded(
+            self.arms,
+            buffer,
+            |rec| Ok(MatchArm { pat: idx(rec.pat), guard: opt_idx(rec.guard), expr: idx(rec.expr) }),
+            |arm| {
+                ids.pat(arm.pat)?;
+                ids.expr_opt(arm.guard)?;
+                ids.expr(arm.expr)
+            },
+        )?;
+        let record_fields: Vec<RecordLitField> = decoded(
+            self.record_fields,
+            buffer,
+            |rec| Ok(RecordLitField { name: field_name(rec, buffer)?, expr: idx(rec.id) }),
+            |field| ids.expr(field.expr),
+        )?;
+        let field_pats: Vec<RecordFieldPat> = decoded(
+            self.field_pats,
+            buffer,
+            |rec| Ok(RecordFieldPat { name: field_name(rec, buffer)?, pat: idx(rec.id) }),
+            |field| ids.pat(field.pat),
+        )?;
+        let expr_lists: Vec<ExprId> =
+            decoded(self.expr_lists, buffer, |&word| Ok(idx(word)), |&expr| ids.expr(expr))?;
+        let pat_lists: Vec<PatId> =
+            decoded(self.pat_lists, buffer, |&word| Ok(idx(word)), |&pat| ids.pat(pat))?;
+        let type_lists: Vec<Option<TypeRefId>> =
+            decoded(self.type_lists, buffer, |&word| Ok(opt_idx(word)), |&ty| ids.ty_opt(ty))?;
+        let SideTables { names, paths, literals, generic_args, offset_ofs, asms } = side;
+        let columns = HirColumns::<Frozen> {
+            expr_kind: self.expr_kind.into(),
+            expr_data: self.expr_data.into(),
+            pat_kind: self.pat_kind.into(),
+            pat_data: self.pat_data.into(),
+            extra: self.extra.into(),
+            expr_lists: expr_lists.into(),
+            pat_lists: pat_lists.into(),
+            statements: statements.into(),
+            arms: arms.into(),
+            record_fields: record_fields.into(),
+            field_pats: field_pats.into(),
+            type_lists: type_lists.into(),
+            names: names.into(),
+            paths: paths.into(),
+            literals: literals.into(),
+            generic_args: generic_args.into(),
+            offset_ofs: offset_ofs.into(),
+            asms: asms.into(),
+        };
+        (columns.check(bindings.len(), labels.len(), types.len()))
+            .map_err(|what| FormatError::Invalid { at: at_of(self.root, buffer), what })?;
 
         let expr_only = match self.has_exprs() {
             false => None,
             true => Some(Box::new(ExpressionOnlyStore {
-                exprs,
-                pats,
+                columns,
                 bindings,
                 labels,
                 binding_owners: self.binding_owners.into(),
@@ -1200,7 +1641,7 @@ impl<'a> ExpressionStoreRef<'a> {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(1),
+        Part::U64(3),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1265,7 +1706,7 @@ impl<'a> BodyRef<'a> {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(1),
+        Part::U64(3),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -1294,7 +1735,8 @@ impl Persist for Body {
         let store = ExpressionStoreRef::new(&root.store, buffer)?;
         let params = root.params.follow(buffer)?;
         for param in params {
-            let fits = param.a < store.pats.len() as u32 && param.b < store.pats.len() as u32;
+            let pats = store.pat_kind.len() as u32;
+            let fits = param.a < pats && param.b < pats;
             ensure(fits, param, buffer, "a parameter past the patterns")?;
         }
         let self_params = root.self_param.follow(buffer)?;
@@ -1316,6 +1758,18 @@ struct SourceMapColumns {
     label_map_back: Column,
     types_map_back: Column,
     lifetime_map_back: Column,
+    expr_map: Column,
+    expr_map_ids: Column,
+    pat_map: Column,
+    pat_map_ids: Column,
+    label_map: Column,
+    label_map_ids: Column,
+    types_map: Column,
+    types_map_ids: Column,
+    lifetime_map: Column,
+    lifetime_map_ids: Column,
+    expansions: Column,
+    expansion_calls: Column,
     flags: u32,
 }
 
@@ -1329,9 +1783,11 @@ impl SourceMapColumns {
             lifetime_map,
         } = map;
         let mut w = Words::new();
-        put_hash(&mut w, types_map, src_key);
-        put_hash(&mut w, lifetime_map, src_key);
+        let (types_map, types_map_ids) = table_columns(types_map, |&ty| raw(ty));
+        let (lifetime_map, lifetime_map_ids) = table_columns(lifetime_map, |&lifetime| raw(lifetime));
         let (mut expr_map_back, mut pat_map_back, mut label_map_back) = (vec![], vec![], vec![]);
+        let (mut expr_keys, mut expr_ids, mut pat_keys, mut pat_ids) = (vec![], vec![], vec![], vec![]);
+        let (mut label_keys, mut label_ids, mut call_keys, mut calls) = (vec![], vec![], vec![], vec![]);
         if let Some(it) = expr_only.as_deref() {
             let ExpressionOnlySourceMap {
                 expr_map,
@@ -1347,18 +1803,18 @@ impl SourceMapColumns {
                 expansions,
                 diagnostics,
             } = it;
-            put_hash(&mut w, expr_map, src_key);
-            put_hash(&mut w, pat_map, src_key);
-            put_hash(&mut w, label_map, src_key);
             put_arena_map(&mut w, binding_definitions);
             put_table(&mut w, field_map_back);
             put_table(&mut w, pat_field_map_back);
             put_template(&mut w, template_map.as_deref());
-            put_hash(&mut w, expansions, src_key);
             w.put(diagnostics);
             expr_map_back = back_column(exprs_back);
             pat_map_back = back_column(pats_back);
             label_map_back = back_column(labels_back);
+            (expr_keys, expr_ids) = table_columns(expr_map, |&id| packed_bits(id));
+            (pat_keys, pat_ids) = table_columns(pat_map, |&id| packed_bits(id));
+            (label_keys, label_ids) = table_columns(label_map, |&label| raw(label));
+            (call_keys, calls) = table_columns(expansions, |&call| bits(call));
         }
         let words = w.place(out);
         SourceMapColumns {
@@ -1368,6 +1824,18 @@ impl SourceMapColumns {
             label_map_back: Column::push(out, &label_map_back),
             types_map_back: Column::push(out, &back_column(types_map_back)),
             lifetime_map_back: Column::push(out, &back_column(lifetime_map_back)),
+            expr_map: Column::push(out, &expr_keys),
+            expr_map_ids: Column::push(out, &expr_ids),
+            pat_map: Column::push(out, &pat_keys),
+            pat_map_ids: Column::push(out, &pat_ids),
+            label_map: Column::push(out, &label_keys),
+            label_map_ids: Column::push(out, &label_ids),
+            types_map: Column::push(out, &types_map),
+            types_map_ids: Column::push(out, &types_map_ids),
+            lifetime_map: Column::push(out, &lifetime_map),
+            lifetime_map_ids: Column::push(out, &lifetime_map_ids),
+            expansions: Column::push(out, &call_keys),
+            expansion_calls: Column::push(out, &calls),
             flags: if expr_only.is_some() { HAS_EXPRS } else { 0 },
         }
     }
@@ -1383,6 +1851,22 @@ impl SourceMapColumns {
                 .slice(field(offset_of!(SourceMapRoot, types_map_back))),
             lifetime_map_back: (self.lifetime_map_back)
                 .slice(field(offset_of!(SourceMapRoot, lifetime_map_back))),
+            expr_map: self.expr_map.slice(field(offset_of!(SourceMapRoot, expr_map))),
+            expr_map_ids: self.expr_map_ids.slice(field(offset_of!(SourceMapRoot, expr_map_ids))),
+            pat_map: self.pat_map.slice(field(offset_of!(SourceMapRoot, pat_map))),
+            pat_map_ids: self.pat_map_ids.slice(field(offset_of!(SourceMapRoot, pat_map_ids))),
+            label_map: self.label_map.slice(field(offset_of!(SourceMapRoot, label_map))),
+            label_map_ids: (self.label_map_ids)
+                .slice(field(offset_of!(SourceMapRoot, label_map_ids))),
+            types_map: self.types_map.slice(field(offset_of!(SourceMapRoot, types_map))),
+            types_map_ids: (self.types_map_ids)
+                .slice(field(offset_of!(SourceMapRoot, types_map_ids))),
+            lifetime_map: self.lifetime_map.slice(field(offset_of!(SourceMapRoot, lifetime_map))),
+            lifetime_map_ids: (self.lifetime_map_ids)
+                .slice(field(offset_of!(SourceMapRoot, lifetime_map_ids))),
+            expansions: self.expansions.slice(field(offset_of!(SourceMapRoot, expansions))),
+            expansion_calls: (self.expansion_calls)
+                .slice(field(offset_of!(SourceMapRoot, expansion_calls))),
             words: self.words.rec(field(offset_of!(SourceMapRoot, words))),
             flags: self.flags,
         }
@@ -1602,323 +2086,6 @@ impl Persist for BodySourceMap {
     }
 }
 
-fn put_expr(expr: &Expr, w: &mut Words) -> u32 {
-    let kind = match expr {
-        Expr::Missing => ExprKind::Missing,
-        Expr::Path(path) => {
-            w.put(path);
-            ExprKind::Path
-        }
-        Expr::If { condition, then_branch, else_branch } => {
-            w.put(condition);
-            w.put(then_branch);
-            w.put(else_branch);
-            ExprKind::If
-        }
-        Expr::Let { pat, expr } => {
-            w.put(pat);
-            w.put(expr);
-            ExprKind::Let
-        }
-        Expr::Block { id, statements, tail, label, unsafe_ } => {
-            w.put(id);
-            w.put(statements);
-            w.put(tail);
-            w.put(label);
-            w.put(unsafe_);
-            ExprKind::Block
-        }
-        Expr::Const(expr) => {
-            w.put(expr);
-            ExprKind::Const
-        }
-        Expr::Loop { body, label, source } => {
-            w.put(body);
-            w.put(label);
-            w.put(source);
-            ExprKind::Loop
-        }
-        Expr::Call { callee, args } => {
-            w.put(callee);
-            w.put(args);
-            ExprKind::Call
-        }
-        Expr::MethodCall { receiver, method_name, args, generic_args } => {
-            w.put(receiver);
-            w.put(method_name);
-            w.put(args);
-            w.put(generic_args);
-            ExprKind::MethodCall
-        }
-        Expr::Match { expr, arms } => {
-            w.put(expr);
-            w.put(arms);
-            ExprKind::Match
-        }
-        Expr::Continue { label } => {
-            w.put(label);
-            ExprKind::Continue
-        }
-        Expr::Break { expr, label } => {
-            w.put(expr);
-            w.put(label);
-            ExprKind::Break
-        }
-        Expr::Return { expr } => {
-            w.put(expr);
-            ExprKind::Return
-        }
-        Expr::Become { expr } => {
-            w.put(expr);
-            ExprKind::Become
-        }
-        Expr::Yield { expr } => {
-            w.put(expr);
-            ExprKind::Yield
-        }
-        Expr::Yeet { expr } => {
-            w.put(expr);
-            ExprKind::Yeet
-        }
-        Expr::RecordLit { path, fields, spread } => {
-            w.put(path);
-            w.put(fields);
-            w.put(spread);
-            ExprKind::RecordLit
-        }
-        Expr::Field { expr, name } => {
-            w.put(expr);
-            w.put(name);
-            ExprKind::Field
-        }
-        Expr::Await { expr } => {
-            w.put(expr);
-            ExprKind::Await
-        }
-        Expr::Cast { expr, type_ref } => {
-            w.put(expr);
-            w.put(type_ref);
-            ExprKind::Cast
-        }
-        Expr::Ref { expr, rawness, mutability } => {
-            w.put(expr);
-            w.put(rawness);
-            w.put(mutability);
-            ExprKind::Ref
-        }
-        Expr::UnaryOp { expr, op } => {
-            w.put(expr);
-            w.put(op);
-            ExprKind::UnaryOp
-        }
-        Expr::BinaryOp { lhs, rhs, op } => {
-            w.put(lhs);
-            w.put(rhs);
-            w.put(op);
-            ExprKind::BinaryOp
-        }
-        Expr::Assignment { target, value } => {
-            w.put(target);
-            w.put(value);
-            ExprKind::Assignment
-        }
-        Expr::Index { base, index } => {
-            w.put(base);
-            w.put(index);
-            ExprKind::Index
-        }
-        Expr::Closure { args, arg_types, ret_type, body, closure_kind, capture_by } => {
-            w.put(args);
-            w.put(arg_types);
-            w.put(ret_type);
-            w.put(body);
-            w.put(closure_kind);
-            w.put(capture_by);
-            ExprKind::Closure
-        }
-        Expr::Tuple { exprs } => {
-            w.put(exprs);
-            ExprKind::Tuple
-        }
-        Expr::Array(array) => {
-            w.put(array);
-            ExprKind::Array
-        }
-        Expr::Literal(literal) => {
-            w.put(literal);
-            ExprKind::Literal
-        }
-        Expr::Underscore => ExprKind::Underscore,
-        Expr::OffsetOf(offset_of) => {
-            w.put(offset_of);
-            ExprKind::OffsetOf
-        }
-        Expr::InlineAsm(asm) => {
-            w.put(asm);
-            ExprKind::InlineAsm
-        }
-        Expr::IncludeBytes => ExprKind::IncludeBytes,
-    };
-    kind as u32
-}
-
-fn get_expr(kind: ExprKind, r: &mut Read<'_>) -> Result<Expr, FormatError> {
-    Ok(match kind {
-        ExprKind::Missing => Expr::Missing,
-        ExprKind::Path => Expr::Path(r.get()?),
-        ExprKind::If => {
-            Expr::If { condition: r.get()?, then_branch: r.get()?, else_branch: r.get()? }
-        }
-        ExprKind::Let => Expr::Let { pat: r.get()?, expr: r.get()? },
-        ExprKind::Block => Expr::Block {
-            id: r.get()?,
-            statements: r.get()?,
-            tail: r.get()?,
-            label: r.get()?,
-            unsafe_: r.get()?,
-        },
-        ExprKind::Const => Expr::Const(r.get()?),
-        ExprKind::Loop => Expr::Loop { body: r.get()?, label: r.get()?, source: r.get()? },
-        ExprKind::Call => Expr::Call { callee: r.get()?, args: r.get()? },
-        ExprKind::MethodCall => Expr::MethodCall {
-            receiver: r.get()?,
-            method_name: r.get()?,
-            args: r.get()?,
-            generic_args: r.get()?,
-        },
-        ExprKind::Match => Expr::Match { expr: r.get()?, arms: r.get()? },
-        ExprKind::Continue => Expr::Continue { label: r.get()? },
-        ExprKind::Break => Expr::Break { expr: r.get()?, label: r.get()? },
-        ExprKind::Return => Expr::Return { expr: r.get()? },
-        ExprKind::Become => Expr::Become { expr: r.get()? },
-        ExprKind::Yield => Expr::Yield { expr: r.get()? },
-        ExprKind::Yeet => Expr::Yeet { expr: r.get()? },
-        ExprKind::RecordLit => {
-            Expr::RecordLit { path: r.get()?, fields: r.get()?, spread: r.get()? }
-        }
-        ExprKind::Field => Expr::Field { expr: r.get()?, name: r.get()? },
-        ExprKind::Await => Expr::Await { expr: r.get()? },
-        ExprKind::Cast => Expr::Cast { expr: r.get()?, type_ref: r.get()? },
-        ExprKind::Ref => Expr::Ref { expr: r.get()?, rawness: r.get()?, mutability: r.get()? },
-        ExprKind::UnaryOp => Expr::UnaryOp { expr: r.get()?, op: r.get()? },
-        ExprKind::BinaryOp => Expr::BinaryOp { lhs: r.get()?, rhs: r.get()?, op: r.get()? },
-        ExprKind::Assignment => Expr::Assignment { target: r.get()?, value: r.get()? },
-        ExprKind::Index => Expr::Index { base: r.get()?, index: r.get()? },
-        ExprKind::Closure => Expr::Closure {
-            args: r.get()?,
-            arg_types: r.get()?,
-            ret_type: r.get()?,
-            body: r.get()?,
-            closure_kind: r.get()?,
-            capture_by: r.get()?,
-        },
-        ExprKind::Tuple => Expr::Tuple { exprs: r.get()? },
-        ExprKind::Array => Expr::Array(r.get()?),
-        ExprKind::Literal => Expr::Literal(r.get()?),
-        ExprKind::Underscore => Expr::Underscore,
-        ExprKind::OffsetOf => Expr::OffsetOf(r.get()?),
-        ExprKind::InlineAsm => Expr::InlineAsm(r.get()?),
-        ExprKind::IncludeBytes => Expr::IncludeBytes,
-    })
-}
-
-fn put_pat(pat: &Pat, w: &mut Words) -> u32 {
-    let kind = match pat {
-        Pat::Missing => PatKind::Missing,
-        Pat::Rest => PatKind::Rest,
-        Pat::Wild => PatKind::Wild,
-        Pat::Tuple { args, ellipsis } => {
-            w.put(args);
-            w.put(ellipsis);
-            PatKind::Tuple
-        }
-        Pat::Or(args) => {
-            w.put(args);
-            PatKind::Or
-        }
-        Pat::Record { path, args, ellipsis } => {
-            w.put(path);
-            w.put(args);
-            w.put(ellipsis);
-            PatKind::Record
-        }
-        Pat::Range { start, end, range_type } => {
-            w.put(start);
-            w.put(end);
-            w.put(range_type);
-            PatKind::Range
-        }
-        Pat::Slice { prefix, slice, suffix } => {
-            w.put(prefix);
-            w.put(slice);
-            w.put(suffix);
-            PatKind::Slice
-        }
-        Pat::Path(path) => {
-            w.put(path);
-            PatKind::Path
-        }
-        Pat::Lit(expr) => {
-            w.put(expr);
-            PatKind::Lit
-        }
-        Pat::Bind { id, subpat } => {
-            w.put(id);
-            w.put(subpat);
-            PatKind::Bind
-        }
-        Pat::TupleStruct { path, args, ellipsis } => {
-            w.put(path);
-            w.put(args);
-            w.put(ellipsis);
-            PatKind::TupleStruct
-        }
-        Pat::Ref { pat, mutability } => {
-            w.put(pat);
-            w.put(mutability);
-            PatKind::Ref
-        }
-        Pat::Box { inner } => {
-            w.put(inner);
-            PatKind::Box
-        }
-        Pat::Deref { inner } => {
-            w.put(inner);
-            PatKind::Deref
-        }
-        Pat::NotNull => PatKind::NotNull,
-        Pat::Expr(expr) => {
-            w.put(expr);
-            PatKind::Expr
-        }
-    };
-    kind as u32
-}
-
-fn get_pat(kind: PatKind, r: &mut Read<'_>) -> Result<Pat, FormatError> {
-    Ok(match kind {
-        PatKind::Missing => Pat::Missing,
-        PatKind::Rest => Pat::Rest,
-        PatKind::Wild => Pat::Wild,
-        PatKind::Tuple => Pat::Tuple { args: r.get()?, ellipsis: r.get()? },
-        PatKind::Or => Pat::Or(r.get()?),
-        PatKind::Record => Pat::Record { path: r.get()?, args: r.get()?, ellipsis: r.get()? },
-        PatKind::Range => Pat::Range { start: r.get()?, end: r.get()?, range_type: r.get()? },
-        PatKind::Slice => Pat::Slice { prefix: r.get()?, slice: r.get()?, suffix: r.get()? },
-        PatKind::Path => Pat::Path(r.get()?),
-        PatKind::Lit => Pat::Lit(r.get()?),
-        PatKind::Bind => Pat::Bind { id: r.get()?, subpat: r.get()? },
-        PatKind::TupleStruct => {
-            Pat::TupleStruct { path: r.get()?, args: r.get()?, ellipsis: r.get()? }
-        }
-        PatKind::Ref => Pat::Ref { pat: r.get()?, mutability: r.get()? },
-        PatKind::Box => Pat::Box { inner: r.get()? },
-        PatKind::Deref => Pat::Deref { inner: r.get()? },
-        PatKind::NotNull => Pat::NotNull,
-        PatKind::Expr => Pat::Expr(r.get()?),
-    })
-}
-
 fn put_binding(binding: &Binding, w: &mut Words) -> u32 {
     let Binding { name, mode, problems, hygiene } = binding;
     w.put(name);
@@ -1940,86 +2107,6 @@ fn put_label(label: &Label, w: &mut Words) -> u32 {
 
 fn get_label((): (), r: &mut Read<'_>) -> Result<Label, FormatError> {
     Ok(Label { name: r.get()? })
-}
-
-fn put_type(ty: &TypeRef, w: &mut Words) -> u32 {
-    let kind = match ty {
-        TypeRef::Never => TypeRefKind::Never,
-        TypeRef::Placeholder => TypeRefKind::Placeholder,
-        TypeRef::Tuple(types) => {
-            w.put(types);
-            TypeRefKind::Tuple
-        }
-        TypeRef::Path(path) => {
-            w.put(path);
-            TypeRefKind::Path
-        }
-        TypeRef::RawPtr(ty, mutability) => {
-            w.put(ty);
-            w.put(mutability);
-            TypeRefKind::RawPtr
-        }
-        TypeRef::Reference(reference) => {
-            w.put(reference);
-            TypeRefKind::Reference
-        }
-        TypeRef::Array(array) => {
-            w.put(array);
-            TypeRefKind::Array
-        }
-        TypeRef::Slice(ty) => {
-            w.put(ty);
-            TypeRefKind::Slice
-        }
-        TypeRef::Fn(fn_type) => {
-            w.put(fn_type);
-            TypeRefKind::Fn
-        }
-        TypeRef::ImplTrait(bounds) => {
-            w.put(bounds);
-            TypeRefKind::ImplTrait
-        }
-        TypeRef::DynTrait(bounds) => {
-            w.put(bounds);
-            TypeRefKind::DynTrait
-        }
-        TypeRef::TypeParam(param) => {
-            w.put(param);
-            TypeRefKind::TypeParam
-        }
-        TypeRef::PatternType(ty, pat) => {
-            w.put(ty);
-            w.put(pat);
-            TypeRefKind::PatternType
-        }
-        TypeRef::Error => TypeRefKind::Error,
-    };
-    kind as u32
-}
-
-fn get_type(kind: TypeRefKind, r: &mut Read<'_>) -> Result<TypeRef, FormatError> {
-    Ok(match kind {
-        TypeRefKind::Never => TypeRef::Never,
-        TypeRefKind::Placeholder => TypeRef::Placeholder,
-        TypeRefKind::Tuple => TypeRef::Tuple(r.get()?),
-        TypeRefKind::Path => TypeRef::Path(r.get()?),
-        TypeRefKind::RawPtr => {
-            let ty = r.get()?;
-            TypeRef::RawPtr(ty, r.get()?)
-        }
-        TypeRefKind::Reference => TypeRef::Reference(r.get()?),
-        TypeRefKind::Array => TypeRef::Array(r.get()?),
-        TypeRefKind::Slice => TypeRef::Slice(r.get()?),
-        TypeRefKind::Fn => TypeRef::Fn(r.get()?),
-        TypeRefKind::ImplTrait => TypeRef::ImplTrait(r.get()?),
-        TypeRefKind::DynTrait => TypeRef::DynTrait(r.get()?),
-        TypeRefKind::TypeParam => TypeRef::TypeParam(r.get()?),
-        TypeRefKind::PatternType => {
-            let ty = r.get()?;
-            TypeRef::PatternType(ty, r.get()?)
-        }
-        TypeRefKind::Error => TypeRef::Error,
-    })
 }
 
 fn put_lifetime(lifetime: &LifetimeRef, w: &mut Words) -> u32 {
@@ -2069,15 +2156,6 @@ macro_rules! unit_codes {
 
 unit_codes! {
     Mutability { 0 => Mutability::Shared, 1 => Mutability::Mut }
-    Rawness { 0 => Rawness::RawPtr, 1 => Rawness::Ref }
-    Unsafe { 0 => Unsafe::Yes, 1 => Unsafe::No }
-    LoopSource { 0 => LoopSource::Loop, 1 => LoopSource::While, 2 => LoopSource::ForLoop }
-    CaptureBy { 0 => CaptureBy::Value, 1 => CaptureBy::Ref }
-    Movability { 0 => Movability::Static, 1 => Movability::Movable }
-    CoroutineKind { 0 => CoroutineKind::Async, 1 => CoroutineKind::Gen, 2 => CoroutineKind::AsyncGen }
-    CoroutineSource {
-        0 => CoroutineSource::Block, 1 => CoroutineSource::Closure, 2 => CoroutineSource::Fn,
-    }
     BindingAnnotation {
         0 => BindingAnnotation::Unannotated,
         1 => BindingAnnotation::Mutable,
@@ -2091,22 +2169,6 @@ unit_codes! {
     }
     InlineAsmKind {
         0 => InlineAsmKind::Asm, 1 => InlineAsmKind::GlobalAsm, 2 => InlineAsmKind::NakedAsm,
-    }
-    RangeOp { 0 => RangeOp::Exclusive, 1 => RangeOp::Inclusive }
-    UnaryOp { 0 => UnaryOp::Deref, 1 => UnaryOp::Not, 2 => UnaryOp::Neg }
-    LogicOp { 0 => LogicOp::And, 1 => LogicOp::Or }
-    ast::Ordering { 0 => ast::Ordering::Less, 1 => ast::Ordering::Greater }
-    ArithOp {
-        0 => ArithOp::Add,
-        1 => ArithOp::Mul,
-        2 => ArithOp::Sub,
-        3 => ArithOp::Div,
-        4 => ArithOp::Rem,
-        5 => ArithOp::Shl,
-        6 => ArithOp::Shr,
-        7 => ArithOp::BitXor,
-        8 => ArithOp::BitOr,
-        9 => ArithOp::BitAnd,
     }
     TraitBoundModifier {
         0 => TraitBoundModifier::None,
@@ -2518,87 +2580,6 @@ impl Code for Literal {
     }
 }
 
-impl Code for RecordSpread {
-    fn put(&self, w: &mut Words) {
-        match self {
-            RecordSpread::None => w.u32(0),
-            RecordSpread::FieldDefaults => w.u32(1),
-            RecordSpread::Expr(expr) => {
-                w.u32(2);
-                expr.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a record spread out of range")? {
-            0 => RecordSpread::None,
-            1 => RecordSpread::FieldDefaults,
-            _ => RecordSpread::Expr(r.get()?),
-        })
-    }
-}
-
-impl Code for RecordLitField {
-    fn put(&self, w: &mut Words) {
-        let RecordLitField { name, expr } = self;
-        name.put(w);
-        expr.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(RecordLitField { name: r.get()?, expr: r.get()? })
-    }
-}
-
-impl Code for RecordFieldPat {
-    fn put(&self, w: &mut Words) {
-        let RecordFieldPat { name, pat } = self;
-        name.put(w);
-        pat.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(RecordFieldPat { name: r.get()?, pat: r.get()? })
-    }
-}
-
-impl Code for MatchArm {
-    fn put(&self, w: &mut Words) {
-        let MatchArm { pat, guard, expr } = self;
-        pat.put(w);
-        guard.put(w);
-        expr.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(MatchArm { pat: r.get()?, guard: r.get()?, expr: r.get()? })
-    }
-}
-
-impl Code for Array {
-    fn put(&self, w: &mut Words) {
-        match self {
-            Array::ElementList { elements } => {
-                w.u32(0);
-                elements.put(w);
-            }
-            Array::Repeat { initializer, repeat } => {
-                w.u32(1);
-                initializer.put(w);
-                repeat.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(2, "an array kind out of range")? {
-            0 => Array::ElementList { elements: r.get()? },
-            _ => Array::Repeat { initializer: r.get()?, repeat: r.get()? },
-        })
-    }
-}
-
 impl Code for OffsetOf {
     fn put(&self, w: &mut Words) {
         let OffsetOf { container, fields } = self;
@@ -2608,91 +2589,6 @@ impl Code for OffsetOf {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         Ok(OffsetOf { container: r.get()?, fields: r.get()? })
-    }
-}
-
-impl Code for ClosureKind {
-    fn put(&self, w: &mut Words) {
-        match self {
-            ClosureKind::Closure => w.u32(0),
-            ClosureKind::OldCoroutine(movability) => {
-                w.u32(1);
-                movability.put(w);
-            }
-            ClosureKind::Coroutine { kind, source } => {
-                w.u32(2);
-                kind.put(w);
-                source.put(w);
-            }
-            ClosureKind::CoroutineClosure(kind) => {
-                w.u32(3);
-                kind.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(4, "a closure kind out of range")? {
-            0 => ClosureKind::Closure,
-            1 => ClosureKind::OldCoroutine(r.get()?),
-            2 => ClosureKind::Coroutine { kind: r.get()?, source: r.get()? },
-            _ => ClosureKind::CoroutineClosure(r.get()?),
-        })
-    }
-}
-
-impl Code for CmpOp {
-    fn put(&self, w: &mut Words) {
-        match self {
-            CmpOp::Eq { negated } => {
-                w.u32(0);
-                negated.put(w);
-            }
-            CmpOp::Ord { ordering, strict } => {
-                w.u32(1);
-                ordering.put(w);
-                strict.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(2, "a comparison out of range")? {
-            0 => CmpOp::Eq { negated: r.get()? },
-            _ => CmpOp::Ord { ordering: r.get()?, strict: r.get()? },
-        })
-    }
-}
-
-impl Code for BinaryOp {
-    fn put(&self, w: &mut Words) {
-        match self {
-            BinaryOp::LogicOp(op) => {
-                w.u32(0);
-                op.put(w);
-            }
-            BinaryOp::ArithOp(op) => {
-                w.u32(1);
-                op.put(w);
-            }
-            BinaryOp::CmpOp(op) => {
-                w.u32(2);
-                op.put(w);
-            }
-            BinaryOp::Assignment { op } => {
-                w.u32(3);
-                op.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(4, "a binary operator out of range")? {
-            0 => BinaryOp::LogicOp(r.get()?),
-            1 => BinaryOp::ArithOp(r.get()?),
-            2 => BinaryOp::CmpOp(r.get()?),
-            _ => BinaryOp::Assignment { op: r.get()? },
-        })
     }
 }
 
@@ -2809,63 +2705,6 @@ impl Code for InlineAsm {
             kind: r.get()?,
             comment_only: r.get()?,
             clobber_abi: r.get()?,
-        })
-    }
-}
-
-impl Code for Statement {
-    fn put(&self, w: &mut Words) {
-        match self {
-            Statement::Let { pat, type_ref, initializer, else_branch, is_super } => {
-                w.u32(0);
-                pat.put(w);
-                type_ref.put(w);
-                initializer.put(w);
-                else_branch.put(w);
-                is_super.put(w);
-            }
-            Statement::Expr { expr, has_semi } => {
-                w.u32(1);
-                expr.put(w);
-                has_semi.put(w);
-            }
-            Statement::Item(item) => {
-                w.u32(2);
-                item.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a statement kind out of range")? {
-            0 => Statement::Let {
-                pat: r.get()?,
-                type_ref: r.get()?,
-                initializer: r.get()?,
-                else_branch: r.get()?,
-                is_super: r.get()?,
-            },
-            1 => Statement::Expr { expr: r.get()?, has_semi: r.get()? },
-            _ => Statement::Item(r.get()?),
-        })
-    }
-}
-
-impl Code for Item {
-    fn put(&self, w: &mut Words) {
-        match self {
-            Item::MacroDef(def) => {
-                w.u32(0);
-                def.put(w);
-            }
-            Item::Other => w.u32(1),
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(2, "an item kind out of range")? {
-            0 => Item::MacroDef(r.get()?),
-            _ => Item::Other,
         })
     }
 }
@@ -3201,17 +3040,79 @@ pub(crate) fn assert_store_round_trip(store: &ExpressionStore, source_map: &Expr
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
-
     use blaze_format::Aligned;
     use rustc_hash::FxHashSet;
     use test_fixture::WithFixture;
 
     use super::*;
     use crate::{
-        DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+        DefWithBodyId, ModuleDefId,
+        hir::{Expr, Pat},
+        nameres::crate_def_map,
+        signatures::FunctionSignature,
         test_db::TestDB,
     };
+
+    /// Which kind `expr` is, from the view, independently of the columns.
+    fn expr_kind_of(expr: Expr<'_>) -> ExprKind {
+        match expr {
+            Expr::Missing => ExprKind::Missing,
+            Expr::Path(_) => ExprKind::Path,
+            Expr::If { .. } => ExprKind::If,
+            Expr::Let { .. } => ExprKind::Let,
+            Expr::Block { .. } => ExprKind::Block,
+            Expr::Const(_) => ExprKind::Const,
+            Expr::Loop { .. } => ExprKind::Loop,
+            Expr::Call { .. } => ExprKind::Call,
+            Expr::MethodCall { .. } => ExprKind::MethodCall,
+            Expr::Match { .. } => ExprKind::Match,
+            Expr::Continue { .. } => ExprKind::Continue,
+            Expr::Break { .. } => ExprKind::Break,
+            Expr::Return { .. } => ExprKind::Return,
+            Expr::Become { .. } => ExprKind::Become,
+            Expr::Yield { .. } => ExprKind::Yield,
+            Expr::Yeet { .. } => ExprKind::Yeet,
+            Expr::RecordLit { .. } => ExprKind::RecordLit,
+            Expr::Field { .. } => ExprKind::Field,
+            Expr::Await { .. } => ExprKind::Await,
+            Expr::Cast { .. } => ExprKind::Cast,
+            Expr::Ref { .. } => ExprKind::Ref,
+            Expr::UnaryOp { .. } => ExprKind::UnaryOp,
+            Expr::BinaryOp { .. } => ExprKind::BinaryOp,
+            Expr::Assignment { .. } => ExprKind::Assignment,
+            Expr::Index { .. } => ExprKind::Index,
+            Expr::Closure { .. } => ExprKind::Closure,
+            Expr::Tuple { .. } => ExprKind::Tuple,
+            Expr::Array(_) => ExprKind::Array,
+            Expr::Literal(_) => ExprKind::Literal,
+            Expr::Underscore => ExprKind::Underscore,
+            Expr::OffsetOf(_) => ExprKind::OffsetOf,
+            Expr::InlineAsm(_) => ExprKind::InlineAsm,
+            Expr::IncludeBytes => ExprKind::IncludeBytes,
+        }
+    }
+
+    fn pat_kind_of(pat: Pat<'_>) -> PatKind {
+        match pat {
+            Pat::Missing => PatKind::Missing,
+            Pat::Rest => PatKind::Rest,
+            Pat::Wild => PatKind::Wild,
+            Pat::Tuple { .. } => PatKind::Tuple,
+            Pat::Or(_) => PatKind::Or,
+            Pat::Record { .. } => PatKind::Record,
+            Pat::Range { .. } => PatKind::Range,
+            Pat::Slice { .. } => PatKind::Slice,
+            Pat::Path(_) => PatKind::Path,
+            Pat::Lit(_) => PatKind::Lit,
+            Pat::Bind { .. } => PatKind::Bind,
+            Pat::TupleStruct { .. } => PatKind::TupleStruct,
+            Pat::Ref { .. } => PatKind::Ref,
+            Pat::Box { .. } => PatKind::Box,
+            Pat::Deref { .. } => PatKind::Deref,
+            Pat::NotNull => PatKind::NotNull,
+            Pat::Expr(_) => PatKind::Expr,
+        }
+    }
 
     /// Checks what `read` reads in place against `store`.
     pub(super) fn assert_reads(read: ExpressionStoreRef<'_>, store: &ExpressionStore) {
@@ -3223,13 +3124,12 @@ mod tests {
         assert_eq!(read.types_len(), store.types.len());
         assert_eq!(read.lifetimes_len(), store.lifetimes.len());
         for (id, expr) in store.exprs() {
-            let kind = ExprKind::from_u32(put_expr(expr, &mut Words::new()));
-            assert_eq!(read.expr_kind(id), kind, "{expr:?}");
+            assert_eq!(read.expr_kind(id), Some(expr_kind_of(expr)), "{expr:?}");
             assert_eq!(read.inherits_overflow_checks(id), store.inherits_overflow_checks(id));
             assert_eq!(read.block_edition(id), store.block_edition(id));
         }
         for (id, pat) in store.pats() {
-            assert_eq!(read.pat_kind(id), PatKind::from_u32(put_pat(pat, &mut Words::new())));
+            assert_eq!(read.pat_kind(id), Some(pat_kind_of(pat)), "{pat:?}");
         }
         for (id, ty) in store.types.iter() {
             assert_eq!(read.type_kind(id), TypeRefKind::from_u32(put_type(ty, &mut Words::new())));
@@ -3539,30 +3439,28 @@ fn f() -> u32 {
         let bytes = blaze_format::to_bytes(&body.store);
         let buffer = Aligned::copy_from(&bytes);
         let read = ExpressionStore::read(&buffer).expect("a store just written");
-        let words_at = offset_in(read.root.words.words.get(&buffer), &buffer);
-        let exprs_at = offset_in(read.exprs, &buffer);
-        let node = |kind: ExprKind| {
-            *read.exprs.iter().find(|node| node.kind == kind as u32).expect("the kind is in the body")
-        };
+        let exprs = read.exprs_len() as u32;
 
-        let kind = exprs_at + offset_of!(Node, kind);
-        assert!(ExpressionStore::read(&with_word(&bytes, kind, 9999)).is_err());
+        let data_len = at_of(&read.root.expr_data, &buffer) as usize + offset_of!(Slice<u32>, len);
+        let short = with_word(&bytes, data_len, exprs - 1);
+        assert!(ExpressionStore::read(&short).is_err(), "a data column of fewer words than nodes");
 
-        let fields = exprs_at + offset_of!(Node, at);
-        assert!(ExpressionStore::read(&with_word(&bytes, fields, u32::MAX)).is_err());
+        let list = offset_in(read.expr_lists, &buffer);
+        let past = with_word(&bytes, list, exprs);
+        let past = ExpressionStore::read(&past).expect("only a list array changed");
+        assert!(past.decode().is_err(), "an expression id past its arena in a list");
 
-        let condition = words_at + node(ExprKind::If).at as usize * size_of::<u32>();
-        let past = with_word(&bytes, condition, read.exprs.len() as u32);
-        let past = ExpressionStore::read(&past).expect("only the words changed");
-        assert!(past.decode().is_err());
+        let statement = offset_in(read.statements, &buffer) + offset_of!(StatementRec, kind);
+        let bad = ExpressionStore::read(&with_word(&bytes, statement, 99)).expect("only a statement changed");
+        assert!(bad.decode().is_err(), "a statement kind out of range");
 
-        let count = words_at + node(ExprKind::Tuple).at as usize * size_of::<u32>();
-        let long = with_word(&bytes, count, u32::MAX);
-        let long = ExpressionStore::read(&long).expect("only the words changed");
-        assert!(long.decode().is_err());
+        let pat = offset_in(read.statements, &buffer) + offset_of!(StatementRec, id);
+        let past = with_word(&bytes, pat, read.pats_len() as u32);
+        let past = ExpressionStore::read(&past).expect("only a statement changed");
+        assert!(past.decode().is_err(), "a pattern id past its arena in a statement");
 
         let root = offset_in(read.expr_roots, &buffer) + offset_of!(ExprRootRec, root);
-        assert!(ExpressionStore::read(&with_word(&bytes, root, read.exprs.len() as u32)).is_err());
+        assert!(ExpressionStore::read(&with_word(&bytes, root, exprs)).is_err());
 
         assert!(Body::read(&buffer).is_err(), "a store's buffer read as a body's");
         assert!(ExpressionStore::read(&Aligned::copy_from(&bytes[..bytes.len() - 16])).is_err());
@@ -3577,5 +3475,43 @@ fn f() -> u32 {
         assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, kind), u32::MAX)).is_err());
         assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, file_kind), 7)).is_err());
         assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, file), 0)).is_err());
+    }
+
+    #[test]
+    fn a_corrupted_kind_or_list_range_is_refused() {
+        let (db, defs) = bodies("fn f() -> (u32, u32, u32) { (1, 2, 3) }");
+        let body = Body::of(&db, defs[0]);
+        let columns = &body.store.expr_only.as_ref().expect("a body has expressions").columns;
+        let (tuple, elements) = (body.store.exprs())
+            .find_map(|(id, expr)| match expr {
+                Expr::Tuple { exprs } if exprs.len() == 3 => Some((id, exprs)),
+                _ => None,
+            })
+            .expect("the tuple");
+        let start = (elements.as_ptr() as usize - columns.expr_lists.as_ptr() as usize)
+            / size_of::<ExprId>();
+        let range = (columns.extra.windows(2))
+            .position(|pair| pair == [start as u32, 3])
+            .expect("the tuple's list as a `(start, len)` pair in `extra`");
+
+        let bytes = blaze_format::to_bytes(&body.store);
+        let buffer = Aligned::copy_from(&bytes);
+        let read = ExpressionStore::read(&buffer).expect("a store just written");
+        assert_eq!(read.expr_kind(tuple), Some(ExprKind::Tuple));
+
+        let kind = offset_in(read.expr_kind, &buffer) + raw(tuple) as usize;
+        let mut bad = bytes.clone();
+        bad[kind] = ExprKind::ALL.len() as u8;
+        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a kind out of range");
+
+        let range_at = offset_in(read.extra, &buffer) + range * size_of::<u32>();
+        let lists = read.expr_lists.len() as u32;
+        let past = with_word(&bytes, range_at, lists);
+        let past = ExpressionStore::read(&past).expect("only `extra` changed");
+        assert!(past.decode().is_err(), "a list that starts past its array");
+
+        let long = with_word(&bytes, range_at + size_of::<u32>(), lists + 1);
+        let long = ExpressionStore::read(&long).expect("only `extra` changed");
+        assert!(long.decode().is_err(), "a list that ends past its array");
     }
 }

@@ -58,26 +58,35 @@ pub(crate) fn validate_outline(
     }
 }
 
+/// Runs on every node of a validated tree: the kind is read once and tested against each
+/// type's kinds, and the node is cast (a cursor clone) only for the one that matches.
 fn validate_node(node: SyntaxNode, errors: &mut Vec<SyntaxError>) {
-    match_ast! {
-        match node {
-            ast::Literal(it) => validate_literal(it, errors),
-            ast::Const(it) => validate_const(it, errors),
-            ast::BlockExpr(it) => block::validate_block_expr(it, errors),
-            ast::FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
-            ast::RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
-            ast::Visibility(it) => validate_visibility(it, errors),
-            ast::RangeExpr(it) => validate_range_expr(it, errors),
-            ast::PathSegment(it) => validate_path_keywords(it, errors),
-            ast::RefType(it) => validate_trait_object_ref_ty(it, errors),
-            ast::PtrType(it) => validate_trait_object_ptr_ty(it, errors),
-            ast::FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
-            ast::MacroRules(it) => validate_macro_rules(it, errors),
-            ast::LetExpr(it) => validate_let_expr(it, errors),
-            ast::DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
-            ast::ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
-            _ => (),
-        }
+    macro_rules! dispatch {
+        ($($ty:ident($it:ident) => $res:expr,)*) => {{
+            let kind = node.kind();
+            $(if ast::$ty::can_cast(kind) {
+                let $it = ast::$ty::cast(node).expect("the kind casts");
+                $res;
+                return;
+            })*
+        }};
+    }
+    dispatch! {
+        Literal(it) => validate_literal(it, errors),
+        Const(it) => validate_const(it, errors),
+        BlockExpr(it) => block::validate_block_expr(it, errors),
+        FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
+        RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
+        Visibility(it) => validate_visibility(it, errors),
+        RangeExpr(it) => validate_range_expr(it, errors),
+        PathSegment(it) => validate_path_keywords(it, errors),
+        RefType(it) => validate_trait_object_ref_ty(it, errors),
+        PtrType(it) => validate_trait_object_ptr_ty(it, errors),
+        FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
+        MacroRules(it) => validate_macro_rules(it, errors),
+        LetExpr(it) => validate_let_expr(it, errors),
+        DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
+        ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
     }
 }
 

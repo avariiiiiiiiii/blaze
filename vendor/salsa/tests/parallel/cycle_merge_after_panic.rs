@@ -23,7 +23,7 @@
 use salsa::Database;
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Barrier};
+use std::sync::Barrier;
 use std::thread;
 
 const NUM_SCOPES: u32 = 3;
@@ -74,26 +74,32 @@ fn analyze_non_terminal_call_range(db: &dyn Database, scope: u32, chunk: u32) {
 
 fn attempt() {
     let db = salsa::DatabaseImpl::default();
-    let barrier = Arc::new(Barrier::new(NUM_WORKERS));
-    let mut threads = Vec::with_capacity(NUM_WORKERS);
+    let barrier = Barrier::new(NUM_WORKERS);
+    let (db, barrier) = (&db, &barrier);
 
-    for worker in 0..NUM_WORKERS {
-        let db = db.clone();
-        let barrier = barrier.clone();
-        threads.push(thread::spawn(move || {
-            barrier.wait();
+    let results: Vec<_> = thread::scope(|threads| {
+        let threads: Vec<_> = (0..NUM_WORKERS)
+            .map(|worker| {
+                threads.spawn(move || {
+                    barrier.wait();
 
-            let scope = worker as u32 % NUM_SCOPES;
-            panic::catch_unwind(AssertUnwindSafe(|| {
-                StaticClassLiteral::implicit_attribute_inner(&db, scope, worker as u32, false)
-            }))
-        }));
-    }
-
-    let results: Vec<_> = threads
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
-        .collect();
+                    let scope = worker as u32 % NUM_SCOPES;
+                    panic::catch_unwind(AssertUnwindSafe(|| {
+                        StaticClassLiteral::implicit_attribute_inner(
+                            db,
+                            scope,
+                            worker as u32,
+                            false,
+                        )
+                    }))
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect()
+    });
     let mut range_panics = 0;
     for result in results {
         match result {

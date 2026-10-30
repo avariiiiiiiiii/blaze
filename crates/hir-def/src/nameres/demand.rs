@@ -11,11 +11,13 @@
 //!   reaches it (`#[used]`, `#[no_mangle]`, `#[export_name]`, `#[link_section]`, the
 //!   allocator, ...): [`bodies_declaring_roots`].
 
+use std::ops::ControlFlow;
+
 use base_db::{Crate, SourceDatabase};
 use hir_expand::{ErasedAstId, InFile, name::Name};
 use intern::Symbol;
 use rustc_hash::FxHashSet;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, T, TextRange, ast};
+use syntax::{AstNode, SmolStr, SyntaxKind, SyntaxNode, T, TextRange, ast};
 
 use crate::{
     AdtId, AssocItemId, AstId, BlockId, DefWithBodyId, HasModule, ItemContainerId, Lookup,
@@ -36,40 +38,73 @@ use crate::{
 /// and the functions and consts of its traits and impls. A function or static of an `extern`
 /// block has none.
 pub fn scope_body_owners(db: &dyn SourceDatabase, scope: &ItemScope) -> Vec<DefWithBodyId> {
-    let mut owners: Vec<DefWithBodyId> = scope.unnamed_consts().map(Into::into).collect();
-    let assoc = |owners: &mut Vec<DefWithBodyId>, items: &[(Name, AssocItemId)]| {
-        for &(_, item) in items {
-            match item {
-                AssocItemId::FunctionId(it) => owners.push(it.into()),
-                AssocItemId::ConstId(it) => owners.push(it.into()),
-                AssocItemId::TypeAliasId(_) => {}
-            }
-        }
-    };
+    let mut owners = Vec::new();
+    push_scope_body_owners(db, scope, &mut owners);
+    owners
+}
+
+fn push_scope_body_owners(
+    db: &dyn SourceDatabase,
+    scope: &ItemScope,
+    owners: &mut Vec<DefWithBodyId>,
+) {
+    let _ = visit_scope_body_owners(db, scope, |it| {
+        owners.push(it);
+        ControlFlow::Continue(())
+    });
+}
+
+/// Calls `each` with the items of `scope` that have a body, in [`scope_body_owners`]' order,
+/// until it breaks.
+fn visit_scope_body_owners(
+    db: &dyn SourceDatabase,
+    scope: &ItemScope,
+    mut each: impl FnMut(DefWithBodyId) -> ControlFlow<DefWithBodyId>,
+) -> ControlFlow<DefWithBodyId> {
+    for it in scope.unnamed_consts() {
+        each(it.into())?;
+    }
     let in_extern_block =
         |container: ItemContainerId| matches!(container, ItemContainerId::ExternBlockId(_));
     for def in scope.declarations() {
         match def {
             ModuleDefId::FunctionId(it) if !in_extern_block(it.lookup(db).container) => {
-                owners.push(it.into())
+                each(it.into())?
             }
-            ModuleDefId::ConstId(it) => owners.push(it.into()),
+            ModuleDefId::ConstId(it) => each(it.into())?,
             ModuleDefId::StaticId(it) if !in_extern_block(it.lookup(db).container) => {
-                owners.push(it.into())
+                each(it.into())?
             }
             ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                 let variants = EnumVariants::of(db, it).0.with_explicit_discriminant();
-                let written = variants.filter(|&(_, _, explicit)| explicit);
-                owners.extend(written.map(|(it, _, _)| DefWithBodyId::VariantId(it)));
+                for (variant, _, explicit) in variants {
+                    if explicit {
+                        each(DefWithBodyId::VariantId(variant))?;
+                    }
+                }
             }
-            ModuleDefId::TraitId(it) => assoc(&mut owners, &TraitItems::query(db, it).items),
+            ModuleDefId::TraitId(it) => visit_assoc(&TraitItems::query(db, it).items, &mut each)?,
             _ => {}
         }
     }
     for it in scope.impls() {
-        assoc(&mut owners, &ImplItems::of(db, it).0.items);
+        visit_assoc(&ImplItems::of(db, it).0.items, &mut each)?;
     }
-    owners
+    ControlFlow::Continue(())
+}
+
+fn visit_assoc(
+    items: &[(Name, AssocItemId)],
+    each: &mut impl FnMut(DefWithBodyId) -> ControlFlow<DefWithBodyId>,
+) -> ControlFlow<DefWithBodyId> {
+    for &(_, item) in items {
+        match item {
+            AssocItemId::FunctionId(it) => each(it.into())?,
+            AssocItemId::ConstId(it) => each(it.into())?,
+            AssocItemId::TypeAliasId(_) => {}
+        }
+    }
+    ControlFlow::Continue(())
 }
 
 /// The items with a body declared in `module`, outside any body. Lowers no body.
@@ -79,8 +114,11 @@ pub fn module_body_owners(db: &dyn SourceDatabase, module: ModuleId) -> Vec<DefW
 
 /// The items with a body declared in the modules of `krate`, outside any body. Lowers no body.
 pub fn crate_body_owners(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
-    let def_map = crate_def_map(db, krate);
-    def_map.modules(db).flat_map(|(_, module)| scope_body_owners(db, module.scope(db))).collect()
+    let mut owners = Vec::new();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        push_scope_body_owners(db, module.scope(db), &mut owners);
+    }
+    owners
 }
 
 /// The blocks with items of one body, and the items with a body they declare.
@@ -96,11 +134,12 @@ pub struct BodyBlocks<'db> {
 /// The blocks of the body of `owner` and what they declare, by lowering that body and no other.
 pub fn body_blocks(db: &dyn SourceDatabase, owner: DefWithBodyId) -> BodyBlocks<'_> {
     let blocks: Vec<_> = Body::of(db, owner).blocks(db).collect();
-    let owners = blocks
-        .iter()
-        .flat_map(|&(_, def_map)| def_map.modules(db).map(|(_, module)| module.scope(db)))
-        .flat_map(|scope| scope_body_owners(db, scope))
-        .collect();
+    let mut owners = Vec::new();
+    for &(_, def_map) in &blocks {
+        for (_, module) in def_map.modules(db) {
+            push_scope_body_owners(db, module.scope(db), &mut owners);
+        }
+    }
     BodyBlocks { blocks, owners }
 }
 
@@ -121,9 +160,7 @@ pub fn walk_bodies<'db>(
         }
         let blocks = body_blocks(db, owner);
         each(owner, &blocks);
-        let inner = blocks.owners.iter().rev().copied().filter(|&it| seen.insert(it));
-        let inner: Vec<_> = inner.collect();
-        queue.extend(inner);
+        queue.extend(blocks.owners.iter().rev().copied().filter(|&it| seen.insert(it)));
     }
 }
 
@@ -142,7 +179,7 @@ pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefW
     // The macros of the blocks lowered so far: a `macro_rules!` of a block is seen by the
     // bodies declared in it, which are visited after it. Seen by the others too, which only
     // lowers more.
-    let local = std::cell::RefCell::new(FxHashSet::default());
+    let local = std::cell::RefCell::new(FxHashSet::<SmolStr>::default());
     let mut bodies = Vec::new();
     let roots = crate_body_owners(db, krate);
     walk_bodies(
@@ -154,7 +191,7 @@ pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefW
             for &(_, def_map) in &blocks.blocks {
                 for (_, module) in def_map.modules(db) {
                     let found = declaring_macros_of_scope(db, module.scope(db), &local.borrow());
-                    local.borrow_mut().extend(found);
+                    local.borrow_mut().extend(found.iter().map(|it| SmolStr::new(it.as_str())));
                 }
             }
         },
@@ -207,7 +244,15 @@ fn owner_in_module(
     module: ModuleId,
     item: ErasedAstId,
 ) -> Option<DefWithBodyId> {
-    module_body_owners(db, module).into_iter().find(|&it| owner_ast_id(db, it) == item)
+    let scope = module.def_map(db).module(db, module).scope(db);
+    visit_scope_body_owners(db, scope, |it| {
+        if owner_ast_id(db, it) == item {
+            ControlFlow::Break(it)
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .break_value()
 }
 
 /// The innermost item with a body whose body holds `block`: a function, a const, a static or
@@ -281,18 +326,35 @@ fn is_root_word(text: &str) -> bool {
     ROOT_WORDS.contains(&text.strip_prefix("r#").unwrap_or(text))
 }
 
-/// The words of `node`, each an identifier, but those of a macro's metavariables (`$name`).
-fn words(node: &SyntaxNode) -> impl Iterator<Item = Symbol> + '_ {
+/// Whether `f` accepts a word of `node`: an identifier, but those of a macro's metavariables
+/// (`$name`), without `r#`. Read in place from the tokens: a body's words are not interned, so
+/// scanning a dependency's bodies writes nothing to the symbol table.
+fn any_word(node: &SyntaxNode, mut f: impl FnMut(&str) -> bool) -> bool {
     let mut after_dollar = false;
-    node.descendants_with_tokens().filter_map(|it| it.into_token()).filter_map(move |token| {
+    for token in node.descendants_with_tokens().filter_map(|it| it.into_token()) {
         let kind = token.kind();
         if kind.is_trivia() {
-            return None;
+            continue;
         }
         let dollar = std::mem::replace(&mut after_dollar, kind == T![$]);
-        (kind == SyntaxKind::IDENT && !dollar)
-            .then(|| Symbol::intern(token.text().strip_prefix("r#").unwrap_or(token.text())))
-    })
+        if kind == SyntaxKind::IDENT && !dollar {
+            let text = token.text();
+            if f(text.strip_prefix("r#").unwrap_or(text)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The words of `node` ([`any_word`]), interned: for a macro's definition, read once per macro.
+fn words(node: &SyntaxNode) -> Vec<Symbol> {
+    let mut words = Vec::new();
+    any_word(node, |word| {
+        words.push(Symbol::intern(word));
+        false
+    });
+    words
 }
 
 /// The expression of the body of `owner`, as it is written.
@@ -326,15 +388,15 @@ pub fn may_declare_roots(db: &dyn SourceDatabase, owner: DefWithBodyId) -> bool 
 fn may_declare_roots_with(
     db: &dyn SourceDatabase,
     owner: DefWithBodyId,
-    local: &FxHashSet<Symbol>,
+    local: &FxHashSet<SmolStr>,
 ) -> bool {
     let Some(body) = body_syntax(db, owner) else { return false };
     let declaring = macros_declaring_roots(db, owner.module(db).krate(db));
-    let declared = |word: &Symbol| {
-        declaring.binary_search_by(|it| it.as_str().cmp(word.as_str())).is_ok()
-    };
-    words(&body)
-        .any(|word| is_root_word(word.as_str()) || local.contains(&word) || declared(&word))
+    any_word(&body, |word| {
+        is_root_word(word)
+            || local.contains(word)
+            || declaring.binary_search_by(|it| it.as_str().cmp(word)).is_ok()
+    })
 }
 
 /// What a macro is made of, for whether it may write an item a build keeps.
@@ -361,7 +423,7 @@ fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
     };
     match expander {
         MacroExpander::Declarative { .. } => {
-            let mut words: Vec<Symbol> = words(&node).collect();
+            let mut words = words(&node);
             words.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
             words.dedup();
             MacroText::Words(words)
@@ -381,14 +443,14 @@ fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
 fn declaring_macros_of_scope(
     db: &dyn SourceDatabase,
     scope: &ItemScope,
-    declaring: &FxHashSet<Symbol>,
+    declaring: &FxHashSet<SmolStr>,
 ) -> Vec<Symbol> {
     let mut found = Vec::new();
     let mut calling = Vec::new();
     for (name, id) in scope_macros(scope) {
         classify(db, name, id, &mut found, &mut calling);
     }
-    settle(found, calling, |word| declaring.contains(word))
+    settle(found, calling, |word| declaring.contains(word.as_str()))
 }
 
 fn scope_macros(scope: &ItemScope) -> impl Iterator<Item = (Symbol, MacroId)> + '_ {
@@ -423,12 +485,14 @@ fn settle(
     mut calling: Vec<(Symbol, Vec<Symbol>)>,
     known: impl Fn(&Symbol) -> bool,
 ) -> Vec<Symbol> {
+    let mut writing: FxHashSet<Symbol> = found.iter().cloned().collect();
     loop {
         let before = found.len();
         calling.retain(|(name, words)| {
-            let writes = words.iter().any(|it| known(it) || found.contains(it));
+            let writes = words.iter().any(|it| known(it) || writing.contains(it));
             if writes {
                 found.push(name.clone());
+                writing.insert(name.clone());
             }
             !writes
         });

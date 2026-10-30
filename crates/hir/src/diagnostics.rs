@@ -865,14 +865,14 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 );
             }
 
-            DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts } => {
+            DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
                 let ast_id_map = ast_id.file_id.ast_id_map(self.db);
                 let ptr = ast_id_map.get_erased(ast_id.value);
                 self.acc.push(
                     InactiveCode {
                         node: InFile::new(ast_id.file_id, ptr),
                         cfg: cfg.clone(),
-                        opts: opts.clone(),
+                        opts: self.krate.cfg_options(self.db).clone(),
                     }
                     .into(),
                 );

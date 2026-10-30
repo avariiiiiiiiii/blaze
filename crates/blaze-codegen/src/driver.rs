@@ -265,12 +265,12 @@ impl Out {
         }
     }
 
-    /// `function`'s template against `refs`, or the error naming why it has none.
-    fn template_of(&mut self, unit: &Unit, function: &CompiledFunction, refs: &[Target]) -> Option<Template> {
-        match Template::of(function, refs) {
+    /// A compile's template against `refs`, or the error naming why it has none.
+    fn template_of(&mut self, unit: &Unit, emitted: &Emitted, refs: &[Target]) -> Option<Template> {
+        match Template::of(&emitted.function, refs, &emitted.extra) {
             Ok(it) => Some(it),
             Err(why) => {
-                self.errors.push(error(function.key, unit.item, why.to_string()));
+                self.errors.push(error(emitted.function.key, unit.item, why.to_string()));
                 None
             }
         }
@@ -698,8 +698,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
-                    out.template(keys::template(&node.stored()), &template);
-                    out.instantiate(&node.unit, key, &template, &node.refs);
+                    out.template(keys::template(&node.stored()), template);
+                    out.instantiate(&node.unit, key, template, &node.refs);
                 }
                 None if first_of.contains_key(&shape) => waiting.push((key, shape)),
                 None => {
@@ -734,18 +734,18 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             out.stats.compiled += 1;
             out.side(&node.unit, &emitted);
-            let Some(template) = out.template_of(&node.unit, &emitted.function, &node.refs) else { continue };
+            let Some(template) = out.template_of(&node.unit, &emitted, &node.refs) else { continue };
             let kept = self.memo.put(shape, template);
-            out.template(keys::template(&node.stored()), &kept);
-            out.instantiate(&node.unit, key, &kept, &node.refs);
+            out.template(keys::template(&node.stored()), kept);
+            out.instantiate(&node.unit, key, kept, &node.refs);
         }
         for (key, shape) in waiting {
             let node = &nodes[&key];
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
-                    out.template(keys::template(&node.stored()), &template);
-                    out.instantiate(&node.unit, key, &template, &node.refs);
+                    out.template(keys::template(&node.stored()), template);
+                    out.instantiate(&node.unit, key, template, &node.refs);
                 }
                 None => out.errors.push(error(
                     key,
@@ -845,7 +845,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.stats.compiled += 1 + merged.thunks.len();
             out.stats.folded += group.members.len();
             out.side(&first.unit, &merged.body);
-            if let Some(body) = out.template_of(&first.unit, &merged.body.function, &first.refs) {
+            if let Some(body) = out.template_of(&first.unit, &merged.body, &first.refs) {
                 out.template(keys::folded(&key), &body);
                 out.instantiate(&first.unit, key, &body, &first.refs);
             }
@@ -857,7 +857,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
                 out.side(&node.unit, thunk);
                 let refs = thunk_refs(group, member);
-                if let Some(template) = out.template_of(&node.unit, &thunk.function, &refs) {
+                if let Some(template) = out.template_of(&node.unit, thunk, &refs) {
                     out.template(keys::thunk(&key, member), &template);
                     out.instantiate(&node.unit, *member, &template, &refs);
                 }
@@ -908,8 +908,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             made.into_par_iter()
                 .map(|(name, made)| {
                     let job = by_name[&name];
-                    let summarized = made.and_then(|(_, made)| {
-                        let (summary, export) = self.backend.summarize(&job.unit, job.spec, &made, &job.node.refs)?;
+                    let summarized = made.and_then(|(_, mut made)| {
+                        let (summary, export) =
+                            self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
                         Ok((summary, export, made))
                     });
                     (name, summarized)
@@ -1041,7 +1042,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.stats.compiled += 1;
             out.stats.imported += imports.imported.len();
             out.side(&job.unit, &emitted);
-            if let Some(template) = out.template_of(&job.unit, &emitted.function, &refs) {
+            if let Some(template) = out.template_of(&job.unit, &emitted, &refs) {
                 out.template(blob_key, &template);
                 out.instantiate(&job.unit, key, &template, &refs);
             }

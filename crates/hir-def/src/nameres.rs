@@ -99,36 +99,49 @@ pub use self::path_resolution::ResolvePathResultPrefixInfo;
 
 #[cfg(test)]
 thread_local! {
-    /// HACK: In order to test builtin derive expansion, we gate their fast path with this atomic when cfg(test).
+    /// Tests only: `macro_expansion_tests` turn the fast path off around one `TestDB`, whose
+    /// batches run on the calling thread (`test_db.rs`'s `RunOrder`), so the thread that set it
+    /// is the one that collects.
     pub(crate) static ENABLE_BUILTIN_DERIVE_FAST_PATH: std::cell::Cell<bool> =
         const { std::cell::Cell::new(true) };
 }
 
-#[inline]
-#[cfg(test)]
-fn enable_builtin_derive_fast_path() -> bool {
-    ENABLE_BUILTIN_DERIVE_FAST_PATH.get()
-}
-
-/// Whether builtin derives are recorded instead of expanded. A code generator needs the bodies
-/// of the derived methods, so it turns this off before anything is analysed.
-#[cfg(not(test))]
+/// Whether builtin derives are recorded instead of expanded, for every database of the process.
+/// A code generator needs the bodies of the derived methods, so it sets this once at startup,
+/// before any database exists; it is never written after, so the relaxed load a collection does
+/// reads a line no core writes.
 pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(not(test))]
-thread_local! {
-    /// [`EXPAND_BUILTIN_DERIVES`] for the def maps computed on this thread only, so a test that
-    /// evaluates a derived method does not change what tests on other threads see.
-    pub static EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+/// Builtin derives expanded in one database only: an input, so a def map collected on any
+/// thread of the plane sees it, and setting it reruns what it changes.
+#[salsa::input(singleton, debug)]
+pub struct BuiltinDerives {
+    pub expand: bool,
 }
 
-#[inline]
-#[cfg(not(test))]
-fn enable_builtin_derive_fast_path() -> bool {
+/// Has the def maps of `db` expand builtin derives (`true`) or only record them.
+pub fn set_expand_builtin_derives(db: &mut dyn SourceDatabase, expand: bool) {
+    use salsa::{Durability, Setter};
+    match BuiltinDerives::try_get(db) {
+        Some(it) => {
+            it.set_expand(db).with_durability(Durability::HIGH).to(expand);
+        }
+        None => {
+            _ = BuiltinDerives::builder(expand).durability(Durability::HIGH).new(db);
+        }
+    }
+}
+
+/// Whether the collection of a def map of `db` records builtin derives instead of expanding
+/// them. Read once per collection.
+fn enable_builtin_derive_fast_path(db: &dyn SourceDatabase) -> bool {
+    #[cfg(test)]
+    if !ENABLE_BUILTIN_DERIVE_FAST_PATH.get() {
+        return false;
+    }
     !(EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
-        || EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD.get())
+        || BuiltinDerives::try_get(db).is_some_and(|it| it.expand(db)))
 }
 
 const PREDEFINED_TOOLS: &[SmolStr] = &[
@@ -462,13 +475,24 @@ impl<'db> ModuleScope<'db> {
     }
 }
 
+/// What a module holds while its `DefMap` is collected: boxed together, so a collected
+/// `ModuleData` (every module of every def map the database keeps) carries 16 bytes for its
+/// scope, not the box and the map's 56.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BuildingScope {
+    scope: ItemScope,
+    children: FxIndexMap<Name, ModuleId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScopeSlot {
     /// While the `DefMap` is being collected.
-    Building { scope: Box<ItemScope>, children: FxIndexMap<Name, ModuleId> },
+    Building(Box<BuildingScope>),
     /// A `ModuleScope`, once it is.
     Collected(salsa::Id),
 }
+
+const _: () = assert!(size_of::<ScopeSlot>() <= 16);
 
 #[inline]
 pub fn crate_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> &DefMap {
@@ -622,13 +646,9 @@ impl DefMap {
     fn hand_over_scopes(&mut self, db: &dyn SourceDatabase) {
         let ModulesSlot::Building(modules) = &mut self.modules else { return };
         for (id, module) in modules.iter_mut() {
-            if let ScopeSlot::Building { scope, children } = &mut module.scope {
-                let scope = ModuleScope::new(
-                    db,
-                    id,
-                    std::mem::take(&mut **scope),
-                    std::mem::take(children),
-                );
+            if let ScopeSlot::Building(building) = &mut module.scope {
+                let BuildingScope { scope, children } = std::mem::take(&mut **building);
+                let scope = ModuleScope::new(db, id, scope, children);
                 module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
             }
         }
@@ -1008,13 +1028,30 @@ impl ModuleData {
             origin,
             visibility,
             parent,
-            scope: ScopeSlot::Building { scope: Box::default(), children: FxIndexMap::default() },
+            scope: ScopeSlot::Building(Box::default()),
+        }
+    }
+
+    /// A module of a `DefMap` being built whose scope and children are already known (a frozen
+    /// `DefMap` read back).
+    pub(crate) fn with_scope(
+        origin: ModuleOrigin,
+        visibility: Visibility,
+        parent: Option<ModuleId>,
+        scope: ItemScope,
+        children: FxIndexMap<Name, ModuleId>,
+    ) -> Self {
+        ModuleData {
+            origin,
+            visibility,
+            parent,
+            scope: ScopeSlot::Building(Box::new(BuildingScope { scope, children })),
         }
     }
 
     pub fn scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
         match &self.scope {
-            ScopeSlot::Building { scope, .. } => scope,
+            ScopeSlot::Building(building) => &building.scope,
             ScopeSlot::Collected(id) => {
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
             }
@@ -1024,7 +1061,7 @@ impl ModuleData {
     /// What `name` means in this module; depends on that name only.
     pub fn name_in_scope(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
         match &self.scope {
-            ScopeSlot::Building { scope, .. } => scope.get(name),
+            ScopeSlot::Building(building) => building.scope.get(name),
             ScopeSlot::Collected(id) => {
                 *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*id).name(db, name.clone())
             }
@@ -1037,7 +1074,7 @@ impl ModuleData {
         name: &Name,
     ) -> Option<&'a [MacroId]> {
         match &self.scope {
-            ScopeSlot::Building { scope, .. } => scope.get_legacy_macro(name),
+            ScopeSlot::Building(building) => building.scope.get_legacy_macro(name),
             ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
                 .legacy_macro(db, name.clone())
                 .as_deref(),
@@ -1050,7 +1087,7 @@ impl ModuleData {
         db: &'a dyn SourceDatabase,
     ) -> impl Iterator<Item = crate::TraitId> + 'a {
         let (building, collected) = match &self.scope {
-            ScopeSlot::Building { scope, .. } => (Some(scope.traits()), None),
+            ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
             ScopeSlot::Collected(id) => (
                 None,
                 Some(
@@ -1067,7 +1104,7 @@ impl ModuleData {
     /// The modules declared in this one, by name.
     pub fn children<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a FxIndexMap<Name, ModuleId> {
         match &self.scope {
-            ScopeSlot::Building { children, .. } => children,
+            ScopeSlot::Building(building) => &building.children,
             ScopeSlot::Collected(id) => {
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).children(db)
             }
@@ -1076,7 +1113,7 @@ impl ModuleData {
 
     pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
         match &mut self.scope {
-            ScopeSlot::Building { children, .. } => children,
+            ScopeSlot::Building(building) => &mut building.children,
             ScopeSlot::Collected(_) => panic!("the children of a collected module are read-only"),
         }
     }
@@ -1084,7 +1121,7 @@ impl ModuleData {
     /// The scope of a module of the `DefMap` being collected.
     pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
         match &mut self.scope {
-            ScopeSlot::Building { scope, .. } => scope,
+            ScopeSlot::Building(building) => &mut building.scope,
             ScopeSlot::Collected(_) => panic!("the scope of a collected module is read-only"),
         }
     }

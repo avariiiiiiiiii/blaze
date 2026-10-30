@@ -70,7 +70,7 @@ pub(crate) struct Table<T: Keyed> {
 }
 
 /// Where a value is: its row, and the value.
-pub(crate) type Found<'a, T> = (u64, &'a T);
+pub(crate) type Hit<'a, T> = (u64, &'a T);
 
 impl<T: Keyed> Table<T> {
     /// A table whose first level has `first` slots (rounded up to a power of two, at least 64)
@@ -133,7 +133,7 @@ impl<T: Keyed> Table<T> {
         Err(None)
     }
 
-    pub(crate) fn get<'a>(&'a self, _held: Held<'a>, key: &T::Key) -> Option<Found<'a, T>> {
+    pub(crate) fn get<'a>(&'a self, _held: Held<'a>, key: &T::Key) -> Option<Hit<'a, T>> {
         for (number, level) in self.made() {
             match self.probe(level, key) {
                 Ok((at, found)) => return Some((self.base(number) + at as u64, found)),
@@ -146,7 +146,7 @@ impl<T: Keyed> Table<T> {
     /// Publishes `value` unless its key is there already: then it gives `value` back with
     /// what is there. Two inserts of one key racing across a level being added can both land;
     /// a lookup finds the one in the older level.
-    pub(crate) fn insert<'a>(&'a self, held: Held<'a>, value: Box<T>) -> Result<Found<'a, T>, (Box<T>, Found<'a, T>)> {
+    pub(crate) fn insert<'a>(&'a self, held: Held<'a>, value: Box<T>) -> Result<Hit<'a, T>, (Box<T>, Hit<'a, T>)> {
         let key = value.key();
         if let Some(found) = self.get(held, &key) {
             return Err((value, found));
@@ -197,7 +197,7 @@ impl<T: Keyed> Table<T> {
     }
 
     /// Every value with its row.
-    pub(crate) fn iter<'a>(&'a self, _held: Held<'a>) -> impl Iterator<Item = Found<'a, T>> + 'a {
+    pub(crate) fn iter<'a>(&'a self, _held: Held<'a>) -> impl Iterator<Item = Hit<'a, T>> + 'a {
         self.made().flat_map(move |(number, level)| {
             let base = self.base(number);
             level.slots.iter().enumerate().filter_map(move |(at, slot)| {

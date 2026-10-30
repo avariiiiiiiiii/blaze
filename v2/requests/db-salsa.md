@@ -6,12 +6,15 @@ What: a tracked function with an `lru` option and without `no_eq` now requires i
 implement `std::hash::Hash`. The macro emits `Fingerprint::of_value(value)` for it, so a missing
 impl is a compile error at the return type. The bound, exactly:
 
-- `Output<'db>: Hash`, where the hash feeds everything `PartialEq` compares, and nothing
-  address-dependent. A `Hash` that hashes a pointer (`intern::Symbol`, `intern::Interned<T>`, an
-  `Arc` by address, `triomphe::Arc::as_ptr`) is unsound here: the fingerprint outlives the value
-  (that is its purpose), so after the value is evicted and the allocation is freed and reused, a
-  different value can hash the same and be backdated. Salsa IDs (inputs, tracked, interned
-  structs) hash index and generation and are fine.
+- `Output<'db>: Hash`, where the hash feeds everything `PartialEq` compares. Hashing an address
+  is sound for an allocation that is never freed: `intern::Symbol` and `intern::Interned<T>`
+  (`crates/intern` never frees or moves them, so an address names one value for the whole
+  process), and salsa IDs (index and generation). It is unsound only for an allocation that can
+  be freed and reused while the fingerprint lives, such as an `Arc` hashed by pointer
+  (`triomphe::Arc::as_ptr`): after the value is evicted and the memory reused, a different value
+  could hash the same and be backdated. Fingerprints are never persisted (salsa recomputes them
+  after a load), so process-local addresses are fine. (Corrected 10-29; db-ty request 12 is
+  right.)
 - Either derive/implement such a `Hash`, or add `no_eq` to the function (then it is never
   backdated by value, and evicted values that recompute count as changed unless no input changed).
 
@@ -35,8 +38,10 @@ Why: LRU eviction used to break early cutoff: an evicted value that recomputed e
 compared (the old value was gone), so everything that read it ran again. The memo now keeps a
 128-bit fingerprint of its value through eviction, and each read records the fingerprint it saw,
 so a recomputed equal value is backdated and a reader whose input returned to the value it read
-is not rerun (docs/v2/plan/lanes/db.md; issues #350, #806, #734). Functions without `lru` are unchanged: they
-keep their values, so `PartialEq` still decides.
+is not rerun (docs/v2/plan/lanes/db.md; issues #350, #806, #734). The fingerprint is taken when
+the value is dropped (by the LRU or `evict_values`), not when it is stored: while the old value
+is there, `PartialEq` decides, and nothing is hashed on the hot path of a cold build (db-ty
+request 8).
 
 > applied: db-expand's sites, by db-expand (`v2/requests/db-expand.md`, the `Hash` section; `Parse` and `mbe::ValueResult` forwarded to format there).
 > forwarded to format: `crates/hir-def/src/expr_store/body.rs:94` and `:144` are format's.
@@ -48,8 +53,10 @@ What: after a build, `crates/blaze-engine/src/lib.rs:7466` calls `db.trigger_lru
 which only trims each `lru` function to its cap. To free the large values (MIR bodies, compiled
 instances) without losing early cutoff, call `<function>::evict_values(db)` for them; it returns
 how many values it dropped. `<function>::evict_values_of(db, keys)` drops chosen keys of a function
-whose one argument is a Salsa struct. Both exist only on functions with an `lru` option (`lru = 0`
-means no cap, so values are kept until evicted this way).
+whose one argument is a Salsa struct. Both exist on **every** tracked function whose output
+implements `Hash` (10-29: no `lru` needed; db-ty request 1). The value is hashed when it is
+dropped; a `no_eq` function's evicted value gets no fingerprint and counts as changed when it
+recomputes, unless no input changed.
 
 Where: `crates/blaze-engine/src/lib.rs` near line 7466; the functions in `hir-ty-mir` and
 `hir-ty-codegen` listed above.
@@ -58,14 +65,94 @@ Why: issues #806 and #734 (memory held by values no later build reads).
 
 > forwarded to codegen: `crates/blaze-engine/src/lib.rs` is codegen's, not the coordinator's.
 
+db-ty request 9 (`lru = 0` on 11 MIR queries so `crates/hir/src/evict.rs` compiles) is no longer
+needed: `evict_values` no longer needs `lru`, only `Output: Hash`, which `MirBody` and
+`MirLowerError` have. `crates/hir/src/evict.rs` and `crates/hir-ty/src/evict.rs` compile against
+the generated names as they are.
+
 ## Memory
 
 Every memo grows by 8 bytes (`QueryRevisions` is 32 bytes, was 24): one `ThinVec` that is empty,
-with no allocation, unless the memo has a value fingerprint or read an `lru` function. Then it
-holds 16 bytes of header plus 20 bytes per such read and 20 for its own value fingerprint. No other change to the
-build is needed.
+with no allocation, unless the memo's value was evicted with a fingerprint or the memo read a
+value that had one. Then it holds 16 bytes of header plus 20 bytes per such read and 20 for its
+own value fingerprint. No other change to the build is needed.
 
 > applied: note only.
+
+## One `Sync` database: no clones, no forks (10-29; lane db, codegen, cargo, ide)
+
+What changed in salsa: `salsa::Storage<Db>` is `Sync` and no longer `Clone`; `StorageHandle`,
+`Storage::into_zalsa_handle`, `DatabaseImpl: Clone` and `EventKind::DidSetCancellationFlag` are
+gone, `EventKind::WillBlockOn` has `other_task: salsa::TaskId` in place of `other_thread_id`, and
+`salsa::Database` requires `Sync`. One database is read by `&` from every thread; a write takes
+`&mut`, which already excludes every reader, so it neither cancels nor waits. Each task (thread
+and pump depth) has its own query stack and `CancellationToken`.
+
+What each site needs: share the one database by `&` (the work goes through `run_all`, a
+`Pool::scope`, or `std::thread::scope`), and delete the `Clone` impl and the `fork`. A
+`Mutex<Db>` or `RwLock<Db>` that serialized writers against clones becomes a plain `&mut` at the
+write and `&` everywhere else. Every field of a database struct must be `Sync` (no `Cell`/
+`RefCell`; use atomics or a `Mutex`).
+
+Where (`rg 'storage\.clone\(\)|fn fork|db\.clone\(\)'`, 10-29):
+
+- Database impls with `Clone` (delete it): `crates/ide-db/src/lib.rs:108` (`RootDatabase`),
+  `crates/load-cargo/src/v2/db.rs:54` (`Db`), `crates/hir-def/src/test_db.rs:82`,
+  `crates/hir-ide/src/test_db.rs:60`, `crates/blaze-items/src/tests/db.rs:53` (and its `fork` at
+  `:77`), `crates/blaze-diagnostics/src/tests/db.rs:42` (and `fork` at `:61`),
+  `crates/hir-ty-codegen/v2/tests/db.rs:42`, `crates/base-db/src/tests.rs:22` (`derive(Clone)`).
+- `load-cargo`: `Lowered::snapshot` (`crates/load-cargo/src/v2.rs:391`) and `Snapshot`
+  (`v2/db.rs`) become `&Db` borrowed from `Lowered` for the length of a read; the
+  `Failed::Again`-on-cancel protocol in the `Db` doc goes, because a write can no longer happen
+  while a reader holds `&Db`. Callers: `crates/blaze-cargo/src/serve/unit/compile.rs:230`,
+  `:397`, `codegen.rs:255`, `:258` (`Box::new(snapshot.clone()) as Box<dyn HirDatabase + Send>`:
+  `hir_ty_codegen::v2::Databases::new` should take `&dyn HirDatabase`), `reach.rs:53`, `:54`.
+- `blaze-engine` clones the database into workers at `crates/blaze-engine/src/lib.rs:1427`,
+  `:3541`, `:3614`, `:3717`, `:3782`, `:4192`, `:4247`, `:4446`, `:4661`, `:5358`, `:6506`,
+  `:7374`, `:8248`, `:8274`, `:10572`, `:10636`, `:11245`; `frozen.rs:317`; `outline.rs:386`;
+  `doctest.rs:1348`. `trigger_cancellation` at `lib.rs:7811`, `:8262` and
+  `crates/load-cargo/src/lib.rs:494` now does nothing a reader can see (it only starts a new
+  cancellation epoch); drop the calls.
+- `crates/ide-db/src/symbol_index.rs:250`, `:264` (`for_each_with(db.clone(), ..)`),
+  `crates/ide-db/src/prime_caches.rs:207`, `crates/blaze-doc/src/collect.rs:36`,
+  `crates/blaze-doc/src/places.rs:446` (`map_with(db.clone(), ..)`): rayon's `for_each`/`map`
+  with `&db` captured.
+- Tests: `crates/hir-ty-codegen/v2/tests.rs:80`, `v2/refs/tests.rs:88` (`Mutex::new(db.clone())`),
+  `crates/blaze-query/src/tests.rs:639`, `:646`, `:661`.
+- Not a database (checked, leave): `crates/blaze-cargo/src/serve/job.rs` `w.db`,
+  `crates/blaze-ci/src/runtime.rs` and `crates/blaze-units/src/load/manifest.rs` `snapshot`
+  (if any of these is a salsa database, it goes in the list above).
+
+Why: docs/v2/plan/process/decisions.md (10-29: "The database is `Sync` and shared by reference;
+no per-thread handles; all parallel work is plane tasks"); a write no longer waits for every
+handle to drop, and no handle per thread is made or kept.
+
+## Set salsa's task depth to the plane's (lane db, base-db; cargo daemon)
+
+What: before the first query, call `salsa::set_task_depth(blaze_graph::pump::depth)` once per
+process. It panics if called twice, so put it behind a `std::sync::Once` in base-db (for example
+`base_db::install_task_depth()`) and call that from every database constructor that runs work on
+the pool: `crates/load-cargo/src/v2/db.rs` `Db::new` and `crates/ide-db/src/lib.rs`
+`RootDatabase::new`. Tests and tools that never pump can leave it unset (depth 0).
+Where: `crates/base-db/src/lib.rs` (needs `blaze-graph` as a dependency if it is not one), the two
+constructors above.
+Why: a job the pool pumps while a task waits runs on the same thread above it. Without the hook,
+salsa sees one task per thread, so the pumped job's reads would be recorded as dependencies of the
+query waiting below it, and its claims would look like the waiting query's own (a false cycle).
+With it, the pumped job has its own query stack, and asking a key the task below holds unwinds at
+once with `salsa::Cancelled::WouldWaitOnItself` instead of deadlocking.
+
+## Repost a task that unwinds with `Cancelled::WouldWaitOnItself` (lane db, base-db `run_all`; core-pool)
+
+What: a `run_all` task, or any pool job, that unwinds with
+`salsa::Cancelled::WouldWaitOnItself` should be posted again rather than its panic propagated to
+the batch's caller (`crates/load-cargo/src/v2/db.rs:147`, `crates/ide-db/src/lib.rs:309`, `crates/hir-def/src/test_db.rs:159`, `crates/hir-ide/src/test_db.rs:150`,
+`crates/blaze-items/src/tests/db.rs:146`, `crates/base-db/src/tests.rs:123`). It asked for a key
+that a task below it on its thread holds, so it can only finish once that task returns or on
+another worker. Today the first panic of a task is resumed by `run_all`, which would unwind the
+whole batch's caller.
+Why: the plane's rule for a wait that can't be served (crates/blaze-graph/src/pump.rs: "gives way
+at once ... and is posted again"); salsa now gives way the same way.
 
 # From speed-salsa (to db-salsa, the owner of `vendor/salsa*`)
 
@@ -215,12 +302,27 @@ word load per group of eight. A reusable value adds one CAS per revision on its 
 is the SwissTable/papaya bar (`docs/v2/plan/design/hardware.md`, "interner and memo lookups"),
 the same table `crates/intern` uses.
 
-Tests: a differential test against the current map, where seeded intern and lookup sequences
-across revisions, immortal and reusable, give the same IDs and generations. A test that 8
+Unsafe (`docs/v2/plan/design/unsafe.md`): this is S1–S4's only new unsafe code. Put the table
+in one small module, `interned/table.rs`, whose API (`find`, `insert_locked`, `grow_locked`) is
+safe, and keep the CAS protocol on `last_interned_at` in safe functions over atomics. Each
+`unsafe` block gets a `// SAFETY:` comment naming its invariant and where it is upheld: a slot's
+`hash` and `ValueKey` are written before its tag's `Release`, and outgrown tables live until
+`&mut`. The speed it buys is the lock removed from every hit.
+
+Tests: keep a safe reference version, `Mutex<hashbrown::HashTable>` (today's map), in the tests.
+A property test over seeded intern and lookup sequences across revisions, immortal and
+reusable, checks that both give the same IDs and generations. A test that 8
 `std::thread::scope` threads interning overlapping keys get one ID per key. A shuttle test
 (`feature = "shuttle"`, which salsa has) of a reader hitting a stale value while a writer
 sweeps the same shard: either the reader's ID is current and its fields are the ones it
 interned, or the reader got a new ID; never a reused slot under an old ID.
+
+## S2a. Existing unsafe against `unsafe.md` (note for you and the safety lane)
+
+salsa has 270 `unsafe {` blocks, and three files opt out of `clippy::undocumented_unsafe_blocks`:
+`tracked_struct.rs:1` and `salsa_value.rs:1` (whole file), and `function/delete.rs:13`, `:15`
+(TODO #697). unsafe.md's Done-when requires a `// SAFETY:` on every block in v2's crates. When
+you next touch these files, write the comments and drop the `allow`s. S1 and S4 add no unsafe.
 
 ## S3. Claims: shard count (`function/sync.rs:75`)
 

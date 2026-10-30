@@ -57,6 +57,8 @@ mod imp {
         }
     }
 
+    // `unsafe(no_lifetime)`: the values are never collected (`revisions = usize::MAX`), so a
+    // `SyntaxContextImpl` held without the database's lifetime never outlives its slot.
     #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX)]
     struct SyntaxContextImpl {
         data: SyntaxContextData,
@@ -75,22 +77,34 @@ mod imp {
 
         /// # Safety
         ///
-        /// The ID must be a valid `SyntaxContext`.
+        /// `u32` must be what [`SyntaxContext::into_u32`] gave for a context of this database.
+        /// Memory safety doesn't rest on it ([`SyntaxContext::id`] checks the bound salsa needs,
+        /// and salsa's table checks the page, slot and type of every lookup): another value
+        /// gives a panic, or another context's hygiene data. It stays `unsafe` so that decoders
+        /// of persisted or wire contexts (hir-def's `persist`, the proc-macro protocols) say
+        /// where they trust their bytes.
         #[inline]
         pub unsafe fn from_u32(u32: u32) -> Self {
-            // INVARIANT: Our precondition.
-            Self(NonZeroU32::new(u32 + 1).unwrap_or_else(|| panic!("invalid SyntaxContext({u32})")))
+            match u32.checked_add(1).and_then(NonZeroU32::new) {
+                Some(it) => Self(it),
+                None => panic!("invalid SyntaxContext({u32})"),
+            }
         }
 
         #[inline]
         fn id(self) -> Option<SyntaxContextImpl> {
             if self.is_root() {
-                None
-            } else {
-                // SAFETY: By our invariant, this is either a root (which we verified it's not) or a
-                // valid `salsa::Id` index.
-                unsafe { Some(SyntaxContextImpl::from_id(salsa::Id::from_index(self.0.get() - 1))) }
+                return None;
             }
+            let index = self.0.get() - 1;
+            assert!(index < salsa::Id::MAX_U32, "SyntaxContext({index}) is no root and no salsa id");
+            // SAFETY: `Id::from_index` needs `index < Id::MAX_U32`, checked just above, so a
+            // context decoded from bad bytes panics here rather than making an `Id` whose
+            // `NonZeroU32` is 0. Whether `index` is a `SyntaxContextImpl` is not a safety
+            // condition: salsa's table bounds-checks the page and slot and checks the page's
+            // type on lookup, and panics otherwise.
+            let id = unsafe { salsa::Id::from_index(index) };
+            Some(SyntaxContextImpl::from_id(id))
         }
 
         #[inline]
@@ -298,10 +312,14 @@ mod imp {
 
         /// # Safety
         ///
-        /// None. This is always safe to call without the `salsa` feature.
+        /// None. This is always safe to call without the `salsa` feature; it is `unsafe` to
+        /// have the signature it has with it.
         #[inline]
         pub unsafe fn from_u32(u32: u32) -> Self {
-            Self(NonZeroU32::new(u32 + 1).unwrap_or_else(|| panic!("invalid SyntaxContext({u32})")))
+            match u32.checked_add(1).and_then(NonZeroU32::new) {
+                Some(it) => Self(it),
+                None => panic!("invalid SyntaxContext({u32})"),
+            }
         }
     }
 
@@ -391,7 +409,8 @@ mod tests {
     #[test]
     fn test_non_root_value_is_not_root() {
         for edition in Edition::iter() {
-            // SAFETY: This is just for testing purposes
+            // SAFETY: `from_u32`'s contract is not a memory-safety one (see its `# Safety`), and
+            // the context made is only asked `is_root`, which reads no database.
             let ctx = unsafe { SyntaxContext::from_u32(edition as u32 + 1) };
             assert!(!ctx.is_root(), "{edition} root should be identified as root");
         }
@@ -403,7 +422,8 @@ mod tests {
         let root = SyntaxContext::root(Edition::Edition2015);
         let ctx = SyntaxContext::new(
             &db,
-            // SAFETY: We never use this ID.
+            // SAFETY: `from_index` needs `1 < Id::MAX_U32`, which holds; the id is stored as
+            // the expansion of the context and never looked up.
             crate::MacroCallId(unsafe { salsa::Id::from_index(1) }),
             Transparency::Opaque,
             Edition::Edition2021,
@@ -416,5 +436,25 @@ mod tests {
         let round_tripped = unsafe { SyntaxContext::from_u32(ctx.into_u32()) };
         assert_eq!(round_tripped.edition(&db), Edition::Edition2021);
         assert_eq!(round_tripped.parent(&db), root);
+    }
+
+    /// A value past the roots, which no salsa id has, panics when looked up instead of making
+    /// an `Id` out of `from_index`'s range.
+    #[test]
+    #[should_panic(expected = "no root and no salsa id")]
+    fn a_context_past_the_roots_panics() {
+        let db = salsa::DatabaseImpl::new();
+        // SAFETY: `from_u32`'s contract is not a memory-safety one (see its `# Safety`); this
+        // checks that breaking it panics.
+        let ctx = unsafe { SyntaxContext::from_u32(u32::MAX - 1) };
+        assert!(!ctx.is_root());
+        ctx.parent(&db);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid SyntaxContext")]
+    fn the_last_u32_is_no_context() {
+        // SAFETY: as above; `u32::MAX` has no `NonZeroU32` one past it, so this panics.
+        let _ = unsafe { SyntaxContext::from_u32(u32::MAX) };
     }
 }

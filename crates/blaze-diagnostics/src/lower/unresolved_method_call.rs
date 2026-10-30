@@ -110,7 +110,7 @@ pub(crate) struct NoMatch<'db> {
 
 /// A function without `self` of the name looked for: rustc's static candidates.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Static {
+pub(crate) enum Static {
     Impl(hir::Impl, hir::Function),
     Trait(hir::Trait, hir::Function),
 }
@@ -911,8 +911,7 @@ pub(crate) fn inject_use_span(cx: &Cx<'_, '_>, module: hir::Module) -> Option<Sp
 }
 
 /// The fact of the item looked for on an ADT's own impls.
-#[allow(dead_code)]
-fn adt_fact(cx: &Cx<'_, '_>, diag: &mut Diag, adt: hir::Adt) {
+pub(crate) fn adt_fact(cx: &Cx<'_, '_>, diag: &mut Diag, adt: hir::Adt) {
     let name = adt.name(cx.db).display(cx.db, cx.edition).to_string();
     diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the items of `{name}`"));
 }

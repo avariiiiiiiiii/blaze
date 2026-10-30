@@ -21,7 +21,7 @@
 use base_db::{Crate, SourceDatabase};
 use span::SyntaxContext;
 use syntax::{
-    AstPtr, Parse, SyntaxElement, SyntaxNode, TextSize, WalkEvent, syntax_editor::SyntaxEditor,
+    AstPtr, SyntaxElement, SyntaxNode, TextSize, WalkEvent, syntax_editor::SyntaxEditor,
 };
 use syntax_bridge::DocCommentDesugarMode;
 
@@ -132,7 +132,7 @@ fn lazy_expand<'db>(
     call_site: SyntaxContext,
     macro_depth: u32,
     eager_callback: EagerCallBackFn<'_>,
-) -> ExpandResult<(InFile<Parse<SyntaxNode>>, &'db ExpansionSpanMap)> {
+) -> ExpandResult<(InFile<SyntaxNode>, &'db ExpansionSpanMap)> {
     let expand_to = ExpandTo::from_call_site(macro_call);
     let id = def.make_call(
         db,
@@ -145,7 +145,7 @@ fn lazy_expand<'db>(
 
     id.parse_macro_expansion(db)
         .as_ref()
-        .map(|parse| (InFile::new(id.into(), parse.0.clone()), &parse.1))
+        .map(|parse| (InFile::new(id.into(), parse.0.syntax_node()), &parse.1))
 }
 
 fn eager_macro_recur(
@@ -161,7 +161,6 @@ fn eager_macro_recur(
     macro_resolver: &dyn Fn(&ModPath) -> Option<MacroDefId>,
     eager_callback: EagerCallBackFn<'_>,
 ) -> ExpandResult<Option<(SyntaxNode, TextSize)>> {
-    let (editor, _) = SyntaxEditor::new(curr.value.clone());
     let original = curr.value.clone();
 
     let mut replacements = Vec::new();
@@ -285,7 +284,7 @@ fn eager_macro_recur(
                     expanded_map,
                     offset,
                     // FIXME: We discard parse errors here
-                    parse.as_ref().map(|it| it.syntax_node()),
+                    parse,
                     krate,
                     call_site,
                     macro_depth + 1,
@@ -315,7 +314,11 @@ fn eager_macro_recur(
         }
     }
 
+    if replacements.is_empty() {
+        return ExpandResult { value: Some((original, offset)), err: error };
+    }
+    let (editor, _) = SyntaxEditor::new(original);
     replacements.into_iter().rev().for_each(|(old, new)| editor.replace(old.syntax(), new));
-    let original = editor.finish().new_root().clone();
-    ExpandResult { value: Some((original, offset)), err: error }
+    let expanded = editor.finish().new_root().clone();
+    ExpandResult { value: Some((expanded, offset)), err: error }
 }

@@ -2,6 +2,8 @@
 //! addresses it slides (rebase) and which it binds to a symbol of a library, the trie of what
 //! the image exports, and the starts of its functions.
 
+use std::borrow::Cow;
+
 use object::macho;
 
 /// A segment, by its index among the image's `LC_SEGMENT_64`s.
@@ -13,12 +15,13 @@ pub(super) struct Span {
 }
 
 /// An address dyld binds to `name` of the library `ordinal` (or a `BIND_SPECIAL_DYLIB_*`).
+/// 40 bytes; the name is borrowed (from the symbol table's strings).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) struct Bind {
+pub(super) struct Bind<'a> {
     pub addr: u64,
     pub ordinal: i64,
     /// As Mach-O names it, with its underscore.
-    pub name: Vec<u8>,
+    pub name: &'a [u8],
     pub weak: bool,
     pub addend: i64,
 }
@@ -52,6 +55,16 @@ fn uleb_len(value: u64) -> u64 {
     u64::from((64 - value.leading_zeros()).max(1).div_ceil(7))
 }
 
+/// `values` in ascending order: borrowed when they already are, as the core lists them.
+fn sorted(values: &[u64]) -> Cow<'_, [u64]> {
+    if values.is_sorted() {
+        return Cow::Borrowed(values);
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    Cow::Owned(values)
+}
+
 /// The segment `addr` is in, by index; an error when it is in none or dyld can't write it.
 fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
     let nth = (spans.iter())
@@ -72,15 +85,16 @@ fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
 
 /// The rebase opcodes of `addrs`, each a pointer dyld adds the slide to.
 pub(super) fn rebases(addrs: &[u64], spans: &[Span]) -> Result<Vec<u8>, String> {
-    let mut addrs = addrs.to_vec();
-    addrs.sort_unstable();
+    let addrs = sorted(addrs);
     if let Some(twice) = addrs.windows(2).find(|it| it[0] == it[1]) {
         return Err(format!("the address {:#x} is to be slid twice", twice[0]));
     }
     if addrs.is_empty() {
         return Ok(Vec::new());
     }
-    let mut out = vec![macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER];
+    // Runs of adjacent pointers take 2 to 3 bytes each; scattered ones about 3.
+    let mut out = Vec::with_capacity(addrs.len() * 3 + 16);
+    out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
     // Where dyld's cursor is: its segment and address.
     let mut cursor: Option<(usize, u64)> = None;
     let mut rest = &addrs[..];
@@ -118,21 +132,20 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span]) -> Result<Vec<u8>, String> 
 }
 
 /// The bind opcodes of `binds`, sorted here by symbol so each symbol is named once.
-pub(super) fn binds(binds: &mut [Bind], spans: &[Span]) -> Result<Vec<u8>, String> {
+pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, String> {
     if binds.is_empty() {
         return Ok(Vec::new());
     }
-    let mut addrs: Vec<u64> = binds.iter().map(|it| it.addr).collect();
-    addrs.sort_unstable();
-    if let Some(twice) = addrs.windows(2).find(|it| it[0] == it[1]) {
-        return Err(format!("the address {:#x} is to be bound twice", twice[0]));
+    binds.sort_unstable_by_key(|it| it.addr);
+    if let Some(twice) = binds.windows(2).find(|it| it[0].addr == it[1].addr) {
+        return Err(format!("the address {:#x} is to be bound twice", twice[0].addr));
     }
-    binds.sort_unstable_by(|a, b| {
-        (a.ordinal, &a.name, a.weak, a.addend, a.addr).cmp(&(
-            b.ordinal, &b.name, b.weak, b.addend, b.addr,
-        ))
+    binds.sort_by(|a, b| {
+        (a.ordinal, a.name, a.weak, a.addend).cmp(&(b.ordinal, b.name, b.weak, b.addend))
     });
-    let mut out = vec![macho::BIND_OPCODE_SET_TYPE_IMM | macho::BIND_TYPE_POINTER];
+    // Each bind's address and opcode take about 3 bytes; each symbol its name and 2.
+    let mut out = Vec::with_capacity(binds.len() * 4 + 16);
+    out.push(macho::BIND_OPCODE_SET_TYPE_IMM | macho::BIND_TYPE_POINTER);
     let (mut ordinal, mut symbol, mut addend) = (None, None::<(&[u8], bool)>, 0i64);
     let mut cursor: Option<(usize, u64)> = None;
     for bind in binds.iter() {
@@ -151,15 +164,15 @@ pub(super) fn binds(binds: &mut [Bind], spans: &[Span]) -> Result<Vec<u8>, Strin
             }
             ordinal = Some(bind.ordinal);
         }
-        if symbol != Some((&bind.name, bind.weak)) {
+        if symbol != Some((bind.name, bind.weak)) {
             if bind.name.is_empty() || bind.name.contains(&0) {
                 return Err(format!("a bind at {:#x} to a symbol of no name", bind.addr));
             }
             let flags = if bind.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT } else { 0 };
             out.push(macho::BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | flags);
-            out.extend_from_slice(&bind.name);
+            out.extend_from_slice(bind.name);
             out.push(0);
-            symbol = Some((&bind.name, bind.weak));
+            symbol = Some((bind.name, bind.weak));
         }
         if addend != bind.addend {
             out.push(macho::BIND_OPCODE_SET_ADDEND_SLEB);
@@ -187,105 +200,142 @@ pub(super) fn binds(binds: &mut [Bind], spans: &[Span]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
-#[derive(Default)]
+/// A node of the export trie: 16 bytes; its edges a CSR range of [`Edge`]s.
+#[derive(Clone, Copy)]
 struct Node {
-    edges: Vec<(Vec<u8>, usize)>,
-    /// Its export's flags and address (from the image's start).
-    terminal: Option<(u64, u64)>,
-    offset: u64,
+    /// The export it ends, or `u32::MAX`.
+    terminal: u32,
+    edges: u32,
+    count: u32,
+    offset: u32,
 }
 
-impl Node {
-    fn info_len(&self) -> u64 {
-        self.terminal.map_or(0, |(flags, addr)| uleb_len(flags) + uleb_len(addr))
-    }
+/// An edge of the export trie: its label is `name[from..to]` of the export `export`, so no
+/// label is copied. 16 bytes.
+#[derive(Clone, Copy)]
+struct Edge {
+    export: u32,
+    from: u32,
+    to: u32,
+    child: u32,
 }
+
+const _: () = assert!(size_of::<Node>() == 16 && size_of::<Edge>() == 16);
 
 /// The export trie of `exports` (Mach-O name, `EXPORT_SYMBOL_FLAGS_*`, address from the
-/// image's start), as dyld and `dlsym` walk it.
-pub(super) fn trie(exports: &mut [(Vec<u8>, u64, u64)]) -> Result<Vec<u8>, String> {
+/// image's start), as dyld and `dlsym` walk it and ld64 writes it: nodes depth first, edges by
+/// label, each offset a ULEB settled when no node moves.
+///
+/// Built from the names in order in one pass: a node's names are a range of them sharing its
+/// prefix, its edges the runs of one next byte, each edge's label the run's common prefix (that
+/// of its first and last name). 32 bytes per node and edge, nothing allocated per either.
+pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Result<Vec<u8>, String> {
     if exports.is_empty() {
         return Ok(Vec::new());
     }
-    exports.sort_unstable();
-    if let Some(twice) = exports.windows(2).find(|it| it[0].0 == it[1].0) {
-        return Err(format!("`{}` is exported twice", String::from_utf8_lossy(&twice[0].0)));
+    if !exports.is_sorted() {
+        exports.sort_unstable();
     }
-    let mut nodes = vec![Node::default()];
-    for (name, flags, addr) in exports.iter() {
-        if name.is_empty() || name.contains(&0) {
+    let name = |nth: usize| exports[nth].0.as_ref();
+    for nth in 0..exports.len() {
+        if name(nth).is_empty() || name(nth).contains(&0) {
             return Err("an export of no name".to_owned());
         }
-        let (mut node, mut name) = (0, &name[..]);
-        loop {
-            if name.is_empty() {
-                nodes[node].terminal = Some((*flags, *addr));
-                break;
-            }
-            let edge = nodes[node].edges.iter().position(|it| it.0[0] == name[0]);
-            let Some(edge) = edge else {
-                nodes.push(Node { terminal: Some((*flags, *addr)), ..Node::default() });
-                let child = nodes.len() - 1;
-                nodes[node].edges.push((name.to_vec(), child));
-                break;
-            };
-            let (label, child) = nodes[node].edges[edge].clone();
-            let common = label.iter().zip(name).take_while(|(a, b)| a == b).count();
-            if common < label.len() {
-                nodes.push(Node { edges: vec![(label[common..].to_vec(), child)], ..Node::default() });
-                let middle = nodes.len() - 1;
-                nodes[node].edges[edge] = (label[..common].to_vec(), middle);
-                node = middle;
-            } else {
-                node = child;
-            }
-            name = &name[common..];
+        if nth > 0 && name(nth - 1) == name(nth) {
+            return Err(format!("`{}` is exported twice", String::from_utf8_lossy(name(nth))));
         }
     }
-    for node in &mut nodes {
-        node.edges.sort_unstable();
+    if exports.len() >= u32::MAX as usize {
+        return Err(format!("{} exports: an export trie names fewer than 2^32", exports.len()));
     }
-    // Each node before its children, depth first; offsets until no ULEB changes its length.
-    let mut order = Vec::new();
-    let mut stack = vec![0];
+
+    let empty = Node { terminal: u32::MAX, edges: 0, count: 0, offset: 0 };
+    let mut nodes = Vec::with_capacity(exports.len() * 2);
+    let mut edges: Vec<Edge> = Vec::with_capacity(exports.len() * 2);
+    nodes.push(empty);
+    // A node, the range of names under it, and its prefix's length.
+    let mut work = vec![(0usize, 0usize, exports.len(), 0usize)];
+    while let Some((node, mut lo, hi, depth)) = work.pop() {
+        if name(lo).len() == depth {
+            nodes[node].terminal = lo as u32;
+            lo += 1;
+        }
+        nodes[node].edges = edges.len() as u32;
+        while lo < hi {
+            let byte = name(lo)[depth];
+            let end = lo + exports[lo..hi].partition_point(|it| it.0.as_ref()[depth] == byte);
+            let (first, last) = (name(lo), name(end - 1));
+            let common = depth
+                + 1
+                + (first[depth + 1..].iter().zip(&last[depth + 1..]))
+                    .take_while(|(a, b)| a == b)
+                    .count();
+            let child = nodes.len();
+            nodes.push(empty);
+            let (from, to) = (depth as u32, common as u32);
+            edges.push(Edge { export: lo as u32, from, to, child: child as u32 });
+            work.push((child, lo, end, common));
+            lo = end;
+        }
+        nodes[node].count = edges.len() as u32 - nodes[node].edges;
+        if nodes[node].count > 255 {
+            return Err("an export trie node of more than 255 edges".to_owned());
+        }
+    }
+
+    let info_len = |node: &Node| match node.terminal {
+        u32::MAX => 0,
+        export => {
+            let (_, flags, addr) = &exports[export as usize];
+            uleb_len(*flags) + uleb_len(*addr)
+        }
+    };
+    let label = |edge: &Edge| &exports[edge.export as usize].0.as_ref()[edge.from as usize..edge.to as usize];
+    let edges_of = |node: &Node| &edges[node.edges as usize..(node.edges + node.count) as usize];
+
+    // Each node before its children, depth first.
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut stack = vec![0u32];
     while let Some(node) = stack.pop() {
         order.push(node);
-        stack.extend(nodes[node].edges.iter().rev().map(|it| it.1));
+        stack.extend(edges_of(&nodes[node as usize]).iter().rev().map(|it| it.child));
     }
+    let mut len;
     loop {
-        let mut offset = 0;
+        len = 0u64;
         let mut moved = false;
         for &node in &order {
-            moved |= nodes[node].offset != offset;
-            nodes[node].offset = offset;
-            let info = nodes[node].info_len();
-            let mut len = uleb_len(info) + info + 1;
-            for (label, child) in &nodes[node].edges {
-                len += label.len() as u64 + 1 + uleb_len(nodes[*child].offset);
+            let offset = u32::try_from(len).map_err(|_| "an export trie past 4 GiB".to_owned())?;
+            moved |= nodes[node as usize].offset != offset;
+            nodes[node as usize].offset = offset;
+            let it = &nodes[node as usize];
+            let info = info_len(it);
+            len += uleb_len(info) + info + 1;
+            for edge in edges_of(it) {
+                len += u64::from(edge.to - edge.from) + 1
+                    + uleb_len(u64::from(nodes[edge.child as usize].offset));
             }
-            offset += len;
         }
         if !moved {
             break;
         }
     }
-    let mut out = Vec::new();
+
+    let mut out = Vec::with_capacity((len as usize).next_multiple_of(8));
     for &node in &order {
-        let node = &nodes[node];
-        debug_assert_eq!(out.len() as u64, node.offset);
-        uleb(&mut out, node.info_len());
-        if let Some((flags, addr)) = node.terminal {
-            uleb(&mut out, flags);
-            uleb(&mut out, addr);
+        let node = &nodes[node as usize];
+        debug_assert_eq!(out.len() as u64, u64::from(node.offset));
+        uleb(&mut out, info_len(node));
+        if node.terminal != u32::MAX {
+            let (_, flags, addr) = &exports[node.terminal as usize];
+            uleb(&mut out, *flags);
+            uleb(&mut out, *addr);
         }
-        if node.edges.len() > 255 {
-            return Err("an export trie node of more than 255 edges".to_owned());
-        }
-        out.push(node.edges.len() as u8);
-        for (label, child) in &node.edges {
-            out.extend_from_slice(label);
+        out.push(node.count as u8);
+        for edge in edges_of(node) {
+            out.extend_from_slice(label(edge));
             out.push(0);
-            uleb(&mut out, nodes[*child].offset);
+            uleb(&mut out, u64::from(nodes[edge.child as usize].offset));
         }
     }
     out.resize(out.len().next_multiple_of(8), 0);
@@ -294,13 +344,15 @@ pub(super) fn trie(exports: &mut [(Vec<u8>, u64, u64)]) -> Result<Vec<u8>, Strin
 
 /// `LC_FUNCTION_STARTS`: the functions' addresses as ULEB distances, the first from `text`.
 pub(super) fn function_starts(text: u64, addrs: &[u64]) -> Vec<u8> {
-    let mut addrs = addrs.to_vec();
-    addrs.sort_unstable();
-    addrs.dedup();
-    let mut out = Vec::new();
+    let addrs = sorted(addrs);
+    // Most functions are less than 16 KiB apart: two bytes each.
+    let mut out = Vec::with_capacity(addrs.len() * 2 + 8);
     let mut last = text;
     // A distance of 0 ends the list: the headers are at `text`, never a function.
-    for addr in addrs.into_iter().filter(|it| *it > text) {
+    for &addr in addrs.iter().filter(|it| **it > text) {
+        if addr == last {
+            continue;
+        }
         uleb(&mut out, addr - last);
         last = addr;
     }

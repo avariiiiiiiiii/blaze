@@ -23,6 +23,10 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     min_same      fail unless at least this many units of `tests/ui` have rustc's codes (0)
     max_accepted  fail if more than this many units of `tests/ui` are accepted (no limit)
     keep          keep every workspace, not only those of units that did not pass
+    cache         where rustc's answers are kept across runs ("~/.cache/blaze-v2-proof"; "" keeps
+                  none): by the toolchain (`rustc -vV`, `cargo -vV`) and the unit's argv, and
+                  used again only while every file and environment variable its dep-info names
+                  has the content it had, so a rerun runs rustc on what changed alone
 
 The units are the files of `tests/ui` (each revision one unit) rustc's suite expects to be
 rejected: no `check-pass`, `build-pass` or `run-*`. Each is read as compiletest reads it
@@ -31,7 +35,7 @@ program or a test harness as rustc would build it.
 
 The reference is the pinned rustc on the file as compiletest runs it (its edition and flags,
 `--cfg` of its revision, `-Zui-testing`, `-A unused -A internal_features`), with
-`--error-format=json --emit=metadata`, which is what `cargo check` asks of rustc. A unit rustc
+`--error-format=json --emit=dep-info,metadata`, which is what `cargo check` asks of rustc. A unit rustc
 accepts that way (its errors are of codegen), or crashes on, is out of scope.
 
 blaze's side: the units rustc rejects are written as packages (a library, a binary, or a library
@@ -69,7 +73,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -144,6 +148,7 @@ class Input:
     min_same: int = 0
     max_accepted: int = 1 << 62
     keep: bool = False
+    cache: str = "~/.cache/blaze-v2-proof"
 
 
 @dataclass(frozen=True)
@@ -427,14 +432,80 @@ def reference_of(returncode: int, stderr: str) -> Reference:
     if keys:
         return Reference(frozenset(keys))
     if returncode == 0:
-        return Reference(out="rustc accepts it as `cargo check` runs it (`--emit=metadata`)")
+        return Reference(out="rustc accepts it as `cargo check` runs it (`--emit=dep-info,metadata`)")
     return Reference(error=f"rustc exited {returncode} with no error:\n{stderr[-600:]}")
 
 
 def rustc_argv(unit: Unit, out_dir: str) -> list[str]:
     kind = {"lib": ["--crate-type", "lib"], "bin": ["--crate-type", "bin"], "test": ["--test"]}[unit.kind]
-    return ["rustc", unit.path, "--edition", unit.edition, *kind, "--error-format=json", "--emit=metadata",
+    return ["rustc", unit.path, "--edition", unit.edition, *kind, "--error-format=json", "--emit=dep-info,metadata",
             "-Zui-testing", *COMMON, *unit.flags, "--out-dir", out_dir]
+
+
+type Read = tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str | None], ...]]
+
+
+def dep_info(text: str, cwd: Path) -> tuple[list[str], list[tuple[str, str | None]]]:
+    """The files and environment variables a rustc dep-info file says the crate read: the
+    files from its phony `path:` lines (a space in a path written `\\ `), relative ones under
+    `cwd`; the variables from its `# env-dep:NAME=VALUE` lines (no `=`: read and unset)."""
+    files: list[str] = []
+    env: list[tuple[str, str | None]] = []
+    for line in text.splitlines():
+        if line.startswith("# env-dep:"):
+            name, eq, value = line[len("# env-dep:"):].partition("=")
+            env.append((name, value if eq else None))
+        elif line.endswith(":") and not line.startswith("#"):
+            path = line[:-1].replace("\\ ", " ")
+            files.append(str(cwd / path) if not Path(path).is_absolute() else path)
+    return files, env
+
+
+def what_was_read(out: Path, cwd: Path) -> Read | None:
+    """Each file rustc's dep-info in `out` names with its sha256, and each variable with its
+    value; None when there is no dep-info (rustc stopped before writing it) or a file it names
+    is gone: then nothing can say when its answer would still hold."""
+    written = sorted(out.glob("*.d"))
+    if len(written) != 1:
+        return None
+    files, env = dep_info(written[0].read_text(errors="replace"), cwd)
+    hashed: list[tuple[str, str]] = []
+    for path in sorted(set(files)):
+        try:
+            hashed.append((path, engine.digest(Path(path))))
+        except OSError:
+            return None
+    return tuple(hashed), tuple(sorted(set(env), key=lambda e: (e[0], e[1] or "")))
+
+
+def kept_reference(entry: object, env: dict[str, str], where: str) -> Reference | None:
+    """A kept answer of rustc, when every file it read still has the sha256 it had and every
+    variable its value; else None. An entry not of the shape `reference` writes is a Failed."""
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise engine.Failed(f"the kept answer of rustc {where} is not one rejections.py wrote: {entry!r:.300}")
+    fields = cast(dict[str, object], entry)
+    files, variables, keys, out = fields.get("files"), fields.get("env"), fields.get("keys"), fields.get("out")
+    if not (isinstance(files, list) and isinstance(variables, list) and isinstance(keys, list)
+            and "out" in fields and (out is None or isinstance(out, str))):
+        raise engine.Failed(f"the kept answer of rustc {where} is not one rejections.py wrote: {entry!r:.300}")
+    for pair in cast(list[object], files):
+        if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) for p in pair)):
+            raise engine.Failed(f"the kept answer of rustc {where} has the file {pair!r}")
+        path, sha = cast(list[str], pair)
+        try:
+            if engine.digest(Path(path)) != sha:
+                return None
+        except OSError:
+            return None
+    for pair in cast(list[object], variables):
+        if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str)):
+            raise engine.Failed(f"the kept answer of rustc {where} has the variable {pair!r}")
+        name, value = cast(list[Any], pair)
+        if env.get(name) != value:
+            return None
+    return Reference(frozenset(str(k) for k in cast(list[object], keys)), cast(str | None, out))
 
 
 def cargo_messages(stdout: str) -> tuple[dict[str, frozenset[str]], frozenset[str], frozenset[str]]:
@@ -568,13 +639,25 @@ def write_workspace(ws: Path, index: int, units: Sequence[Unit]) -> tuple[dict[s
     return members, out
 
 
-def reference(unit: Unit, scratch: Path, env: dict[str, str]) -> Reference:
+def reference(unit: Unit, scratch: Path, env: dict[str, str], kept: engine.Kept, toolchain: str) -> tuple[Reference, bool]:
+    """rustc's answer on `unit`, and whether it was kept from an earlier run (`kept_reference`:
+    while what it read is unchanged); else rustc is run and its answer kept with what it read.
+    An answer the harness could not get (a timeout) is never kept."""
+    cwd = Path(unit.path).parent
+    key = kept.key(toolchain, str(cwd), *rustc_argv(unit, "{out}"))
+    if (known := kept_reference(kept.get(key), env, str(kept.path(key)))) is not None:
+        return known, True
     with tempfile.TemporaryDirectory(dir=scratch) as out:
         try:
-            ran = engine.run(f"rustc {unit.label}", rustc_argv(unit, out), Path(unit.path).parent, env, RUSTC_SECS)
+            ran = engine.run(f"rustc {unit.label}", rustc_argv(unit, out), cwd, env, RUSTC_SECS)
         except engine.Failed as e:
-            return Reference(error=str(e))
-    return reference_of(ran.returncode, ran.stderr)
+            return Reference(error=str(e)), False
+        ref = reference_of(ran.returncode, ran.stderr)
+        if ref.error is None and (read := what_was_read(Path(out), cwd)) is not None:
+            files, variables = read
+            kept.put(key, dict(files=[list(f) for f in files], env=[list(v) for v in variables],
+                               keys=sorted(ref.keys), out=ref.out))
+    return ref, False
 
 
 def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path, store: Path, whole: bool) -> Batch:
@@ -682,8 +765,15 @@ def main(args: Input) -> None:
     fixed = fixed_cases(host) if args.fixed else []
     rep = report.Report(SCRIPT, args.engine, args.out)
     every = [*candidates, *(unit for unit, _, _ in fixed)]
+    kept = engine.Kept(args.cache, "rustc")
+    try:
+        toolchain = engine.toolchain_identity(env)
+    except engine.Failed as e:
+        fail(SCRIPT, str(e))
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        references = dict(zip((u.label for u in every), pool.map(lambda u: reference(u, work / "rustc", env), every)))
+        answers = list(pool.map(lambda u: reference(u, work / "rustc", env, kept, toolchain), every))
+    references = {u.label: ref for u, (ref, _) in zip(every, answers)}
+    rustc_kept = sum(hit for _, hit in answers)
     rejected: list[Unit] = []
     issues: dict[str, str] = {}
     for unit in candidates:
@@ -707,7 +797,8 @@ def main(args: Input) -> None:
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         running = [pool.submit(run_batch, eng, i, chunk, work, work / "store", args.whole)
                    for i, chunk in enumerate(batches_of(rejected, args.batch))]
-        for done in concurrent.futures.as_completed(running):
+        # In the order the workspaces were made, not the order they end in: one report for one input.
+        for done in running:
             batch = done.result()
             for _, why in batch.out:
                 out_of_scope[why] += 1
@@ -735,6 +826,7 @@ def main(args: Input) -> None:
                 ceiling=args.max_accepted)
     rep.extra.update(work=str(work), toolchain=engine.TOOLCHAIN, rust=args.rust, files=files,
                      not_rejections=passing, units=len(candidates), in_scope=in_scope,
+                     rustc_runs=len(every) - rustc_kept, rustc_kept=rustc_kept,
                      categories=dict(categories), fixed=dict(fixed_categories),
                      out_of_scope=dict(out_of_scope.most_common()))
     if not args.keep:
@@ -927,9 +1019,49 @@ def test_fixed_cases() -> None:
     assert named["const-atomic-load.rs"][0].kind == "lib"
 
 
+def test_kept_answers() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "a b").mkdir()
+        main, module = root / "t.rs", root / "a b" / "m.rs"
+        main.write_text("mod m;\n")
+        module.write_text("fn f() {}\n")
+        out = root / "out"
+        out.mkdir()
+        assert what_was_read(out, root) is None, "no dep-info is not an answer that can be kept"
+        (out / "t.d").write_text(f"{out}/libt.rmeta: {main} a\\ b/m.rs\n\n{out}/t.d: {main} a\\ b/m.rs\n\n"
+                                 f"{main}:\na\\ b/m.rs:\n\n# env-dep:SET=1\n# env-dep:UNSET\n")
+        files, variables = dep_info((out / "t.d").read_text(), root)
+        assert files == [str(main), str(module)], files
+        assert variables == [("SET", "1"), ("UNSET", None)], variables
+        read = what_was_read(out, root)
+        assert read is not None and [p for p, _ in read[0]] == sorted([str(main), str(module)]), read
+        kept = engine.Kept(str(root / "kept"), "rustc")
+        files_read, env_read = read
+        kept.put("k", dict(files=[list(f) for f in files_read], env=[list(v) for v in env_read],
+                           keys=["E0063"], out=None))
+        env = {"SET": "1"}
+        assert kept_reference(kept.get("k"), env, "k") == Reference(frozenset({"E0063"}))
+        assert kept_reference(kept.get("k"), {"SET": "2"}, "k") is None, "a variable changed"
+        assert kept_reference(kept.get("k"), {"SET": "1", "UNSET": "x"}, "k") is None, "a variable unset is set"
+        module.write_text("fn g() {}\n")
+        assert kept_reference(kept.get("k"), env, "k") is None, "a module it read changed"
+        module.unlink()
+        assert kept_reference(kept.get("k"), env, "k") is None, "a module it read is gone"
+        assert kept_reference(None, env, "k") is None
+        for bad in ([], {"files": [["a"]], "env": [], "keys": [], "out": None}, {"files": [], "env": [], "keys": []}):
+            try:
+                kept_reference(bad, env, "k")
+            except engine.Failed:
+                continue
+            raise AssertionError(f"a kept answer of another shape was taken: {bad}")
+    unit = Unit("t.rs", "/x/t.rs", None, "lib", "2021")
+    assert "--emit=dep-info,metadata" in rustc_argv(unit, "/o")
+
+
 SELFTESTS = (test_directives, test_classify_modes, test_classify_scope, test_classify_shape, test_flag_of,
              test_host_names, test_shard, test_keys, test_cargo_messages, test_verdict, test_header, test_packages,
-             test_fixed_cases)
+             test_fixed_cases, test_kept_answers)
 
 
 def selftest() -> int:

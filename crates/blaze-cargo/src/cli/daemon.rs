@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
 use blaze_api::{
     Request, Response, Status,
     client::{Client, ClientError},
@@ -14,17 +13,35 @@ use blaze_api::{
 
 /// How long a daemon that was started is waited for, and one that was told to stop.
 pub const PATIENCE: Duration = Duration::from_secs(10);
-const POLL: Duration = Duration::from_millis(5);
+/// A socket that comes up within a millisecond is used within one.
+const POLL: Duration = Duration::from_millis(1);
 
-/// What the commands ask of the daemon: [`Client::call`], which the tests fake.
+/// What the commands ask of the daemon, which the tests fake.
 pub trait Api {
-    /// Sends `request` and hands each of its responses to `on` until its Done; Done's `ok`.
-    fn call(&mut self, request: Request, on: &mut dyn FnMut(&Response)) -> Result<bool, ClientError>;
+    /// Sends `request` and hands each of its responses to `on`, owned, until its Done (handed
+    /// too); Done's `ok`.
+    fn call<F: FnMut(Response)>(&mut self, request: Request, on: F) -> Result<bool, ClientError>;
 }
 
+/// One request per connection: a response to any other is the daemon's mistake, said as one.
 impl Api for Client {
-    fn call(&mut self, request: Request, on: &mut dyn FnMut(&Response)) -> Result<bool, ClientError> {
-        Client::call(self, request, on)
+    fn call<F: FnMut(Response)>(&mut self, request: Request, mut on: F) -> Result<bool, ClientError> {
+        let id = self.send(request)?;
+        loop {
+            let envelope = self.receive()?;
+            if envelope.id != id {
+                let said = format!("the daemon answered request {} on a connection that sent only {id}", envelope.id);
+                return Err(ClientError::Refused(blaze_api::ApiError::new(said, None)));
+            }
+            let done = match envelope.body {
+                Response::Done { ok } => Some(ok),
+                _ => None,
+            };
+            on(envelope.body);
+            if let Some(ok) = done {
+                return Ok(ok);
+            }
+        }
     }
 }
 
@@ -81,6 +98,7 @@ pub fn not_listening(socket: &Path, log: &Path, error: &str) -> String {
 /// terminal's foreground does not end it, with its output appended to its log; the log.
 #[cfg(unix)]
 fn started() -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
     let state = crate::serve::state()?;
     crate::socket::private_dir(&state).with_context(|| format!("the daemon's directory {}", state.display()))?;
     let log = state.join("serve.log");
@@ -102,9 +120,9 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
         return Ok(0);
     };
     let mut said = Vec::new();
-    let ok = Api::call(&mut client, Request::Stop, &mut |response| {
+    let ok = Api::call(&mut client, Request::Stop, |response| {
         if let Response::Error(error) = response {
-            said.push(error.what.clone());
+            said.push(error.what);
         }
     })?;
     drop(client);
@@ -145,9 +163,9 @@ pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color:
     };
     let mut status = None;
     let mut said = Vec::new();
-    let ok = Api::call(&mut client, Request::Status, &mut |response| match response {
-        Response::Status(it) => status = Some(it.clone()),
-        Response::Error(error) => said.push(error.what.clone()),
+    let ok = Api::call(&mut client, Request::Status, |response| match response {
+        Response::Status(it) => status = Some(it),
+        Response::Error(error) => said.push(error.what),
         _ => {}
     })?;
     for what in said {

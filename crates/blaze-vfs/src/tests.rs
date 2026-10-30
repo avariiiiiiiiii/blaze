@@ -166,7 +166,8 @@ fn deletes_and_renames_of_directories() {
     let all = tree.apply(base, &[delete("src"), delete("top")]).unwrap();
     assert_eq!(all, tree.empty());
 
-    let error = |ops: &[Op]| tree.clone().apply(base, ops).unwrap_err();
+    let nodes = tree.len();
+    let mut error = |ops: &[Op]| tree.apply(base, ops).unwrap_err();
     assert_eq!(error(&[rename("src", "src/x/inner")]), OpError::BadPath("src/x/inner".into()));
     assert_eq!(error(&[rename("top", "src")]), OpError::Exists("src".into()));
     assert_eq!(error(&[write("top/a", "")]), OpError::NotADirectory("top/a".into()));
@@ -174,6 +175,7 @@ fn deletes_and_renames_of_directories() {
     assert_eq!(error(&[delete("nope")]), OpError::NotFound("nope".into()));
     assert_eq!(error(&[write("../a", "")]), OpError::BadPath("../a".into()));
     assert_eq!(error(&[write("a//b", "")]), OpError::BadPath("a//b".into()));
+    assert_eq!(tree.len(), nodes, "a refused transaction adds no node");
 }
 
 #[test]
@@ -471,9 +473,17 @@ fn model_apply(model: &mut BTreeMap<String, (Mode, Vec<u8>)>, op: &Op) -> bool {
     true
 }
 
-#[test]
 fn listed(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-    Some(reader.list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect())
+    Some(reader.list(root, path)?.collect())
+}
+
+/// What a pinned read lends, owned, to compare with [`Reader::file`].
+fn pinned_file(reader: &Reader, root: ContentId, path: &str) -> Option<(ContentId, Mode, Vec<u8>)> {
+    reader.pin().file(root, path).map(|it| (it.id, it.mode, it.bytes.to_vec()))
+}
+
+fn pinned_list(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+    Some(reader.pin().list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect())
 }
 
 #[test]
@@ -493,10 +503,15 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
         let file = vfs.read(view, path).map(|it| (it.id, it.mode, it.bytes.to_vec()));
         let read = reader.file(root, path).map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
         assert_eq!(read, file, "{path}");
+        assert_eq!(pinned_file(&reader, root, path), file, "{path}");
     }
     for path in ["", "src", "run.sh", "nope"] {
         assert_eq!(listed(&reader, root, path), vfs.list(view, path), "{path}");
+        assert_eq!(pinned_list(&reader, root, path), vfs.list(view, path), "{path}");
     }
+    // A read lends the tree's own bytes: no copy, whichever handle reads them.
+    let lent = reader.file(root, "run.sh").unwrap().2;
+    assert!(std::ptr::eq(lent.as_ptr(), vfs.read(view, "run.sh").unwrap().bytes.as_ptr()));
     let file_id = vfs.lookup(view, "run.sh").unwrap();
     assert_eq!(listed(&reader, file_id, ""), None, "a file is no root");
     assert_eq!(reader.file(file_id, ""), None);
@@ -511,8 +526,7 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
                 let reader = reader.clone();
                 scope.spawn(move || {
                     (0..2000).all(|_| {
-                        reader.file(what_if, "src/lib.rs").map(|it| &it.2[..])
-                            == Some(b"pub fn a() {}".as_slice())
+                        reader.file(what_if, "src/lib.rs").is_some_and(|it| *it.2 == *b"pub fn a() {}")
                     })
                 })
             })
@@ -528,15 +542,11 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
             assert!(reading.join().unwrap());
         }
     });
-    // SAFETY: every reading thread has joined.
-    unsafe { vfs.reclaim() };
 
     // Collection takes from the reader what it takes from the tree.
     vfs.close(view);
     vfs.remove_head("w");
     vfs.collect(&[what_if]);
-    // SAFETY: no read is going on.
-    unsafe { vfs.reclaim() };
     assert!(vfs.has(what_if) && !vfs.has(root));
     assert_eq!(reader.file(root, "run.sh"), None);
     assert_eq!(listed(&reader, root, ""), None);
@@ -984,17 +994,30 @@ fn told(files: &[&str]) -> Completion {
     }
 }
 
-/// The tags of the stats in `effects`, which are taken.
-fn stats(effects: &mut Vec<Effect>) -> Vec<Tag> {
-    let mut tags = Vec::new();
+/// The stat and read tags of each path `effects` asks to look at, which are taken: both are
+/// asked at once, in the same order.
+fn looks(effects: &mut Vec<Effect>) -> Vec<(Tag, Tag)> {
+    let (mut stats, mut reads) = (Vec::new(), Vec::new());
     effects.retain(|it| match it {
-        Effect::Stat { tag, .. } => {
-            tags.push(*tag);
+        Effect::Stat { file, tag } => {
+            stats.push((file.clone(), *tag));
+            false
+        }
+        Effect::ReadAll { file, tag } => {
+            reads.push((file.clone(), *tag));
             false
         }
         _ => true,
     });
-    tags
+    assert_eq!(stats.len(), reads.len(), "each stat is asked with its read");
+    stats
+        .into_iter()
+        .zip(reads)
+        .map(|((stat_file, stat), (read_file, read))| {
+            assert_eq!(stat_file, read_file);
+            (stat, read)
+        })
+        .collect()
 }
 
 fn a_file(len: u64) -> Done {
@@ -1080,17 +1103,17 @@ fn a_path_changed_since_the_report_is_a_conflict() {
     scan_as_head(&mut vfs, &mut watcher, &mut effects);
     effects.clear();
     assert_eq!(watcher.complete(&mut vfs, told(&["ws/c", "ws/d"]), &mut effects), vec![]);
-    let tags = stats(&mut effects);
+    let tags = looks(&mut effects);
     assert_eq!(tags.len(), 2);
 
     // An agent changes `c` before the disk's change is read.
     vfs.commit("disk", base.root, &[write("c", "agent")]).unwrap();
     let mut out = Vec::new();
-    for &tag in &tags {
+    for &(tag, _) in &tags {
         out.extend(watcher.complete(&mut vfs, Completion { tag, done: a_file(4) }, &mut effects));
     }
-    assert!(effects.iter().any(|it| matches!(it, Effect::ReadAll { tag, .. } if *tag == tags[0])));
-    for &tag in &tags {
+    assert_eq!(looks(&mut effects), vec![], "a stat asks for nothing more: the read is in flight");
+    for &(_, tag) in &tags {
         let read = Completion { tag, done: Done::Read(b"disk".to_vec()) };
         out.extend(watcher.complete(&mut vfs, read, &mut effects));
     }
@@ -1112,15 +1135,14 @@ fn reports_commit_in_the_order_they_were_told() {
     effects.clear();
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
-    let tags = stats(&mut effects);
-    let read = |vfs: &mut Vfs, watcher: &mut Watcher, tag, bytes: &[u8]| {
+    let tags = looks(&mut effects);
+    // The read comes back before its stat: it waits for the stat to say a file.
+    let read = |vfs: &mut Vfs, watcher: &mut Watcher, (stat, read): (Tag, Tag), bytes: &[u8]| {
         let mut effects = Vec::new();
-        let mut out = watcher.complete(vfs, Completion { tag, done: a_file(1) }, &mut effects);
-        out.extend(watcher.complete(
-            vfs,
-            Completion { tag, done: Done::Read(bytes.to_vec()) },
-            &mut effects,
-        ));
+        let read = Completion { tag: read, done: Done::Read(bytes.to_vec()) };
+        let mut out = watcher.complete(vfs, read, &mut effects);
+        assert_eq!(out, vec![]);
+        out.extend(watcher.complete(vfs, Completion { tag: stat, done: a_file(1) }, &mut effects));
         out
     };
     // The later report is read first, and waits for the earlier one.
@@ -1145,8 +1167,8 @@ fn an_unreadable_path_or_lost_changes_are_named() {
     effects.clear();
 
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
-    let tags = stats(&mut effects);
-    let &[tag] = tags.as_slice() else { panic!("one stat: {tags:?}") };
+    let tags = looks(&mut effects);
+    let &[(tag, read)] = tags.as_slice() else { panic!("one look: {tags:?}") };
     let error = IoError("permission denied".into());
     let failed = Completion { tag, done: Done::Failed(error.clone()) };
     assert_eq!(
@@ -1154,7 +1176,11 @@ fn an_unreadable_path_or_lost_changes_are_named() {
         vec![Watched::Unreadable { path: "a".into(), error }]
     );
     assert_eq!(vfs.head("disk"), None);
-    assert!(watcher.idle());
+    assert!(watcher.idle(), "the failed stat settled the path; its read is not waited for");
+    // The read the stat made moot comes back late, and is dropped.
+    let late = Completion { tag: read, done: Done::Read(b"late".to_vec()) };
+    assert_eq!(watcher.complete(&mut vfs, late, &mut effects), vec![]);
+    assert_eq!(vfs.head("disk"), None);
 
     // Dropped changes are a rescan; a second loss while it lists asks for one more after.
     let lost = || Completion { tag: Tag(100), done: Done::Changed { files: Vec::new(), lost: true } };

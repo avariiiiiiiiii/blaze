@@ -20,11 +20,17 @@
 //! that failed), the obligation's cause (rustc's `ObligationCauseCode`, here found again from
 //! the syntax the bound was registered at), whether a span is of a format string's
 //! desugaring, and the ambiguous goals rustc reports as E0283.
+//!
+//! Cost: nothing until the solver reports the error. Then O(the call's arguments, the
+//! callee's bounds and the trait's attributes): types compare as interned ids, never printed;
+//! whether the trait has impls is read from its row of the cached impl tables; the
+//! `on_unimplemented` arguments are made only for a trait with the attribute.
 
 use base_db::{CrateOrigin, LangCrateOrigin};
 use blaze_items::{Fact, ItemId};
 use hir::{AsAssocItem as _, InFile, LangItem, PathResolution};
 use hir_def::FunctionId;
+use hir_ty::method_resolution::TraitImpls;
 use syntax::{
     AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, TextRange,
     ast::{self, HasAttrs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
@@ -53,8 +59,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
         (Some(leaf_self), Some(root_self))
             if root_ref.trait_() != leaf_trait
                 && !is_lang(cx, root_ref.trait_(), LangItem::Unsize)
-                && (cx.ty(leaf_self) == cx.ty(&root_self.strip_references())
-                    || cx.ty(leaf_self) == cx.ty(root_self)) =>
+                && (*leaf_self == root_self.strip_references() || leaf_self == root_self) =>
         {
             root
         }
@@ -64,9 +69,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
     let direct = d.parent_trait_predicates.is_empty() || !main_is_leaf;
 
     let at = cx.syntax(d.span.map(|it| it.syntax_node_ptr()));
-    let want = root_self.as_ref().map(|it| cx.ty(it));
     let cause = Cause::of(cx, &at, |ty| {
-        want.as_ref().is_some_and(|want| cx.ty(ty) == *want || cx.ty(&ty.strip_references()) == *want)
+        root_self.as_ref().is_some_and(|want| ty == want || ty.strip_references() == *want)
     });
     let custom = on_unimplemented(cx, main, direct);
     let message = custom.message.clone().unwrap_or_else(|| {
@@ -112,7 +116,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
         suggest_derive(cx, leaf, &mut diag);
     }
     if is_local_trait(cx, leaf_trait)
-        && hir::Impl::all_for_trait(cx.db, leaf_trait).is_empty()
+        && !has_impls(cx, leaf_trait)
         && !leaf_trait.is_auto(cx.db)
         && leaf.polarity() == hir::PredicatePolarity::Positive
         && let Some(src) = cx.sema.source(leaf_trait)
@@ -194,7 +198,7 @@ impl Cause {
             callee_span: None,
             callee: None,
         };
-        let (callee_range, callee, args): (TextRange, Option<hir::Function>, Vec<ast::Expr>) =
+        let (callee_range, callee, args): (TextRange, Option<hir::Function>, Option<ast::ArgList>) =
             if let Some(path) = ast::PathExpr::cast(at.value.clone())
                 && let Some(call) = path.syntax().parent().and_then(ast::CallExpr::cast)
                 && call.expr().is_some_and(|it| it.syntax() == path.syntax())
@@ -205,22 +209,20 @@ impl Cause {
                         _ => None,
                     }
                 });
-                let args = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
-                (path.syntax().text_range(), callee, args)
+                (path.syntax().text_range(), callee, call.arg_list())
             } else if let Some(call) = ast::MethodCallExpr::cast(at.value.clone()) {
                 let Some(name) = call.name_ref() else { return plain() };
-                let args = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
-                (name.syntax().text_range(), cx.sema.resolve_method_call(&call), args)
+                (name.syntax().text_range(), cx.sema.resolve_method_call(&call), call.arg_list())
             } else {
                 return plain();
             };
         let callee_span = cx.span(at.with_value(callee_range));
-        let blamed: Vec<&ast::Expr> = args
+        let mut blamed = args
             .iter()
-            .filter(|arg| cx.sema.type_of_expr(arg).is_some_and(|it| is_of(&it.original)))
-            .collect();
-        match blamed.as_slice() {
-            [arg] => Cause {
+            .flat_map(|it| it.args())
+            .filter(|arg| cx.sema.type_of_expr(arg).is_some_and(|it| is_of(&it.original)));
+        match (blamed.next(), blamed.next()) {
+            (Some(arg), None) => Cause {
                 span: cx.span(at.with_value(arg.syntax().text_range())),
                 node: at.with_value(arg.syntax().clone()),
                 callee_span: Some(callee_span),
@@ -293,33 +295,36 @@ pub(super) fn where_clause_note<'db>(
     self_ty: Option<&hir::Type<'db>>,
 ) {
     let Some(src) = cx.sema.source(callee) else { return };
-    let name = print::def_path(cx, hir::ModuleDef::Function(callee));
     let item = &src.value;
-    let bounds: Vec<ast::TypeBound> = bounds_of(item)
-        .into_iter()
-        .filter(|bound| bound_trait(cx, bound) == Some(trait_))
-        .collect();
+    let mut bounds = bounds_of(item).filter(|bound| bound_trait(cx, bound) == Some(trait_));
+    let only = bounds.next();
+    if only.is_some() && bounds.next().is_some() {
+        return;
+    }
+    let name = print::def_path(cx, hir::ModuleDef::Function(callee));
     let ident = item.name().map(|it| cx.span(src.with_value(it.syntax().text_range())));
-    let (at, descr, label) = match bounds.as_slice() {
-        [bound] => (
+    let (at, descr, label) = match only {
+        Some(bound) => (
             cx.span(src.with_value(bound.syntax().text_range())),
             format!("required by a bound in `{name}`"),
             format!("required by this bound in `{name}`"),
         ),
-        [] if is_lang(cx, trait_, LangItem::Sized) => {
-            let params: Vec<ast::TypeParam> = item
-                .generic_param_list()
-                .map(|it| it.type_or_const_params().filter_map(|p| match p {
+        None if is_lang(cx, trait_, LangItem::Sized) => {
+            let mut params = item.generic_param_list().into_iter().flat_map(|it| {
+                it.type_or_const_params().filter_map(|p| match p {
                     ast::TypeOrConstParam::Type(it) if !is_maybe_sized(&it) => Some(it),
                     _ => None,
-                }).collect())
-                .unwrap_or_default();
-            let param = match (params.as_slice(), self_ty.and_then(|it| it.as_type_param(cx.db))) {
-                (_, Some(param)) => params
-                    .iter()
-                    .find(|it| it.name().is_some_and(|n| n.text() == param.name(cx.db).as_str())),
-                ([only], None) => Some(only),
-                _ => None,
+                })
+            });
+            let param = match self_ty.and_then(|it| it.as_type_param(cx.db)) {
+                Some(param) => {
+                    let want = param.name(cx.db);
+                    params.find(|it| it.name().is_some_and(|n| n.text() == want.as_str()))
+                }
+                None => match (params.next(), params.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                },
             };
             let Some(param) = param else { return };
             let range = param.name().map_or(param.syntax().text_range(), |it| it.syntax().text_range());
@@ -352,26 +357,30 @@ pub(super) fn where_clause_note<'db>(
     }
 }
 
-/// The bounds written on a function's type parameters and in its where clause, in order.
-fn bounds_of(item: &ast::Fn) -> Vec<ast::TypeBound> {
-    let mut out = Vec::new();
-    if let Some(params) = item.generic_param_list() {
-        for param in params.type_or_const_params() {
-            if let ast::TypeOrConstParam::Type(param) = param
-                && let Some(list) = param.type_bound_list()
-            {
-                out.extend(list.bounds());
-            }
-        }
-    }
-    if let Some(clause) = item.where_clause() {
-        for pred in clause.predicates() {
-            if let Some(list) = pred.type_bound_list() {
-                out.extend(list.bounds());
-            }
-        }
-    }
-    out
+/// The bounds written on a function's type parameters, in its parameters' `impl Trait` types
+/// and in its where clause, in order.
+fn bounds_of(item: &ast::Fn) -> impl Iterator<Item = ast::TypeBound> {
+    let params = item
+        .generic_param_list()
+        .into_iter()
+        .flat_map(|it| it.type_or_const_params())
+        .filter_map(|param| match param {
+            ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
+            ast::TypeOrConstParam::Const(_) => None,
+        });
+    let impl_traits = item
+        .param_list()
+        .into_iter()
+        .flat_map(|it| it.params())
+        .filter_map(|param| param.ty())
+        .flat_map(|ty| ty.syntax().descendants().filter_map(ast::ImplTraitType::cast))
+        .filter_map(|it| it.type_bound_list());
+    let wheres = item
+        .where_clause()
+        .into_iter()
+        .flat_map(|it| it.predicates())
+        .filter_map(|pred| pred.type_bound_list());
+    params.chain(impl_traits).chain(wheres).flat_map(|list| list.bounds())
 }
 
 /// The trait a bound names.
@@ -428,17 +437,18 @@ fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: boo
     let tr = pred.trait_ref();
     let trait_ = tr.trait_();
     let Some(src) = cx.sema.source(trait_) else { return Custom::default() };
-    let args = Args::of(cx, pred);
+    let mut args = None;
     let mut custom = Custom::default();
     for attr in src.value.attrs() {
         let Some(ast::Meta::TokenTreeMeta(meta)) = attr.meta() else { continue };
         let Some(path) = meta.path() else { continue };
-        let path = path.syntax().text().to_string();
+        let path = path.syntax().text();
         let is_rustc = path == "rustc_on_unimplemented";
         if !is_rustc && path != "diagnostic::on_unimplemented" {
             continue;
         }
         let Some(tt) = meta.token_tree() else { continue };
+        let args: &Args = args.get_or_insert_with(|| Args::of(cx, pred));
         let metas = parse_metas(tt.syntax());
         // rustc walks the directive, then its `on(..)`s from the last to the first, each that
         // holds overriding the message and label before it and adding its notes: the first
@@ -736,7 +746,7 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
         "Copy" | "Clone" => true,
         _ if matches!(adt, hir::Adt::Union(_)) => false,
         "PartialEq" | "PartialOrd" => {
-            tr.get_type_argument(1).is_some_and(|rhs| cx.ty(&rhs) == cx.ty(&self_ty))
+            tr.get_type_argument(1).is_some_and(|rhs| rhs == self_ty)
         }
         _ => true,
     };
@@ -744,19 +754,19 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
         return false;
     }
     let args: Vec<hir::Type<'_>> = self_ty.type_arguments().collect();
-    let fields: Vec<hir::Field> = match adt {
-        hir::Adt::Struct(it) => it.fields(cx.db),
-        hir::Adt::Union(it) => it.fields(cx.db),
-        hir::Adt::Enum(it) => it.variants(cx.db).into_iter().flat_map(|v| v.fields(cx.db)).collect(),
-    };
-    fields.iter().all(|field| {
+    let has_rhs = matches!(name, "PartialEq" | "PartialOrd");
+    let holds = |field: hir::Field| {
         let ty = field.ty(cx.db).instantiate_type_params(args.iter());
-        let rhs: Vec<hir::Type<'_>> = match name {
-            "PartialEq" | "PartialOrd" => vec![ty.clone()],
-            _ => Vec::new(),
-        };
-        ty.impls_trait(cx.db, trait_, &rhs)
-    })
+        let rhs: &[hir::Type<'_>] = if has_rhs { std::slice::from_ref(&ty) } else { &[] };
+        ty.impls_trait(cx.db, trait_, rhs)
+    };
+    match adt {
+        hir::Adt::Struct(it) => it.fields(cx.db).into_iter().all(holds),
+        hir::Adt::Union(it) => it.fields(cx.db).into_iter().all(holds),
+        hir::Adt::Enum(it) => {
+            it.variants(cx.db).into_iter().all(|v| v.fields(cx.db).into_iter().all(holds))
+        }
+    }
 }
 
 /// rustc's `suggest_derive`: "consider annotating `S` with `#[derive(Trait)]`".
@@ -786,6 +796,23 @@ fn is_local_adt(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
 
 fn is_local_trait(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     trait_.module(cx.db).krate(cx.db) == cx.krate
+}
+
+/// Whether the crate being checked has an impl of `trait_`, one of its own traits: rustc's
+/// `all_impls(..)` of the local crate, which is all a local trait can have (crates after it are
+/// not seen). Reads the trait's row of the crate's impl table and of the trait's block's, both
+/// salsa-cached, and allocates nothing.
+fn has_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
+    let id = hir_def::TraitId::from(trait_);
+    let module = hir_def::ModuleId::from(trait_.module(cx.db));
+    sees(TraitImpls::for_crate(cx.db, cx.krate.into()), id)
+        || module.block(cx.db).and_then(|it| TraitImpls::for_block(cx.db, it)).is_some_and(|it| sees(it, id))
+}
+
+fn sees(impls: &TraitImpls<'_>, trait_: hir_def::TraitId) -> bool {
+    let mut any = false;
+    impls.for_trait(trait_, |run| any |= run.either(|it| !it.is_empty(), |it| !it.is_empty()));
+    any
 }
 
 pub(super) fn is_lang(cx: &Cx<'_, '_>, trait_: hir::Trait, item: LangItem) -> bool {

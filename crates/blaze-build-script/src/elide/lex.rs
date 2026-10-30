@@ -9,23 +9,27 @@
 //! `foo#`), a lone carriage return, and the text direction code points rustc's
 //! `text_direction_codepoint_in_literal` and `…_in_comment` lints deny. A refusal only means
 //! a script is run rather than elided.
+//!
+//! Tokens borrow the source: a string's value is the source's own bytes unless an escape
+//! made it differ, so lexing a script allocates its token list and only escaped strings.
 
 use std::borrow::Cow;
 
 /// What a token is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub enum Kind<'a> {
     /// An identifier or keyword: `fn`, `main`, `println`, `true`.
     Ident,
     /// `r#name`.
     RawIdent,
     /// `'a`, a lifetime or a label.
     Lifetime,
-    /// `"…"`, with its value once escapes are read, and whether an escape made a `{` or `}`
-    /// (which a format string would read as source braces only when written as braces).
-    Str { value: String, escaped_brace: bool },
+    /// `"…"`, with its value once escapes are read (borrowed when it has none), and whether
+    /// an escape made a `{` or `}` (which a format string would read as source braces only
+    /// when written as braces).
+    Str { value: Cow<'a, str>, escaped_brace: bool },
     /// `r"…"` or `r#"…"#`, with its value.
-    RawStr { value: String },
+    RawStr { value: &'a str },
     /// `'x'`, with its value.
     Char(char),
     /// A decimal integer with no suffix, with its value.
@@ -44,7 +48,7 @@ pub enum Kind {
 /// A token and its text in the normalized source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token<'a> {
-    pub kind: Kind,
+    pub kind: Kind<'a>,
     pub text: &'a str,
 }
 
@@ -75,12 +79,50 @@ pub fn normalize(source: &str) -> Cow<'_, str> {
 }
 
 /// The punctuation characters of Rust's tokens.
-const PUNCT: &str = ";,.(){}[]@#~?:$=!<>-&|+*/^%";
+fn is_punct(c: char) -> bool {
+    matches!(
+        c,
+        ';' | ','
+            | '.'
+            | '('
+            | ')'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '@'
+            | '#'
+            | '~'
+            | '?'
+            | ':'
+            | '$'
+            | '='
+            | '!'
+            | '<'
+            | '>'
+            | '-'
+            | '&'
+            | '|'
+            | '+'
+            | '*'
+            | '/'
+            | '^'
+            | '%'
+    )
+}
 
-/// Characters rustc's deny-by-default lints refuse in literals and comments: the explicit
-/// embedding, override and isolate controls.
-fn is_text_direction(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+/// Where the first of the characters rustc's deny-by-default lints refuse in literals and
+/// comments is: the explicit embedding, override and isolate controls, U+202A to U+202E
+/// (`E2 80 AA`..`E2 80 AE` in UTF-8) and U+2066 to U+2069 (`E2 81 A6`..`E2 81 A9`). Found by
+/// memchr's search for their lead byte, not by decoding every character.
+fn text_direction(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    memchr::memchr_iter(0xe2, bytes).find(|&at| {
+        matches!(
+            (bytes.get(at + 1), bytes.get(at + 2)),
+            (Some(0x80), Some(0xaa..=0xae)) | (Some(0x81), Some(0xa6..=0xa9))
+        )
+    })
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -94,19 +136,20 @@ fn is_ident_continue(c: char) -> bool {
 /// The tokens of a normalized source ([`normalize`]), comments other than doc comments left
 /// out.
 pub fn lex(source: &str) -> Result<Vec<Token<'_>>, Unlexed> {
-    if let Some(at) = source.find('\r') {
+    if let Some(at) = memchr::memchr(b'\r', source.as_bytes()) {
         return Err(Unlexed { at, why: "a carriage return not before a line feed" });
     }
-    if let Some(at) = source.find(is_text_direction) {
+    if let Some(at) = text_direction(source) {
         return Err(Unlexed { at, why: "a text direction code point" });
     }
     let mut lexer = Lexer { source, at: 0 };
-    let mut tokens = Vec::new();
+    // About one token for every few bytes of a script's source.
+    let mut tokens = Vec::with_capacity(source.len() / 4);
     while let Some(c) = lexer.peek() {
         let start = lexer.at;
         let kind = match c {
             ' ' | '\t' | '\n' | '\x0b' | '\x0c' => {
-                lexer.bump();
+                lexer.at += 1;
                 continue;
             }
             '/' if lexer.nth(1) == Some('/') => match lexer.line_comment() {
@@ -140,7 +183,7 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, Unlexed> {
                 }
                 Kind::Ident
             }
-            c if PUNCT.contains(c) => {
+            c if is_punct(c) => {
                 lexer.bump();
                 Kind::Punct(c)
             }
@@ -156,9 +199,14 @@ struct Lexer<'a> {
     at: usize,
 }
 
-impl Lexer<'_> {
+impl<'a> Lexer<'a> {
+    /// The character at `at`: one byte read for ASCII, which is nearly all of a script.
     fn peek(&self) -> Option<char> {
-        self.source[self.at..].chars().next()
+        let byte = *self.source.as_bytes().get(self.at)?;
+        match byte.is_ascii() {
+            true => Some(char::from(byte)),
+            false => self.source[self.at..].chars().next(),
+        }
     }
 
     fn nth(&self, n: usize) -> Option<char> {
@@ -176,9 +224,8 @@ impl Lexer<'_> {
     }
 
     fn ident_rest(&mut self) {
-        while self.peek().is_some_and(is_ident_continue) {
-            self.bump();
-        }
+        let rest = &self.source.as_bytes()[self.at..];
+        self.at += rest.iter().take_while(|it| it.is_ascii_alphanumeric() || **it == b'_').count();
     }
 
     /// A literal's end: rustc reads an identifier right after it as its suffix, which no
@@ -191,9 +238,10 @@ impl Lexer<'_> {
     }
 
     /// `//…` to the end of the line: a doc comment's kind, or none for a plain comment.
-    fn line_comment(&mut self) -> Option<Kind> {
+    fn line_comment(&mut self) -> Option<Kind<'a>> {
         let start = self.at;
-        let end = self.source[start..].find('\n').map_or(self.source.len(), |it| start + it);
+        let end = memchr::memchr(b'\n', &self.source.as_bytes()[start..])
+            .map_or(self.source.len(), |it| start + it);
         self.at = end;
         let text = &self.source[start..end];
         if text.starts_with("//!") {
@@ -206,7 +254,7 @@ impl Lexer<'_> {
     }
 
     /// `/* … */`, nested: a doc comment's kind, or none for a plain comment.
-    fn block_comment(&mut self) -> Result<Option<Kind>, Unlexed> {
+    fn block_comment(&mut self) -> Result<Option<Kind<'a>>, Unlexed> {
         let start = self.at;
         self.at += 2;
         let mut depth = 1usize;
@@ -234,26 +282,40 @@ impl Lexer<'_> {
         })
     }
 
-    /// The rest of `"…"`, after the opening quote.
-    fn string(&mut self) -> Result<Kind, Unlexed> {
+    /// The rest of `"…"`, after the opening quote. Its value is the source between the quotes
+    /// until an escape makes it differ; from there it is built.
+    fn string(&mut self) -> Result<Kind<'a>, Unlexed> {
         let start = self.at - 1;
-        let mut value = String::new();
+        let content = self.at;
+        let mut built: Option<String> = None;
         let mut escaped_brace = false;
         loop {
+            let at = self.at;
             match self.bump() {
                 None => return Err(Unlexed { at: start, why: "an unterminated string" }),
-                Some('"') => break,
+                Some('"') => {
+                    let value = match built {
+                        Some(it) => Cow::Owned(it),
+                        None => Cow::Borrowed(&self.source[content..at]),
+                    };
+                    self.no_suffix()?;
+                    return Ok(Kind::Str { value, escaped_brace });
+                }
                 Some('\\') => {
+                    let source = self.source;
+                    let value = built.get_or_insert_with(|| source[content..at].to_owned());
                     if let Some(c) = self.escape(true)? {
                         escaped_brace |= matches!(c, '{' | '}');
                         value.push(c);
                     }
                 }
-                Some(c) => value.push(c),
+                Some(c) => {
+                    if let Some(value) = &mut built {
+                        value.push(c);
+                    }
+                }
             }
         }
-        self.no_suffix()?;
-        Ok(Kind::Str { value, escaped_brace })
     }
 
     /// An escape, after its backslash: the character it stands for, or none for a string's
@@ -300,7 +362,7 @@ impl Lexer<'_> {
             }
             '\n' if in_string => {
                 while matches!(self.peek(), Some(' ' | '\t' | '\n')) {
-                    self.bump();
+                    self.at += 1;
                 }
                 return Ok(None);
             }
@@ -310,11 +372,11 @@ impl Lexer<'_> {
     }
 
     /// The rest of `r"…"` or `r#"…"#`, after the `r`.
-    fn raw_string(&mut self) -> Result<Kind, Unlexed> {
+    fn raw_string(&mut self) -> Result<Kind<'a>, Unlexed> {
         let start = self.at - 1;
         let mut hashes = 0usize;
         while self.peek() == Some('#') {
-            self.bump();
+            self.at += 1;
             hashes += 1;
         }
         if hashes > 255 || self.bump() != Some('"') {
@@ -322,25 +384,23 @@ impl Lexer<'_> {
         }
         let content = self.at;
         loop {
-            match self.bump() {
-                None => return Err(Unlexed { at: start, why: "an unterminated raw string" }),
-                Some('"') => {
-                    let close = self.at - 1;
-                    let rest = self.source[self.at..].as_bytes();
-                    if rest.len() >= hashes && rest[..hashes].iter().all(|b| *b == b'#') {
-                        self.at += hashes;
-                        let value = self.source[content..close].to_owned();
-                        self.no_suffix()?;
-                        return Ok(Kind::RawStr { value });
-                    }
-                }
-                Some(_) => {}
+            let Some(quote) = memchr::memchr(b'"', &self.source.as_bytes()[self.at..]) else {
+                return Err(Unlexed { at: start, why: "an unterminated raw string" });
+            };
+            let close = self.at + quote;
+            self.at = close + 1;
+            let rest = self.source[self.at..].as_bytes();
+            if rest.len() >= hashes && rest[..hashes].iter().all(|b| *b == b'#') {
+                self.at += hashes;
+                let value = &self.source[content..close];
+                self.no_suffix()?;
+                return Ok(Kind::RawStr { value });
             }
         }
     }
 
     /// `'x'`, `'\n'`, or a lifetime or label `'a`.
-    fn char_or_lifetime(&mut self) -> Result<Kind, Unlexed> {
+    fn char_or_lifetime(&mut self) -> Result<Kind<'a>, Unlexed> {
         self.bump();
         let kind = match self.peek() {
             Some('\\') => {
@@ -371,25 +431,28 @@ impl Lexer<'_> {
         Ok(kind)
     }
 
-    fn number(&mut self) -> Kind {
+    fn number(&mut self) -> Kind<'a> {
         let start = self.at;
         if self.peek() == Some('0') && matches!(self.nth(1), Some('x' | 'o' | 'b')) {
             self.at += 2;
             self.ident_rest();
             return Kind::Number;
         }
-        while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
-            self.bump();
-        }
-        let digits = &self.source[start..self.at];
+        let rest = &self.source.as_bytes()[start..];
+        self.at += rest.iter().take_while(|it| it.is_ascii_digit() || **it == b'_').count();
+        let digits = &self.source.as_bytes()[start..self.at];
         if self.peek().is_some_and(is_ident_start) {
             self.ident_rest();
             return Kind::Number;
         }
-        let digits: String = digits.chars().filter(|c| *c != '_').collect();
-        match digits.parse::<u128>() {
-            Ok(value) => Kind::Int(value),
-            Err(_) => Kind::Number,
+        // The digits' value without their `_`s, as `str::parse` of them would give it: too
+        // big for a `u128` is no value.
+        let value = digits.iter().filter(|it| **it != b'_').try_fold(0u128, |value, digit| {
+            value.checked_mul(10)?.checked_add(u128::from(digit - b'0'))
+        });
+        match value {
+            Some(value) => Kind::Int(value),
+            None => Kind::Number,
         }
     }
 }

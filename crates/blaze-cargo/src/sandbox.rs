@@ -19,13 +19,15 @@
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     ffi::OsString,
+    hash::BuildHasher as _,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
 use blaze_usercode::trace::{self, Seen};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
@@ -561,7 +563,9 @@ impl Recorder {
             })
             .collect();
         lines.sort_unstable();
-        let mut text = String::with_capacity(lines.iter().map(|it| it.1.len() + it.2.len() + 4).sum());
+        lines.dedup();
+        let room = lines.iter().map(|it| it.1.len() + it.2.len() + 4).sum();
+        let mut text = String::with_capacity(room);
         for (reached, test, what) in lines {
             text.push(reached.letter());
             text.push('\t');
@@ -647,21 +651,21 @@ impl Recorder {
 
     /// `thread` read `path`, made whole: recorded when reads are and it is an input.
     pub fn read(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Read, self.scope_of(thread), path);
+        self.note(Seen::Read, self.scope_of(thread), path);
     }
 
     /// `thread` looked at `path`, made whole, without opening it: recorded as [`Self::read`]
     /// records a read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn looked(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Looked, self.scope_of(thread), path);
+        self.note(Seen::Looked, self.scope_of(thread), path);
     }
 
     /// `thread` listed the directory `path`, made whole: recorded as [`Self::read`] records a
     /// read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn listed(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Listed, self.scope_of(thread), path);
+        self.note(Seen::Listed, self.scope_of(thread), path);
     }
 
     /// `thread` got what can't be traced.
@@ -710,7 +714,7 @@ impl Recorder {
 
     /// The sandbox refused `thread` a write to `path`.
     pub fn refused_write(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::RefusedWrite, self.scope_of(thread), path);
+        self.note(Seen::RefusedWrite, self.scope_of(thread), path);
     }
 
     /// The sandbox refused `thread` the network at `address`.
@@ -861,7 +865,7 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
     let code = windows::run(&confined)?;
     if let Some(file) = &spec.record {
         let mut recorder = Recorder::new(spec, &[]);
-        recorder.reached(Seen::Incomplete, String::new(), v2::NOT_TRACED_ON_WINDOWS);
+        recorder.reached(Seen::Incomplete, "", v2::NOT_TRACED_ON_WINDOWS);
         recorder.write(file);
     }
     Ok(code)
@@ -1008,6 +1012,24 @@ fn tidy(path: &Path) -> String {
     out.to_string_lossy().into_owned()
 }
 
+/// [`tidy`] of the Unix path `path` into `out`, which keeps its room from one path to the next.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tidy_into(path: &[u8], out: &mut String) {
+    out.clear();
+    if path.first() == Some(&b'/') {
+        out.push('/');
+    }
+    for part in path.split(|&it| it == b'/').filter(|it| !it.is_empty() && *it != b".") {
+        if !out.is_empty() && !out.ends_with('/') {
+            out.push('/');
+        }
+        match std::str::from_utf8(part) {
+            Ok(part) => out.push_str(part),
+            Err(_) => out.push_str(&String::from_utf8_lossy(part)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,7 +1171,7 @@ mod tests {
         recorder.runs(11, "/bin/static", recorder.scope(11));
         assert!(recorder.marked(10, 10, b"/.blaze-loaded"));
         recorder.ended();
-        let lines: Vec<_> = recorder.lines().cloned().collect();
+        let lines: Vec<_> = recorder.lines().collect();
         assert_eq!(
             lines,
             [trace::Line::new(
@@ -1171,5 +1193,63 @@ mod tests {
         assert_eq!(recorder.scope(20), "tests::c", "a thread seen before keeps its scope");
         assert!(recorder.marked(20, 20, b"/.blaze-test/"));
         assert_eq!(recorder.scope(20), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_is_tidied_into_a_buffer_as_it_is_tidied() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let paths: [&[u8]; 12] = [
+            b"",
+            b"/",
+            b"//",
+            b"/a/./b//c/",
+            b"./a",
+            b"a/../b",
+            b".",
+            b"./",
+            b"/./.",
+            b"a//b/.",
+            b"/x/\xff\xfe/y",
+            b"\xe2/z",
+        ];
+        let mut out = String::from("left over");
+        for path in paths {
+            tidy_into(path, &mut out);
+            assert_eq!(out, tidy(Path::new(std::ffi::OsStr::from_bytes(path))), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_kept_once() {
+        let mut names = Names::default();
+        let ids = ["", "/ws/a", "tests::a", "/ws/a", ""].map(|it| names.intern(it));
+        assert_eq!(ids, [0, 1, 2, 1, 0]);
+        assert_eq!([names.get(0), names.get(1), names.get(2)], ["", "/ws/a", "tests::a"]);
+        assert_eq!(names.text, "/ws/atests::a");
+    }
+
+    #[test]
+    fn a_line_is_kept_once_and_one_that_cant_be_written_is_an_x_line() {
+        let mut recorder = Recorder::new(&Spec { record_reads: true, ..Spec::default() }, &[]);
+        assert!(recorder.marked(30, 30, b"/.blaze-test/tests::e"));
+        for _ in 0..3 {
+            recorder.read(30, "/ws/a");
+            recorder.read(31, "/ws/a");
+        }
+        recorder.read(30, "/ws/b\tc");
+        recorder.read(30, "/ws/d\ne");
+        assert!(recorder.marked(32, 32, b"/.blaze-test/tests\tf"));
+        recorder.read(32, "/ws/a");
+        let lines: Vec<_> = recorder.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                trace::Line::new(Seen::Read, "tests::e", "/ws/a"),
+                trace::Line::new(Seen::Read, "", "/ws/a"),
+                trace::Line::new(Seen::Read, "tests::e", "/ws/b\tc"),
+                trace::Line::new(Seen::Read, "tests\tf", "/ws/a"),
+            ]
+        );
     }
 }

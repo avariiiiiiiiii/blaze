@@ -102,24 +102,78 @@ impl Stage<'_> {
         }
         let exports = self.exports();
         counts.exports = exports.len() as u64;
-        counts.export_names = exports.iter().map(|it| it.len() as u64 + 1).sum();
+        counts.export_names = exports.iter().map(|it| it.0.len() as u64 + 1).sum();
         counts
     }
 
-    /// The names the image exports.
-    pub fn exports(&self) -> Vec<String> {
-        let mut out = match &self.output.kind {
-            crate::OutputKind::Shared { exports, .. } => exports.clone(),
+    /// What the image exports: the name, the symbol it is, and whether it is data whatever
+    /// it is defined in (`/EXPORT:name=symbol,DATA`).
+    pub fn exports(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<(String, String, bool)> = match &self.output.kind {
+            crate::OutputKind::Shared { exports, .. } => exports.iter().map(|it| (it.clone(), it.clone(), false)).collect(),
             crate::OutputKind::Executable { .. } => Vec::new(),
         };
+        for export in &self.new.resolved.exports {
+            if !out.iter().any(|it| it.0 == export.0) {
+                out.push(export.clone());
+            }
+        }
         if self.output.live.is_some() {
-            out.push(blaze_live::patch::DESCRIPTOR.to_owned());
+            let name = blaze_live::patch::DESCRIPTOR.to_owned();
+            out.push((name.clone(), name, true));
         }
         out
     }
 
     pub fn place(&mut self) -> Result<(), LinkError> {
         if self.full { self.lay_out() } else { self.allocate() }
+    }
+
+    /// Whether a class is laid out again whole when it changes: as [`ordered`], and the GOT
+    /// of an image whose GOT is its import address table, each DLL's cells together.
+    fn ordered(&self, class: &Class) -> bool {
+        ordered(class) || (self.plan.got_by_library && *class == Class::Got)
+    }
+
+    /// Where a GOT cell is in an image whose GOT is its import address table: the DLL, and
+    /// the import (each DLL's zero cell after its imports' cells).
+    fn iat_cell(&self, class: &Class, id: PieceId) -> Option<(u32, u32)> {
+        if !self.plan.got_by_library || *class != Class::Got {
+            return None;
+        }
+        let piece = self.new.piece(id)?;
+        if let Some(library) = self.iat_end(piece.sym) {
+            return Some((library, u32::MAX));
+        }
+        let What::Got { kind: crate::reloc::GotKind::Address, target } = piece.what else {
+            return None;
+        };
+        let at = self.import_of(target)?;
+        Some((self.new.resolved.imports.get(at as usize)?.library.unwrap_or(u32::MAX), at))
+    }
+
+    /// Sorts a class's pieces into the order they are laid out in: by rank, link-line order
+    /// and symbol; import address table cells first, by DLL and import.
+    fn sort_pieces(&self, class: &Class, ids: &mut [PieceId]) {
+        ids.sort_by_cached_key(|id| {
+            let piece = self.new.piece(*id).expect("live");
+            let iat = self.iat_cell(class, *id);
+            (iat.is_none(), iat, piece.rank, piece.order, self.symbols.key(piece.sym).clone())
+        });
+    }
+
+    /// Each piece's offset from `start` when a region holds `ids` in this order, and the
+    /// region's size.
+    fn offsets(&self, start: u64, ids: &[PieceId]) -> (Vec<u64>, u64) {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut size = 0;
+        for id in ids {
+            let piece = self.new.piece(*id).expect("live");
+            size = align_up(start + size, piece.align) - start;
+            out.push(size);
+            size += piece.size;
+        }
+        (out, size)
     }
 
     /// Every piece placed anew.
@@ -147,17 +201,15 @@ impl Stage<'_> {
         self.writer.order(&mut classes);
         let mut spaces = Vec::new();
         let mut addr = self.plan.base + self.plan.headers;
+        let mut code_addr = 0;
         let mut prot = None;
         let mut text_size = 0;
         let mut data_size = 0;
         for class in classes {
             let mut ids = by_class.remove(&class).unwrap_or_default();
-            ids.sort_by(|a, b| {
-                let (pa, pb) = (self.new.piece(*a).expect("live"), self.new.piece(*b).expect("live"));
-                (pa.rank, pa.order, self.symbols.key(pa.sym)).cmp(&(pb.rank, pb.order, self.symbols.key(pb.sym)))
-            });
+            self.sort_pieces(&class, &mut ids);
             let this = self.writer.prot(&class);
-            let indexed = self.plan.indexed_code && class == Class::Text;
+            let indexed = self.plan.indexed_code && this.exec;
             if !indexed && prot != Some(this) {
                 addr = align_up(addr, self.plan.page);
                 prot = Some(this);
@@ -168,17 +220,15 @@ impl Stage<'_> {
                 .max()
                 .unwrap_or(1)
                 .max(if matches!(class, Class::Synthetic(_)) { 8 } else { 1 });
-            let start = if indexed { 0 } else { align_up(addr, align) };
+            let start = if indexed { code_addr } else { align_up(addr, align) };
             let region = spaces.len() as u32;
-            let mut size = 0;
             let zero = zeroed(&class);
-            for id in &ids {
+            let (offsets, size) = self.offsets(start, &ids);
+            for (id, offset) in ids.iter().zip(offsets) {
                 let piece = self.new.piece_mut(*id).expect("live");
-                size = align_up(size, piece.align);
-                piece.addr = start + size;
+                piece.addr = start + offset;
                 piece.region = region;
                 piece.zero = zero;
-                size += piece.size;
             }
             match &class {
                 Class::Text => text_size += size,
@@ -210,7 +260,9 @@ impl Stage<'_> {
             if matches!(class, Class::Synthetic(_)) {
                 spaces.last_mut().expect("just pushed").region.size = 0;
             }
-            if !indexed {
+            if indexed {
+                code_addr = start + capacity;
+            } else {
                 addr = start + capacity;
             }
             self.write.extend(ids);
@@ -238,7 +290,7 @@ impl Stage<'_> {
         let removed: FxHashSet<PieceId> = self.removed.iter().map(|it| it.0).collect();
         let mut relay: FxHashSet<usize> = FxHashSet::default();
         for (id, piece) in &self.removed {
-            if self.old.piece(*id).is_some() && ordered(&piece.class) {
+            if self.old.piece(*id).is_some() && self.ordered(&piece.class) {
                 relay.insert(piece.region as usize);
             }
         }
@@ -264,7 +316,7 @@ impl Stage<'_> {
                     ),
                 )
             })?;
-            if ordered(&class) {
+            if self.ordered(&class) {
                 relay.insert(space);
                 let piece = self.new.piece_mut(id).expect("live");
                 piece.region = space as u32;
@@ -312,25 +364,20 @@ impl Stage<'_> {
             .filter(|(_, it)| it.region as usize == space)
             .map(|(id, _)| id)
             .collect();
-        ids.sort_by(|a, b| {
-            let (pa, pb) = (self.new.piece(*a).expect("live"), self.new.piece(*b).expect("live"));
-            (pa.rank, pa.order, self.symbols.key(pa.sym)).cmp(&(pb.rank, pb.order, self.symbols.key(pb.sym)))
-        });
+        self.sort_pieces(&class, &mut ids);
         let start = self.new.spaces[space].region.addr;
         let capacity = self.new.spaces[space].region.capacity;
         let zero = self.new.spaces[space].zero;
-        let mut size = 0;
-        for id in ids {
+        let (offsets, size) = self.offsets(start, &ids);
+        if size > capacity {
+            return Err(error(
+                None,
+                format!("{class:?} needs {size} bytes and has room for {capacity}: link the image from scratch"),
+            ));
+        }
+        for (id, offset) in ids.into_iter().zip(offsets) {
             let piece = self.new.piece(id).expect("live");
-            size = align_up(start + size, piece.align) - start;
-            let addr = start + size;
-            size += piece.size;
-            if size > capacity {
-                return Err(error(
-                    None,
-                    format!("{class:?} needs {size} bytes and has room for {capacity}: link the image from scratch"),
-                ));
-            }
+            let addr = start + offset;
             if piece.addr != addr || self.fresh.contains(&id) {
                 let moved: Vec<_> = std::iter::once(piece.sym).chain(piece.defines.iter().copied()).collect();
                 self.changed.extend(moved);

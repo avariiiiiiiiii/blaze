@@ -299,8 +299,13 @@ pub(crate) fn attr_macro_input_to_token_tree(
     is_derive: bool,
     censor_item_tree_attr_ids: &[AttrId],
     krate: Crate,
+    fix_errors: bool,
 ) -> (tt::TopSubtree, SyntaxFixupUndoInfo) {
-    let fixups = fixup::fixup_syntax(span_map, node, span, DocCommentDesugarMode::ProcMacro);
+    let fixups = if fix_errors {
+        fixup::fixup_syntax(span_map, node, span, DocCommentDesugarMode::ProcMacro)
+    } else {
+        fixup::SyntaxFixups::default()
+    };
     (
         syntax_bridge::syntax_node_to_token_tree_modified(
             node,

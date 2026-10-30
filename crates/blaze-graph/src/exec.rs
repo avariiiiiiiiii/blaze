@@ -12,7 +12,7 @@ use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
@@ -30,7 +30,7 @@ use crate::{
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
     pool::{self, Pool as Workers},
-    pump::lock,
+    pump::Lock,
     topology::Topology,
 };
 
@@ -63,12 +63,14 @@ impl Did {
 ///
 /// # Panics
 ///
-/// Where a worker cannot be started or bound, naming why: the pool is never made smaller.
+/// Where the machine's topology cannot be read, or a worker cannot be started or bound,
+/// naming why: the pool is never made smaller or shaped by a guess.
 pub fn shared() -> &'static Workers {
     static SHARED: OnceLock<Workers> = OnceLock::new();
     SHARED.get_or_init(|| {
         let bind = cfg!(any(target_os = "linux", target_os = "macos"));
-        Workers::new(&Topology::detect(), bind)
+        Topology::detect()
+            .and_then(|topology| Workers::new(&topology, bind))
             .unwrap_or_else(|why| panic!("the process's worker pool: {why}"))
     })
 }
@@ -80,7 +82,7 @@ pub fn shared() -> &'static Workers {
 /// The work nodes run on a pool of the machine's `work` workers and the IO nodes on one of its
 /// `io`, both lent to this build alone and kept for the next build of their size once it's
 /// over (not bound to CPUs: several builds may run at once). `work` may borrow what the caller
-/// has.
+/// has, and runs in its thread's task arena ([`arena::task`]), reset when the node is done.
 ///
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
@@ -101,10 +103,11 @@ where
     let workers = Lent::take(config.work, "worker");
     let io = Lent::take(config.io, "IO");
     let (done_tx, done_rx) = unbounded::<(NodeId, Did, u64)>();
-    let first_panic: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
+    // Taken only to keep a node's panic, once it has unwound.
+    let first_panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
     let failed = |panic: Box<dyn Any + Send>| {
         let did = Did::failed(panicked(&*panic));
-        lock(&first_panic).get_or_insert(panic);
+        first_panic.lock().get_or_insert(panic);
         did
     };
     let over = workers.pool().scope(|jobs| {
@@ -114,16 +117,17 @@ where
                 let done = move |did: thread::Result<Did>| {
                     _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
                 };
+                let run = move || arena::task(|| work(id));
                 match at {
-                    Pool::Io => waits.submit(None, move || work(id), done),
-                    Pool::Work => jobs.submit(None, move || work(id), done),
+                    Pool::Io => waits.submit(None, run, done),
+                    Pool::Work => jobs.submit(None, run, done),
                 }
             };
             run(machine, nodes, &post, &done_rx, &now, said, trace)
         })
     });
     drop((workers, io));
-    if let Some(panic) = first_panic.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+    if let Some(panic) = first_panic.into_inner()
     {
         resume_unwind(panic);
     }
@@ -168,8 +172,8 @@ fn run(
 }
 
 /// The pools no [`drive`] is using, each kept for the next build of its size, so a build
-/// starts no thread once one of its size has run.
-static SPARE: Mutex<Vec<Workers>> = Mutex::new(Vec::new());
+/// starts no thread once one of its size has run. Taken only to take or give back a pool.
+static SPARE: Lock<Vec<Workers>> = Lock::new(Vec::new());
 
 /// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
 /// it's over: a build runs as many nodes at once as its machine says, whatever else runs.
@@ -178,7 +182,7 @@ struct Lent(Option<Workers>);
 impl Lent {
     fn take(workers: usize, what: &str) -> Lent {
         let spare = {
-            let mut spare = lock(&SPARE);
+            let mut spare = SPARE.lock();
             spare.iter().position(|it| it.workers() == workers).map(|at| spare.swap_remove(at))
         };
         Lent(Some(spare.unwrap_or_else(|| {
@@ -195,7 +199,7 @@ impl Lent {
 impl Drop for Lent {
     fn drop(&mut self) {
         if let Some(pool) = self.0.take() {
-            lock(&SPARE).push(pool);
+            SPARE.lock().push(pool);
         }
     }
 }
@@ -277,6 +281,8 @@ struct Job {
     tx: Sender<Msg>,
     /// The IO threads' queue, for an IO task posted again.
     io: Option<Sender<Arc<Job>>>,
+    /// On its request's critical path, as the plane said when it ran it.
+    critical: bool,
     start: Instant,
 }
 
@@ -350,10 +356,13 @@ impl Handle {
 /// threads of their own. Dropping it stops the owner thread and waits for the IO tasks under
 /// way; pool tasks under way finish on the pool, and what came of them is not taken.
 ///
-/// A task's work runs inside [`arena::measure`], and its `Done` gives the plane the peak it
-/// held and the group it ran on; after each `Done` the plane hears what the process holds
-/// ([`arena::held`]). Work that returns [`Cancelled`] is posted again (the plane still sees it
-/// running), behind what is ready on its group. The clock is read here, never by the plane.
+/// A task's work runs in its thread's task arena ([`arena::task`]: a pool worker's is on its
+/// NUMA node, in huge pages, and reset when the task ends) inside [`arena::measure`], and its
+/// `Done` gives the plane the peak it held and the group it ran on; after each `Done` the plane
+/// hears what the process holds ([`arena::held`]). A task the plane says is on its request's
+/// critical path runs on a fast group of the pool ([`Workers::submit_critical`]). Work that
+/// returns [`Cancelled`] is posted again (the plane still sees it running), behind what is
+/// ready on its group. The clock is read here, never by the plane.
 ///
 /// Every request is released as it opens: once it finishes, the plane gives its room (nodes,
 /// names, deps, its id) to the next, so a daemon's plane holds only the requests under way.
@@ -609,7 +618,7 @@ impl Owner {
                     _ = heard.send(Heard::Said(record));
                 }
             }
-            PlaneOutput::Run { id, pool, near } => self.run(id, pool, near),
+            PlaneOutput::Run { id, pool, near, critical } => self.run(id, pool, near, critical),
             PlaneOutput::Finished { request, ok } => {
                 // Work found by a task that then gave way, and never added.
                 self.works.retain(|_, it| it.request != request);
@@ -620,7 +629,7 @@ impl Owner {
         }
     }
 
-    fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>) {
+    fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
         let Some(entry) = self.works.get(&id) else {
             // The plane runs only nodes added here, each with its work: a node it runs with
             // none fails, saying so, through the owner's own queue.
@@ -643,6 +652,7 @@ impl Owner {
             work: entry.work.clone(),
             tx: self.tx.clone(),
             io,
+            critical,
             start: self.start,
         });
         match pool {
@@ -653,25 +663,33 @@ impl Owner {
     }
 }
 
-/// Runs `job` on `pool` near `near`; posted again, behind what is ready on the group it ran on,
-/// while its work gives way.
+/// Runs `job` on `pool` near `near` (on a fast group when it is critical); posted again,
+/// behind what is ready on the group it ran on, while its work gives way.
 fn post(pool: &'static Workers, near: Option<u32>, job: Arc<Job>) {
     let again = job.clone();
-    pool.submit(
-        near,
-        move || arena::measure(|| (job.work)()),
-        move |result| match result {
-            Ok((Ok(did), peak)) => again.done(did, Some(peak), pool::group()),
-            Ok((Err(Cancelled), _)) => post(pool, pool::group(), again),
-            Err(panic) => again.done(Did::failed(panicked(&*panic)), None, pool::group()),
-        },
-    );
+    let critical = job.critical;
+    let run = move || measured(&job);
+    let done = move |result: thread::Result<(Result<Did, Cancelled>, u64)>| match result {
+        Ok((Ok(did), peak)) => again.done(did, Some(peak), pool::group()),
+        Ok((Err(Cancelled), _)) => post(pool, pool::group(), again),
+        Err(panic) => again.done(Did::failed(panicked(&*panic)), None, pool::group()),
+    };
+    if critical {
+        pool.submit_critical(near, run, done);
+    } else {
+        pool.submit(near, run, done);
+    }
+}
+
+/// `job`'s work in this thread's task arena, reset when it ends, and the peak it held.
+fn measured(job: &Job) -> (Result<Did, Cancelled>, u64) {
+    arena::measure(|| arena::task(|| (job.work)()))
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
 /// while its work gives way.
 fn run_io(job: Arc<Job>) {
-    match catch_unwind(AssertUnwindSafe(|| arena::measure(|| (job.work)()))) {
+    match catch_unwind(AssertUnwindSafe(|| measured(&job))) {
         Ok((Ok(did), peak)) => job.done(did, Some(peak), None),
         Ok((Err(Cancelled), _)) => {
             if let Some(io) = job.io.clone() {
@@ -783,7 +801,7 @@ mod tests {
             assert_eq!(ran.len(), 4);
             assert!(on(&[0, 3]).is_disjoint(&on(&[1, 2])), "IO and work share a thread");
         };
-        let spare = || lock(&SPARE).iter().filter(|it| [3, 7].contains(&it.workers())).count();
+        let spare = || SPARE.lock().iter().filter(|it| [3, 7].contains(&it.workers())).count();
         // A build that made its pools rather than borrowing the last one's would leave more.
         for _ in 0..4 {
             build();

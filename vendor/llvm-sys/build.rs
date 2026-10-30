@@ -706,6 +706,21 @@ fn get_llvm_cflags(llvm_config_path: &Path) -> String {
         .join(" ")
 }
 
+/// blaze: `llvm-config --cxxflags` for wrappers/passes.cpp, cleaned as [`get_llvm_cflags`]
+/// cleans the C flags.
+fn get_llvm_cxxflags(llvm_config_path: &Path) -> String {
+    let output = llvm_config(llvm_config_path, ["--cxxflags"]);
+    let no_clean = env::var_os(&*ENV_NO_CLEAN_CFLAGS).is_some();
+    if no_clean || target_env_is("msvc") {
+        return output;
+    }
+    output
+        .split(&[' ', '\n'][..])
+        .filter(|word| !word.starts_with("-W"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn is_llvm_debug(llvm_config_path: &Path) -> bool {
     // Has to be either Debug or Release
     llvm_config(llvm_config_path, ["--build-mode"]).contains("Debug")
@@ -738,12 +753,23 @@ fn main() {
     };
 
     // Build the extra wrapper functions.
+    println!("cargo:rerun-if-changed=wrappers/target.c");
     if !cfg!(feature = "disable-alltargets-init") {
         std::env::set_var("CFLAGS", get_llvm_cflags(&llvm_config_path));
         cc::Build::new()
             .file("wrappers/target.c")
             .compile("targetwrappers");
     }
+
+    // blaze: the pass builder kept per thread and target machine (wrappers/passes.cpp). LLVM's
+    // own system libraries name the C++ runtime, so cc names none.
+    println!("cargo:rerun-if-changed=wrappers/passes.cpp");
+    let mut passes = cc::Build::new();
+    passes.cpp(true).cpp_link_stdlib(None).file("wrappers/passes.cpp");
+    for flag in get_llvm_cxxflags(&llvm_config_path).split_whitespace() {
+        passes.flag(flag);
+    }
+    passes.compile("blazepasses");
 
     if cfg!(feature = "no-llvm-linking") {
         return;

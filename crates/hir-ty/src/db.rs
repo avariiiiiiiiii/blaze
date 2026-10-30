@@ -8,7 +8,7 @@ use base_db::{Crate, SourceDatabase, target::TargetLoadError};
 use either::Either;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId, EnumVariantId,
-    ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, LocalFieldId, ModuleId,
+    ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ModuleId,
     StaticId, TraitId, TypeAliasId, VariantId,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::ExpressionStore,
@@ -17,21 +17,20 @@ use hir_def::{
     resolver::{HasResolver, Resolver},
     signatures::{ConstSignature, StaticSignature},
 };
-use la_arena::ArenaMap;
 use salsa::SalsaValue;
 use span::Edition;
 use stdx::impl_from;
 use triomphe::Arc;
 
 use crate::{
-    FieldType, GenericDefaultsRef, GenericPredicates, ImplTraitId, InferBodyId, TyDefId,
+    GenericDefaultsRef, GenericPredicates, ImplTraitId, InferBodyId, TyDefId,
     TyLoweringDiagnostic, TyLoweringResult, ValueTyDefId,
     consteval::ConstEvalError,
     dyn_compatibility::DynCompatibilityViolation,
     layout::{Layout, LayoutError},
     lower::{
-        ConstParamTypes, FieldTypes, GenericDefaults, SelfAndAssocBounds, TrackedStructToken,
-        WithDefinedOpaques,
+        ConstParamTypes, FieldTypes, GenericDefaults, Lowered, SelfAndAssocBounds,
+        TrackedStructToken, WithDefinedOpaques,
     },
     mir::{MirBody, MirEvalError, MirLowerError},
     next_solver::{
@@ -342,7 +341,7 @@ pub trait HirDatabase: SourceDatabase + 'static {
     fn impl_self_ty_with_diagnostics<'db>(
         &'db self,
         def: ImplId,
-    ) -> &'db TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
+    ) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
         let db = self.as_dyn();
         crate::lower::impl_self_ty_with_diagnostics(db, def)
     }
@@ -373,7 +372,7 @@ pub trait HirDatabase: SourceDatabase + 'static {
     fn impl_trait_with_diagnostics<'db>(
         &'db self,
         def: ImplId,
-    ) -> &'db Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
+    ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
         let db = self.as_dyn();
         crate::lower::impl_trait_with_diagnostics(db, def)
     }
@@ -386,12 +385,12 @@ pub trait HirDatabase: SourceDatabase + 'static {
     fn field_types_with_diagnostics<'db>(
         &'db self,
         var: VariantId,
-    ) -> &'db TyLoweringResult<'db, FieldTypes> {
+    ) -> Lowered<'db, FieldTypes> {
         let db = self.as_dyn();
         crate::lower::field_types_with_diagnostics(db, var)
     }
 
-    fn field_types(&self, var: VariantId) -> &ArenaMap<LocalFieldId, FieldType> {
+    fn field_types(&self, var: VariantId) -> &FieldTypes {
         let db = self.as_dyn();
         crate::lower::field_types_query(db, var)
     }
@@ -683,9 +682,9 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
     let mut result = ArrayVec::new();
 
     // Queries common to all generic defs:
-    push(&mut result, db.generic_defaults_with_diagnostics(def));
+    push(&mut result, db.generic_defaults_with_diagnostics(def).as_lowered());
     push(&mut result, GenericPredicates::query_with_diagnostics(db, def));
-    push(&mut result, db.const_param_types_with_diagnostics(def));
+    push(&mut result, db.const_param_types_with_diagnostics(def).as_lowered());
 
     match def {
         GenericDefId::ImplId(id) => {
@@ -695,20 +694,26 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
             }
         }
         GenericDefId::TypeAliasId(id) => {
-            push(&mut result, db.type_for_type_alias_with_diagnostics(id));
-            push(&mut result, db.type_alias_bounds_with_diagnostics(id));
+            push(&mut result, db.type_for_type_alias_with_diagnostics(id).as_lowered());
+            push(&mut result, db.type_alias_bounds_with_diagnostics(id).as_lowered());
         }
-        GenericDefId::FunctionId(id) => push(&mut result, db.fn_sig_for_fn_with_diagnostics(id)),
-        GenericDefId::ConstId(def) => push(&mut result, db.type_for_const_with_diagnostics(def)),
-        GenericDefId::StaticId(def) => push(&mut result, db.type_for_static_with_diagnostics(def)),
+        GenericDefId::FunctionId(id) => {
+            push(&mut result, db.fn_sig_for_fn_with_diagnostics(id).as_lowered())
+        }
+        GenericDefId::ConstId(def) => {
+            push(&mut result, db.type_for_const_with_diagnostics(def).as_lowered())
+        }
+        GenericDefId::StaticId(def) => {
+            push(&mut result, db.type_for_static_with_diagnostics(def).as_lowered())
+        }
         GenericDefId::TraitId(_) | GenericDefId::AdtId(_) => {}
     }
 
     return result;
 
-    fn push<'db, T>(
+    fn push<'db, T: ?Sized>(
         result: &mut ArrayVec<(&'db [AnonConstId<'db>], &'db [TyLoweringDiagnostic]), 5>,
-        item: &'db TyLoweringResult<'db, T>,
+        item: crate::lower::Lowered<'db, T>,
     ) {
         result.push((item.defined_anon_consts(), item.diagnostics()));
     }

@@ -80,6 +80,8 @@ struct Fake {
     listens: Vec<(Tag, Address)>,
     recvs: Vec<(Tag, Conn)>,
     sent: Vec<(Conn, Frame)>,
+    /// How many sends the queue asked for.
+    sends: usize,
     hangups: Vec<Conn>,
     records: BTreeMap<FileName, Vec<u8>>,
     next_conn: u64,
@@ -101,6 +103,7 @@ impl Fake {
             listens: Vec::new(),
             recvs: Vec::new(),
             sent: Vec::new(),
+            sends: 0,
             hangups: Vec::new(),
             records: BTreeMap::new(),
             next_conn: 0,
@@ -124,8 +127,9 @@ impl Fake {
     }
 
     fn pump(&mut self, mut effects: Vec<Effect>) {
-        // What the last frame sent was, so the timer after it is known for its.
-        let mut last: Option<Frame> = None;
+        // The runs and kills sent whose timers have not come yet: a server's timers follow the
+        // send of its frames, in their order.
+        let mut awaiting: std::collections::VecDeque<Frame> = std::collections::VecDeque::new();
         while !effects.is_empty() {
             let mut answers = Vec::new();
             for effect in effects.drain(..) {
@@ -144,9 +148,12 @@ impl Fake {
                         let mut frames = Frames::new();
                         frames.push(&bytes);
                         while let Some(frame) = frames.pop().unwrap() {
-                            last = Some(frame.clone());
+                            if matches!(frame, Frame::Run { .. } | Frame::Kill { .. }) {
+                                awaiting.push_back(frame.clone());
+                            }
                             self.sent.push((conn, frame));
                         }
+                        self.sends += 1;
                         answers.push(Completion { tag, done: Done::Sent });
                     }
                     Effect::Unlisten { tag } => {
@@ -158,7 +165,7 @@ impl Fake {
                         answers.push(Completion { tag, done: Done::HungUp });
                     }
                     Effect::Timer { after, tag } => {
-                        match last.take() {
+                        match awaiting.pop_front() {
                             Some(Frame::Run { id, .. }) => _ = self.deadlines.insert(id, tag),
                             Some(Frame::Kill { id }) => _ = self.graces.insert(id, tag),
                             _ => {}
@@ -647,5 +654,64 @@ fn the_queue_under_a_simulated_driver() {
             assert_eq!(result.output, test.as_bytes(), "seed {seed}");
             assert_eq!(result.trace, Trace::Lines(vec![Line::new(Seen::Read, test, &format!("/ws/{test}"))]), "seed {seed}");
         }
+    }
+}
+
+#[test]
+fn what_one_call_says_to_a_server_goes_as_one_send_with_each_timer_after_it() {
+    let mut fake = Fake::new(config(4), vec![binary("lib", vec![job("a", 4), job("b", 3), job("c", 2), job("d", 1)])]);
+    let before = fake.sends;
+    let conn = fake.hello(0, &["a", "b", "c", "d"]);
+    assert_eq!(fake.sends, before + 1);
+    assert_eq!(fake.runs(conn), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    for id in 0..4 {
+        assert_eq!(fake.timers.iter().find(|it| it.0 == fake.deadlines[&id]).map(|it| it.1), Some(Duration::from_secs(60)));
+    }
+}
+
+#[test]
+fn a_line_of_every_scope_is_given_once_however_often_it_comes() {
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0), job("b", 0)])]);
+    let conn = fake.hello(0, &["a", "b"]);
+    assert_eq!(fake.runs(conn), vec![(0, 0)]);
+    let libc = Line::new(Seen::Read, "", "/lib/libc.so");
+    let looked = Line::new(Seen::Looked, "", "/lib/libc.so");
+    fake.append(0, &[libc.clone(), libc.clone(), looked.clone(), Line::new(Seen::Read, "a", "/ws/a"), libc.clone()]);
+    fake.end(conn, 0, End::Exited(0), b"");
+    assert_eq!(fake.result("a").trace, Trace::Lines(vec![libc.clone(), looked.clone(), Line::new(Seen::Read, "a", "/ws/a")]));
+    assert_eq!(fake.runs(conn), vec![(1, 1)]);
+    fake.append(0, &[libc.clone(), Line::new(Seen::Read, "b", "/ws/b")]);
+    fake.end(conn, 1, End::Exited(0), b"");
+    assert_eq!(fake.result("b").trace, Trace::Lines(vec![libc, looked, Line::new(Seen::Read, "b", "/ws/b")]));
+}
+
+#[test]
+fn a_line_that_is_not_utf_8_is_read_as_the_lossy_record_has_it() {
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
+    let conn = fake.hello(0, &["a"]);
+    assert_eq!(fake.runs(conn), vec![(0, 0)]);
+    fake.records.get_mut(&name("req/1/r0")).unwrap().extend_from_slice(b"R\ta\t/ws/\xff\xfex\n");
+    fake.end(conn, 0, End::Exited(0), b"");
+    let text = String::from_utf8_lossy(b"R\ta\t/ws/\xff\xfex").into_owned();
+    assert_eq!(fake.result("a").trace, Trace::Lines(vec![Line::parse(&text).unwrap()]));
+}
+
+/// The queue's borrowed reading of a record's line against [`Line::parse`], over seeded lines
+/// of the characters that matter (letters, tabs, a scope, a multi-byte character).
+#[test]
+fn a_line_is_read_in_place_as_line_parse_reads_it() {
+    let alphabet = ['R', 'L', 'D', 'E', 'T', 'W', 'N', 'X', 'Q', '\t', 'a', '/', 'é', '*'];
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 12) as usize;
+        let text: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+        let read = record_line(&text).map(|(seen, scope, what)| Line { seen, scope: scope.to_owned(), what: what.to_owned() });
+        assert_eq!(read, Line::parse(&text), "{text:?}");
     }
 }

@@ -127,6 +127,12 @@ pub struct Emitted {
     /// Its debug info and panic locations, kept in the store under
     /// [`CompiledFunction::side`].
     pub side: Option<Vec<u8>>,
+    /// Outside symbols the backend calls of its own accord, which no reference names: LLVM's
+    /// `memcpy` from a loop idiom, `bcmp`, libm, compiler-rt, stack probes. Each is a
+    /// [`crate::Target::Extern`] of the function's relocations, by name; the template keeps
+    /// them ([`crate::template::Template::externs`]). Empty for what lists every symbol it
+    /// calls among its references.
+    pub extra: Vec<String>,
 }
 
 /// A function a release compile imports: its export (its IR as the backend shows it to an
@@ -183,12 +189,14 @@ pub trait Prepare: Sync {
     ) -> Result<(Shape, Self::Prepared), CodegenError>;
 
     /// Release: what cross-function passes need of the function, and its export, from its
-    /// prepared IR. Only asked of units whose backend is LLVM.
+    /// prepared IR. Only asked of units whose backend is LLVM. What it makes that
+    /// [`Prepare::emit`] takes up (a pre-linked module) stays in `prepared`, which the build
+    /// hands to `emit`: never in state shared between units.
     fn summarize(
         &self,
         unit: &Unit,
         spec: &Spec,
-        prepared: &Self::Prepared,
+        prepared: &mut Self::Prepared,
         refs: &Refs,
     ) -> Result<(Summary, Self::Export), CodegenError>;
 

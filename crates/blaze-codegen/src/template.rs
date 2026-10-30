@@ -179,9 +179,37 @@ fn place(refs: &Refs, target: &Target) -> Result<u32, TemplateError> {
     found.map(|it| it as u32).ok_or_else(|| TemplateError::NotReferenced(target.clone()))
 }
 
+/// `target` by its place among `refs`, else, for an outside symbol, among `externs`.
+fn reference(refs: &Refs, externs: &[String], target: &Target) -> Result<Ref, TemplateError> {
+    match place(refs, target) {
+        Ok(at) => Ok(Ref::Place(at)),
+        Err(missing) => match target {
+            Target::Extern(name) => {
+                externs.iter().position(|it| it == name).map(|at| Ref::Extern(at as u32)).ok_or(missing)
+            }
+            _ => Err(missing),
+        },
+    }
+}
+
+/// The outside symbols of `extra` that `refs` does not list, each once, in `extra`'s order.
+fn own_externs(refs: &Refs, extra: &[String]) -> Result<Vec<String>, TemplateError> {
+    let mut externs: Vec<String> = Vec::with_capacity(extra.len());
+    for name in extra {
+        if name.is_empty() || externs.contains(name) {
+            return Err(TemplateError::NotAnExtern(name.clone()));
+        }
+        if !refs.iter().any(|it| matches!(it, Target::Extern(listed) if listed == name)) {
+            externs.push(name.clone());
+        }
+    }
+    Ok(externs)
+}
+
 fn template_relocs(
     relocs: &[Reloc],
     refs: &Refs,
+    externs: &[String],
     data: &[Data],
     before: Option<u32>,
 ) -> Result<Vec<TemplateReloc>, TemplateError> {
@@ -202,31 +230,31 @@ fn template_relocs(
                     Ref::Data(at)
                 }
                 Target::Position(span) => Ref::Position(*span),
-                other => Ref::Place(place(refs, other)?),
+                other => reference(refs, externs, other)?,
             };
             Ok(TemplateReloc { at: reloc.at, kind: reloc.kind, target, addend: reloc.addend })
         })
         .collect()
 }
 
-fn template_data(data: &[Data], refs: &Refs) -> Result<Vec<TemplateData>, TemplateError> {
+fn template_data(data: &[Data], refs: &Refs, externs: &[String]) -> Result<Vec<TemplateData>, TemplateError> {
     data.iter()
         .enumerate()
         .map(|(at, it)| {
             Ok(TemplateData {
                 align: it.align,
                 bytes: it.bytes.clone(),
-                relocs: template_relocs(&it.relocs, refs, data, Some(at as u32))?,
+                relocs: template_relocs(&it.relocs, refs, externs, data, Some(at as u32))?,
             })
         })
         .collect()
 }
 
 /// The data of a template with `refs` in its places, each with its content ID.
-fn instantiate_data(data: &[TemplateData], refs: &Refs) -> Result<Vec<Data>, TemplateError> {
+fn instantiate_data(data: &[TemplateData], refs: &Refs, externs: &[String]) -> Result<Vec<Data>, TemplateError> {
     let mut made: Vec<Data> = Vec::with_capacity(data.len());
     for (at, it) in data.iter().enumerate() {
-        let relocs = instantiate_relocs(&it.relocs, refs, &made, Some(at as u32))?;
+        let relocs = instantiate_relocs(&it.relocs, refs, externs, &made, Some(at as u32))?;
         made.push(Data::new(it.align, it.bytes.clone(), relocs));
     }
     Ok(made)
@@ -235,6 +263,7 @@ fn instantiate_data(data: &[TemplateData], refs: &Refs) -> Result<Vec<Data>, Tem
 fn instantiate_relocs(
     relocs: &[TemplateReloc],
     refs: &Refs,
+    externs: &[String],
     data: &[Data],
     before: Option<u32>,
 ) -> Result<Vec<Reloc>, TemplateError> {
@@ -243,6 +272,9 @@ fn instantiate_relocs(
         .map(|reloc| {
             let target = match reloc.target {
                 Ref::Place(at) => refs.get(at as usize).cloned().ok_or(TemplateError::Place(at))?,
+                Ref::Extern(at) => {
+                    Target::Extern(externs.get(at as usize).cloned().ok_or(TemplateError::Extern(at))?)
+                }
                 Ref::Data(at) => {
                     if let Some(data) = before
                         && at >= data
@@ -315,20 +347,24 @@ fn refs_len(refs: &Refs) -> u32 {
 }
 
 impl Template {
-    /// `function` with each of its references by its place in `refs`.
-    pub fn of(function: &CompiledFunction, refs: &Refs) -> Result<Template, TemplateError> {
+    /// `function` with each of its references by its place in `refs`. `extra` are the outside
+    /// symbols its backend named of its own accord ([`crate::backend::Emitted::extra`]): a
+    /// relocation to one of them that `refs` lacks is kept by name in the template.
+    pub fn of(function: &CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
         check_refs(refs)?;
+        let externs = own_externs(refs, extra)?;
         Ok(Template {
             arch: function.arch,
             align: function.align,
             code: function.code.clone(),
-            relocs: template_relocs(&function.relocs, refs, &function.data, None)?,
-            data: template_data(&function.data, refs)?,
+            relocs: template_relocs(&function.relocs, refs, &externs, &function.data, None)?,
+            data: template_data(&function.data, refs, &externs)?,
             inlined: function.inlined.clone(),
             side: function.side,
             unwind: function.unwind.as_ref().map(|it| template_unwind(it, refs, &function.data)).transpose()?,
             lines: function.lines.clone(),
             refs: refs_len(refs),
+            externs,
         })
     }
 
@@ -342,13 +378,13 @@ impl Template {
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
-        let data = instantiate_data(&self.data, refs)?;
+        let data = instantiate_data(&self.data, refs, &self.externs)?;
         Ok(CompiledFunction {
             key,
             arch: self.arch,
             align: self.align,
             code: self.code.clone(),
-            relocs: instantiate_relocs(&self.relocs, refs, &data, None)?,
+            relocs: instantiate_relocs(&self.relocs, refs, &self.externs, &data, None)?,
             unwind: self.unwind.as_ref().map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
             data,
             inlined: self.inlined.clone(),
@@ -399,6 +435,10 @@ impl Template {
         }
         content::lines_into(&mut hasher, &self.lines);
         hasher.update(&self.refs.to_le_bytes());
+        hasher.update(&(self.externs.len() as u64).to_le_bytes());
+        for name in &self.externs {
+            hasher.part(name.as_bytes());
+        }
         hasher.finish()
     }
 }
@@ -408,14 +448,14 @@ impl StaticTemplate {
         check_refs(refs)?;
         let init = match &value.init {
             Init::Bytes { bytes, relocs } => {
-                TemplateInit::Bytes { bytes: bytes.clone(), relocs: template_relocs(relocs, refs, &value.data, None)? }
+                TemplateInit::Bytes { bytes: bytes.clone(), relocs: template_relocs(relocs, refs, &[], &value.data, None)? }
             }
             Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
         };
         Ok(StaticTemplate {
             align: value.align,
             init,
-            data: template_data(&value.data, refs)?,
+            data: template_data(&value.data, refs, &[])?,
             mutable: value.mutable,
             thread_local: value.thread_local,
             section: value.section.clone(),
@@ -428,10 +468,10 @@ impl StaticTemplate {
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
-        let data = instantiate_data(&self.data, refs)?;
+        let data = instantiate_data(&self.data, refs, &[])?;
         let init = match &self.init {
             TemplateInit::Bytes { bytes, relocs } => {
-                Init::Bytes { bytes: bytes.clone(), relocs: instantiate_relocs(relocs, refs, &data, None)? }
+                Init::Bytes { bytes: bytes.clone(), relocs: instantiate_relocs(relocs, refs, &[], &data, None)? }
             }
             TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
         };
@@ -460,6 +500,7 @@ fn template_relocs_into(hasher: &mut Hasher, relocs: &[TemplateReloc]) {
             Ref::Position(SpanRef { anchor, index }) => {
                 hasher.update(&[2]).id(&anchor).update(&index.to_le_bytes())
             }
+            Ref::Extern(at) => hasher.update(&[3]).update(&at.to_le_bytes()),
         };
     }
 }
@@ -535,7 +576,7 @@ mod tests {
             personality: Some(refs[3].clone()),
             lsda: Some(lsda),
         });
-        let template = Template::of(&function, &refs).unwrap();
+        let template = Template::of(&function, &refs, &[]).unwrap();
         assert!(matches!(
             template.unwind,
             Some(TemplateUnwind::Dwarf { personality: Some(3), lsda: Some(0), .. })
@@ -544,28 +585,48 @@ mod tests {
 
         let mut foreign = function.clone();
         foreign.unwind = Some(Unwind::Windows { info: vec![1], handler: None, lsda: Some(ContentId([8; 32])) });
-        assert_eq!(Template::of(&foreign, &refs).unwrap_err(), TemplateError::ForeignData(ContentId([8; 32])));
+        assert_eq!(Template::of(&foreign, &refs, &[]).unwrap_err(), TemplateError::ForeignData(ContentId([8; 32])));
         let mut unlisted = function;
         unlisted.unwind = Some(Unwind::Windows {
             info: vec![1],
             handler: Some(Target::Extern("__CxxFrameHandler3".to_owned())),
             lsda: None,
         });
-        assert!(matches!(Template::of(&unlisted, &refs), Err(TemplateError::NotReferenced(_))));
+        assert!(matches!(Template::of(&unlisted, &refs, &[]), Err(TemplateError::NotReferenced(_))));
     }
 
     #[test]
     fn a_template_gives_back_its_function() {
         let (function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
-        let template = Template::of(&function, &refs).unwrap();
+        let template = Template::of(&function, &refs, &[]).unwrap();
         assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+    }
+
+    #[test]
+    fn a_symbol_the_backend_named_is_kept_by_name() {
+        let (mut function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        let bcmp = Target::Extern("bcmp".to_owned());
+        function.relocs.push(call(1, bcmp.clone()));
+        assert_eq!(Template::of(&function, &refs, &[]).unwrap_err(), TemplateError::NotReferenced(bcmp));
+        // `memcpy` is listed already, so it stays a place.
+        let extra = ["memcpy".to_owned(), "bcmp".to_owned()];
+        let template = Template::of(&function, &refs, &extra).unwrap();
+        assert_eq!(template.externs, ["bcmp".to_owned()]);
+        assert_eq!(template.relocs.last().unwrap().target, Ref::Extern(0));
+        assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+        assert_ne!(template.id(), Template { externs: vec!["memcmp".to_owned()], ..template.clone() }.id());
+        let twice = ["bcmp".to_owned(), "bcmp".to_owned()];
+        assert_eq!(
+            Template::of(&function, &refs, &twice).unwrap_err(),
+            TemplateError::NotAnExtern("bcmp".to_owned())
+        );
     }
 
     #[test]
     fn siblings_up_to_callee_renaming_share_one_template() {
         let (a, a_refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
         let (b, b_refs) = reserve(key(4), key(5), ItemKey(ContentId([6; 32])));
-        let (ta, tb) = (Template::of(&a, &a_refs).unwrap(), Template::of(&b, &b_refs).unwrap());
+        let (ta, tb) = (Template::of(&a, &a_refs, &[]).unwrap(), Template::of(&b, &b_refs, &[]).unwrap());
         assert_eq!(ta, tb);
         assert_eq!(ta.id(), tb.id());
         // `b`'s data points at its callee, so its ID is made again from the new place.
@@ -577,17 +638,17 @@ mod tests {
         let (a, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
         let mut b = a.clone();
         b.code[10] = 0xcc;
-        assert_ne!(Template::of(&a, &refs).unwrap().id(), Template::of(&b, &refs).unwrap().id());
+        assert_ne!(Template::of(&a, &refs, &[]).unwrap().id(), Template::of(&b, &refs, &[]).unwrap().id());
     }
 
     #[test]
     fn what_is_not_referenced_is_refused() {
         let (function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
         assert_eq!(
-            Template::of(&function, &refs[..1]).unwrap_err(),
+            Template::of(&function, &refs[..1], &[]).unwrap_err(),
             TemplateError::NotReferenced(refs[2].clone())
         );
-        let template = Template::of(&function, &refs).unwrap();
+        let template = Template::of(&function, &refs, &[]).unwrap();
         assert_eq!(
             template.instantiate(function.key, &refs[..2]).unwrap_err(),
             TemplateError::Refs { made: 3, given: 2 }
@@ -599,7 +660,7 @@ mod tests {
         let (mut function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
         function.data.reverse();
         assert!(matches!(
-            Template::of(&function, &refs),
+            Template::of(&function, &refs, &[]),
             Err(TemplateError::DataOrder { data: 0, points_at: 1 })
         ));
     }

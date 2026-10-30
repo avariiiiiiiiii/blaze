@@ -70,6 +70,9 @@ Order:
   undefined-behavior checker on the MIR evaluator (`crates/hir-ty-ub/`, new), fuzz targets for
   every parser of untrusted bytes (`fuzz/`, new), and the model checker for lock-free code
   (`crates/blaze-graph/src/check/`, new). Sanitizer instrumentation goes to codegen by request.
+- **`fastcompile`**: the twelve changes in `plan/design/compile-time.md`, in new crates
+  (`blaze-stencil`, `blaze-lazy`, `blaze-premap`, `blaze-intent`, `blaze-history`,
+  `blaze-global`) and `tools/pgo/`, with hooks in other lanes' crates by request.
 
 ## 19. How the coordinator integrates
 

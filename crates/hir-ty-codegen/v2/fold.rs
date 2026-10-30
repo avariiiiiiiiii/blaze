@@ -2,10 +2,11 @@
 //! of a prepared function ([`masked`]) and a group's one body with a thunk per member
 //! ([`merge`]). Which functions fold is [`blaze_codegen::fold::groups`]'s.
 //!
-//! A masked function is its IR printed as Cranelift prints it, in layout order, with every
-//! value, block, signature, stack slot, pool constant, function and global value numbered by
-//! its first use, so two functions built alike are equal whatever their entities' numbers.
-//! `iconst`, `f32const` and `f64const` print their immediate as its index among the
+//! A masked function is its IR walked in layout order and written as little-endian words, all
+//! Cranelift's printer shows and nothing else, with every value, block, signature, stack
+//! slot, pool constant, function and global value numbered by its first use, so two
+//! functions built alike are equal whatever their entities' numbers. Its shape is the words'
+//! BLAKE3 hash. `iconst`, `f32const` and `f64const` leave their immediate out for the
 //! constants, and so does every named function and global value: one named by a place, and a
 //! data object of the function's own (a vtable, a type's info, a constant), which is told by
 //! its content with what it points at by target.
@@ -17,10 +18,13 @@
 //! its arguments and its constants: a plain call and return, as Cranelift tail-calls only
 //! under `tail`, which no member is.
 
-use std::collections::HashMap;
+use std::{
+    cell::RefCell,
+    hash::{Hash, Hasher as _},
+};
 
 use blaze_codegen::{
-    CodegenError, Unit,
+    CodegenError, Target, Unit,
     backend::Emitted,
     content::target_id,
     fold::{Constant, Group, Masked, Merged},
@@ -61,12 +65,16 @@ pub(crate) fn masked(function: &Function, refs: &Refs) -> Option<Masked> {
     masked_ir(function.ir()?, &|it| name(function, refs, it))
 }
 
-/// [`masked`] of `func`, whose names `names` says.
+/// [`masked`] of `func`, whose names `names` says. `names` masks no function itself: the
+/// walk's buffers are the thread's.
 pub(crate) fn masked_ir(
     func: &ir::Function,
     names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
 ) -> Option<Masked> {
-    walk(func, names).map(|it| it.masked)
+    WORDS.with_borrow_mut(|words| {
+        let size = canon(func, names, words)?;
+        Some(Masked { shape: shape(&words.bytes), constants: words.constants.clone(), size })
+    })
 }
 
 const FOLD_DATA_DOMAIN: &str = "blaze v2 fold data 1";
@@ -149,7 +157,10 @@ struct Walk {
     sites: Vec<Site>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+const FOLD_IR_DOMAIN: &str = "blaze v2 fold ir 1";
+
+/// The entities numbered by their first use, as indices of [`Words::numbers`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Value,
     Block,
@@ -160,216 +171,498 @@ enum Kind {
     Pool,
 }
 
-/// What an entity is printed as, and which of them are numbered by first use. `None`: an
-/// entity Cranelift prints inline, which a walk refuses if it ever names it by number.
-const PREFIXES: [(&str, Option<Kind>); 11] = [
-    ("block", Some(Kind::Block)),
-    ("const", Some(Kind::Pool)),
-    ("dss", None),
-    ("sig", Some(Kind::Sig)),
-    ("fn", Some(Kind::Func)),
-    ("gv", Some(Kind::Global)),
-    ("jt", None),
-    ("et", None),
-    ("dt", None),
-    ("ss", Some(Kind::Slot)),
-    ("v", Some(Kind::Value)),
-];
+const KINDS: usize = 7;
 
-struct Canon<'a> {
-    func: &'a ir::Function,
-    names: &'a dyn Fn(ir::UserExternalName) -> Option<Name>,
-    text: String,
-    numbers: HashMap<(Kind, u32), u32>,
-    counts: HashMap<Kind, u32>,
+/// What starts a block's words and an instruction's.
+const BLOCK: u8 = 0;
+const INST: u8 = 1;
+
+/// A walk's buffers, one set per thread and reused, so masking a function allocates only
+/// what it returns.
+#[derive(Default)]
+struct Words {
+    /// The masked IR: fixed-width little-endian words, each block and instruction tagged and
+    /// each list length-prefixed, so equal words are equal IR.
+    bytes: Vec<u8>,
+    /// Per kind, by an entity's own number, its number of first use plus one; 0 until used.
+    numbers: [Vec<u32>; KINDS],
+    counts: [u32; KINDS],
     constants: Vec<Constant>,
+    /// Of each of `constants`.
     sites: Vec<Site>,
-    refused: bool,
 }
 
+thread_local! {
+    static WORDS: RefCell<Words> = RefCell::default();
+}
+
+fn shape(bytes: &[u8]) -> Vec<u8> {
+    Hasher::new(FOLD_IR_DOMAIN).update(bytes).finish().0.to_vec()
+}
+
+/// [`masked_ir`] with the sites of its constants, for [`build`].
 fn walk(func: &ir::Function, names: &dyn Fn(ir::UserExternalName) -> Option<Name>) -> Option<Walk> {
+    WORDS.with_borrow_mut(|words| {
+        let size = canon(func, names, words)?;
+        let masked =
+            Masked { shape: shape(&words.bytes), constants: words.constants.clone(), size };
+        Some(Walk { masked, sites: words.sites.clone() })
+    })
+}
+
+/// Writes `func` masked into `words`; its number of instructions, `None` where [`masked`]
+/// refuses.
+fn canon(
+    func: &ir::Function,
+    names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
+    words: &mut Words,
+) -> Option<u32> {
+    words.bytes.clear();
+    words.numbers.iter_mut().for_each(Vec::clear);
+    words.counts = [0; KINDS];
+    words.constants.clear();
+    words.sites.clear();
     func.layout.entry_block()?;
     if !func.dynamic_stack_slots.is_empty() {
         return None;
     }
-    let mut canon = Canon {
-        func,
-        names,
-        text: format!("{}\n", func.signature),
-        numbers: HashMap::new(),
-        counts: HashMap::new(),
-        constants: Vec::new(),
-        sites: Vec::new(),
-        refused: false,
-    };
+    let mut canon = Canon { func, names, words };
+    canon.plain(&func.signature);
     let mut size = 0u32;
     for block in func.layout.blocks() {
-        canon.entity(Kind::Block, block.as_u32());
-        canon.text.push('(');
-        for &param in func.dfg.block_params(block) {
-            canon.entity(Kind::Value, param.as_u32());
-            canon.text.push_str(&format!(": {}, ", func.dfg.value_type(param)));
+        canon.u8(BLOCK);
+        canon.entity(Kind::Block, block.as_u32())?;
+        let params = func.dfg.block_params(block);
+        canon.len(params.len());
+        for &param in params {
+            canon.value(param)?;
+            canon.plain(&func.dfg.value_type(param));
         }
-        canon.text.push_str(if func.layout.is_cold(block) { ") cold:\n" } else { "):\n" });
+        canon.u8(u8::from(func.layout.is_cold(block)));
         for inst in func.layout.block_insts(block) {
             size += 1;
-            canon.inst(inst);
-            canon.text.push('\n');
+            canon.inst(inst)?;
         }
     }
-    if canon.refused {
-        return None;
+    Some(size)
+}
+
+/// Writes what a [`Hash`] impl feeds it as little-endian words: plain data (memory flags,
+/// signatures, stack slots, trap and condition codes) is written whole, whatever its fields.
+struct Le<'a>(&'a mut Vec<u8>);
+
+impl std::hash::Hasher for Le<'_> {
+    fn finish(&self) -> u64 {
+        unreachable!("the words are hashed whole, by BLAKE3")
     }
-    let Canon { text, constants, sites, .. } = canon;
-    Some(Walk { masked: Masked { shape: text.into_bytes(), constants, size }, sites })
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.0.push(i);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        self.write_u8(i as u8);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        self.write_u16(i as u16);
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        self.write_u32(i as u32);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        self.write_u128(i as u128);
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        self.write_u64(i as u64);
+    }
+}
+
+struct Canon<'a> {
+    func: &'a ir::Function,
+    names: &'a dyn Fn(ir::UserExternalName) -> Option<Name>,
+    words: &'a mut Words,
 }
 
 impl Canon<'_> {
-    fn inst(&mut self, inst: ir::Inst) {
+    fn u8(&mut self, it: u8) {
+        self.words.bytes.push(it);
+    }
+
+    fn u32(&mut self, it: u32) {
+        self.words.bytes.extend_from_slice(&it.to_le_bytes());
+    }
+
+    fn len(&mut self, len: usize) {
+        self.u32(len as u32);
+    }
+
+    fn plain(&mut self, it: &impl Hash) {
+        it.hash(&mut Le(&mut self.words.bytes));
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.len(bytes.len());
+        self.words.bytes.extend_from_slice(bytes);
+    }
+
+    fn constant(&mut self, constant: Constant, site: Site) {
+        self.words.constants.push(constant);
+        self.words.sites.push(site);
+    }
+
+    fn value(&mut self, value: ir::Value) -> Option<()> {
+        self.entity(Kind::Value, value.as_u32())
+    }
+
+    fn values(&mut self, values: &[ir::Value]) -> Option<()> {
+        self.len(values.len());
+        values.iter().try_for_each(|&it| self.value(it))
+    }
+
+    fn flags(&mut self, flags: ir::MemFlags) {
+        let data = self.func.dfg.mem_flags[flags];
+        self.plain(&data);
+    }
+
+    /// Every field of every format, as the printer shows them; what an instruction can't
+    /// take as a parameter it refuses.
+    fn inst(&mut self, inst: ir::Inst) -> Option<()> {
         let func = self.func;
         let dfg = &func.dfg;
-        let constant = match dfg.insts[inst] {
-            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
-                let bits = dfg.ctrl_typevar(inst).bits() as u8;
-                Some(Constant::Int { bits, value: u128::from(imm.bits() as u64) })
+        let pool = &dfg.value_lists;
+        self.u8(INST);
+        self.values(dfg.inst_results(inst))?;
+        let data = dfg.insts[inst];
+        self.plain(&data.opcode());
+        let ctrl = dfg.ctrl_typevar(inst);
+        self.plain(&ctrl);
+        match data {
+            InstructionData::AtomicCas { opcode: _, args, flags } => {
+                self.flags(flags);
+                self.values(&args)?;
             }
-            InstructionData::UnaryIeee32 { opcode: Opcode::F32const, imm } => {
-                Some(Constant::F32(imm.bits()))
+            InstructionData::AtomicRmw { opcode: _, args, flags, op } => {
+                self.flags(flags);
+                self.plain(&op);
+                self.values(&args)?;
             }
-            InstructionData::UnaryIeee64 { opcode: Opcode::F64const, imm } => {
-                Some(Constant::F64(imm.bits()))
+            InstructionData::Binary { opcode: _, args } => self.values(&args)?,
+            InstructionData::BinaryImm8 { opcode: _, arg, imm } => {
+                self.value(arg)?;
+                self.plain(&imm);
             }
-            _ => None,
-        };
-        let Some(constant) = constant else {
-            // What Cranelift prints after `  ; ` are the values of the constants it reads.
-            let shown = dfg.display_inst(inst).to_string();
-            return self.tokens(shown.split("  ; ").next().unwrap_or_default());
-        };
-        self.entity(Kind::Value, dfg.first_result(inst).as_u32());
-        let opcode = dfg.insts[inst].opcode();
-        let ty = dfg.ctrl_typevar(inst);
-        self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len()));
-        self.constants.push(constant);
-        self.sites.push(Site::Inst(inst));
-    }
-
-    fn tokens(&mut self, text: &str) {
-        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        let mut rest = text;
-        while let Some(start) = rest.find(word) {
-            self.text.push_str(&rest[..start]);
-            let len = rest[start..].find(|c: char| !word(c)).unwrap_or(rest.len() - start);
-            self.token(&rest[start..start + len]);
-            rest = &rest[start + len..];
+            InstructionData::BranchTable { opcode: _, arg, table } => {
+                self.value(arg)?;
+                let branches = dfg.jump_tables[table].all_branches();
+                self.len(branches.len());
+                for branch in branches {
+                    self.block_call(branch)?;
+                }
+            }
+            InstructionData::Brif { opcode: _, arg, blocks: [then, otherwise] } => {
+                self.value(arg)?;
+                self.block_call(&then)?;
+                self.block_call(&otherwise)?;
+            }
+            InstructionData::Call { opcode: _, args, func_ref } => {
+                self.entity(Kind::Func, func_ref.as_u32())?;
+                self.values(args.as_slice(pool))?;
+                self.stack_map(inst)?;
+            }
+            InstructionData::CallIndirect { opcode: _, args, sig_ref } => {
+                self.entity(Kind::Sig, sig_ref.as_u32())?;
+                self.values(args.as_slice(pool))?;
+                self.stack_map(inst)?;
+            }
+            InstructionData::CondTrap { opcode: _, arg, code } => {
+                self.value(arg)?;
+                self.plain(&code);
+            }
+            InstructionData::DynamicStackAddr { opcode: _, dynamic_stack_slot: _ } => return None,
+            InstructionData::ExceptionHandlerAddress { opcode: _, block, imm } => {
+                self.entity(Kind::Block, block.as_u32())?;
+                self.plain(&imm);
+            }
+            InstructionData::FloatCompare { opcode: _, args, cond } => {
+                self.plain(&cond);
+                self.values(&args)?;
+            }
+            InstructionData::FuncAddr { opcode: _, func_ref } => {
+                self.entity(Kind::Func, func_ref.as_u32())?;
+            }
+            InstructionData::IntAddTrap { opcode: _, args, code } => {
+                self.values(&args)?;
+                self.plain(&code);
+            }
+            InstructionData::IntCompare { opcode: _, args, cond } => {
+                self.plain(&cond);
+                self.values(&args)?;
+            }
+            InstructionData::Jump { opcode: _, destination } => self.block_call(&destination)?,
+            InstructionData::Load { opcode: _, arg, flags, offset } => {
+                self.flags(flags);
+                self.value(arg)?;
+                self.plain(&offset);
+            }
+            InstructionData::LoadNoOffset { opcode: _, arg, flags } => {
+                self.flags(flags);
+                self.value(arg)?;
+            }
+            InstructionData::MultiAry { opcode: _, args } => self.values(args.as_slice(pool))?,
+            InstructionData::NullAry { opcode: _ } => {}
+            InstructionData::Shuffle { opcode: _, args, imm } => {
+                self.values(&args)?;
+                self.bytes(dfg.immediates.get(imm)?.as_slice());
+            }
+            InstructionData::StackAddr { opcode: _, stack_slot, offset } => {
+                self.entity(Kind::Slot, stack_slot.as_u32())?;
+                self.plain(&offset);
+            }
+            InstructionData::Store { opcode: _, args, flags, offset } => {
+                self.flags(flags);
+                self.values(&args)?;
+                self.plain(&offset);
+            }
+            InstructionData::StoreNoOffset { opcode: _, args, flags } => {
+                self.flags(flags);
+                self.values(&args)?;
+            }
+            InstructionData::Ternary { opcode: _, args } => self.values(&args)?,
+            InstructionData::TernaryImm8 { opcode: _, args, imm } => {
+                self.values(&args)?;
+                self.plain(&imm);
+            }
+            InstructionData::Trap { opcode: _, code } => self.plain(&code),
+            InstructionData::TryCall { opcode: _, args, func_ref, exception } => {
+                self.entity(Kind::Func, func_ref.as_u32())?;
+                self.values(args.as_slice(pool))?;
+                self.exception_table(exception)?;
+                self.stack_map(inst)?;
+            }
+            InstructionData::TryCallIndirect { opcode: _, args, exception } => {
+                self.values(args.as_slice(pool))?;
+                self.exception_table(exception)?;
+                self.stack_map(inst)?;
+            }
+            InstructionData::Unary { opcode: _, arg } => self.value(arg)?,
+            InstructionData::UnaryConst { opcode: _, constant_handle } => {
+                self.entity(Kind::Pool, constant_handle.as_u32())?;
+            }
+            InstructionData::UnaryGlobalValue { opcode: _, global_value } => {
+                self.entity(Kind::Global, global_value.as_u32())?;
+            }
+            InstructionData::UnaryIeee16 { opcode: _, imm } => self.plain(&imm),
+            InstructionData::UnaryIeee32 { opcode, imm } => match opcode {
+                Opcode::F32const => self.constant(Constant::F32(imm.bits()), Site::Inst(inst)),
+                _ => self.plain(&imm),
+            },
+            InstructionData::UnaryIeee64 { opcode, imm } => match opcode {
+                Opcode::F64const => self.constant(Constant::F64(imm.bits()), Site::Inst(inst)),
+                _ => self.plain(&imm),
+            },
+            InstructionData::UnaryImm { opcode, imm } => match opcode {
+                Opcode::Iconst => {
+                    let value = u128::from(imm.bits() as u64);
+                    self.constant(Constant::Int { bits: ctrl.bits() as u8, value }, Site::Inst(inst));
+                }
+                // Sign-extended from the type's width, as the printer shows it.
+                _ if ctrl.bits() != 0 => self.plain(&imm.sign_extend_from_width(ctrl.bits())),
+                _ => self.plain(&imm),
+            },
         }
-        self.text.push_str(rest);
+        Some(())
     }
 
-    fn token(&mut self, word: &str) {
-        for (prefix, kind) in PREFIXES {
-            let Some(digits) = word.strip_prefix(prefix) else { continue };
-            if digits.is_empty() || !digits.bytes().all(|it| it.is_ascii_digit()) {
-                continue;
+    fn block_call(&mut self, call: &ir::BlockCall) -> Option<()> {
+        let func = self.func;
+        let pool = &func.dfg.value_lists;
+        self.entity(Kind::Block, call.block(pool).as_u32())?;
+        self.len(call.len(pool));
+        for arg in call.args(pool) {
+            match arg {
+                ir::BlockArg::Value(value) => {
+                    self.u8(0);
+                    self.value(value)?;
+                }
+                ir::BlockArg::TryCallRet(at) => {
+                    self.u8(1);
+                    self.u32(at);
+                }
+                ir::BlockArg::TryCallExn(at) => {
+                    self.u8(2);
+                    self.u32(at);
+                }
             }
-            match (kind, digits.parse::<u32>()) {
-                (Some(kind), Ok(raw)) => self.entity(kind, raw),
-                _ => self.refused = true,
-            }
-            return;
         }
-        self.text.push_str(word);
+        Some(())
     }
 
-    /// Prints the entity by its number of first use, and what it is where it is first used.
-    fn entity(&mut self, kind: Kind, raw: u32) {
+    fn exception_table(&mut self, table: ir::ExceptionTable) -> Option<()> {
+        let func = self.func;
+        let table = &func.dfg.exception_tables[table];
+        self.entity(Kind::Sig, table.signature().as_u32())?;
+        self.block_call(table.normal_return())?;
+        for item in table.items() {
+            match item {
+                ir::ExceptionTableItem::Tag(tag, call) => {
+                    self.u8(0);
+                    self.u32(tag.as_u32());
+                    self.block_call(&call)?;
+                }
+                ir::ExceptionTableItem::Default(call) => {
+                    self.u8(1);
+                    self.block_call(&call)?;
+                }
+                ir::ExceptionTableItem::Context(value) => {
+                    self.u8(2);
+                    self.value(value)?;
+                }
+            }
+        }
+        self.u8(3);
+        Some(())
+    }
+
+    fn stack_map(&mut self, inst: ir::Inst) -> Option<()> {
+        let func = self.func;
+        let Some(entries) = func.dfg.user_stack_map_entries(inst) else {
+            self.u8(0);
+            return Some(());
+        };
+        self.u8(1);
+        self.len(entries.len());
+        for entry in entries {
+            self.plain(&entry.ty);
+            self.entity(Kind::Slot, entry.slot.as_u32())?;
+            self.u32(entry.offset);
+        }
+        Some(())
+    }
+
+    /// Writes the entity's number of first use, and on its first use what it is.
+    fn entity(&mut self, kind: Kind, raw: u32) -> Option<()> {
+        let func = self.func;
         let raw = match kind {
-            Kind::Value => self.func.dfg.resolve_aliases(ir::Value::from_u32(raw)).as_u32(),
+            Kind::Value => func.dfg.resolve_aliases(ir::Value::from_u32(raw)).as_u32(),
             _ => raw,
         };
-        let prefix = PREFIXES.iter().find(|it| it.1 == Some(kind)).map_or("?", |it| it.0);
-        if let Some(number) = self.numbers.get(&(kind, raw)) {
-            return self.text.push_str(&format!("{prefix}{number}"));
+        let (k, at) = (kind as usize, raw as usize);
+        let numbers = &mut self.words.numbers[k];
+        if at >= numbers.len() {
+            numbers.resize(at + 1, 0);
         }
-        let count = self.counts.entry(kind).or_default();
-        let number = *count;
-        *count += 1;
-        self.numbers.insert((kind, raw), number);
-        self.text.push_str(&format!("{prefix}{number}"));
-        let func = self.func;
+        let known = numbers[at];
+        if known != 0 {
+            self.u32(known - 1);
+            return Some(());
+        }
+        let number = self.words.counts[k];
+        self.words.numbers[k][at] = number + 1;
+        self.words.counts[k] = number + 1;
+        self.u32(number);
         match kind {
             Kind::Value | Kind::Block => {}
             Kind::Func => {
                 let callee = ir::FuncRef::from_u32(raw);
-                let data = &func.dfg.ext_funcs[callee];
-                self.text.push('{');
-                let place = self.name(&data.name, Site::Func(callee));
-                self.text.push(' ');
-                self.entity(Kind::Sig, data.signature.as_u32());
-                self.text.push_str(&format!(" {} {}}}", data.colocated, data.patchable));
-                if place && data.patchable {
-                    self.refused = true;
+                let ir::ExtFuncData { ref name, signature, colocated, patchable } =
+                    func.dfg.ext_funcs[callee];
+                if self.name(name, Site::Func(callee))? && patchable {
+                    return None;
                 }
+                self.entity(Kind::Sig, signature.as_u32())?;
+                self.u8(u8::from(colocated));
+                self.u8(u8::from(patchable));
             }
             Kind::Global => {
                 let global = ir::GlobalValue::from_u32(raw);
-                self.text.push('{');
                 match func.global_values[global] {
-                    ir::GlobalValueData::Symbol { ref name, offset, colocated, tls } => {
-                        self.name(name, Site::Global(global));
-                        let offset: i64 = offset.into();
-                        self.text.push_str(&format!(" {offset} {colocated} {tls}"));
-                    }
+                    ir::GlobalValueData::VMContext => self.u8(0),
                     ir::GlobalValueData::Load { base, offset, global_type, flags } => {
-                        self.refused |= self.is_named(base);
-                        self.text.push_str(&format!("load.{global_type} {flags} "));
-                        self.entity(Kind::Global, base.as_u32());
-                        self.text.push_str(&format!("{offset}"));
+                        if self.is_named(base) {
+                            return None;
+                        }
+                        self.u8(1);
+                        self.flags(flags);
+                        self.entity(Kind::Global, base.as_u32())?;
+                        self.plain(&offset);
+                        self.plain(&global_type);
                     }
                     ir::GlobalValueData::IAddImm { base, offset, global_type } => {
-                        self.refused |= self.is_named(base);
-                        self.text.push_str(&format!("iadd_imm.{global_type} "));
-                        self.entity(Kind::Global, base.as_u32());
-                        self.text.push_str(&format!(", {offset}"));
+                        if self.is_named(base) {
+                            return None;
+                        }
+                        self.u8(2);
+                        self.entity(Kind::Global, base.as_u32())?;
+                        self.plain(&offset);
+                        self.plain(&global_type);
                     }
-                    ref other => self.text.push_str(&other.to_string()),
+                    ir::GlobalValueData::Symbol { ref name, offset, colocated, tls } => {
+                        self.u8(3);
+                        self.name(name, Site::Global(global))?;
+                        self.plain(&offset);
+                        self.u8(u8::from(colocated));
+                        self.u8(u8::from(tls));
+                    }
+                    ir::GlobalValueData::DynScaleTargetConst { vector_type } => {
+                        self.u8(4);
+                        self.plain(&vector_type);
+                    }
                 }
-                self.text.push('}');
             }
-            Kind::Sig => {
-                let sig = &func.dfg.signatures[ir::SigRef::from_u32(raw)];
-                self.text.push_str(&format!("{{{sig}}}"));
-            }
-            Kind::Slot => {
-                let slot = &func.sized_stack_slots[ir::StackSlot::from_u32(raw)];
-                self.text.push_str(&format!("{{{slot}}}"));
-            }
-            Kind::Pool => {
-                let data = func.dfg.constants.get(ir::Constant::from_u32(raw));
-                self.text.push_str(&format!("{{{data}}}"));
-            }
+            Kind::Sig => self.plain(&func.dfg.signatures[ir::SigRef::from_u32(raw)]),
+            Kind::Slot => self.plain(&func.sized_stack_slots[ir::StackSlot::from_u32(raw)]),
+            Kind::Pool => self.bytes(func.dfg.constants.get(ir::Constant::from_u32(raw)).as_slice()),
         }
+        Some(())
     }
 
-    /// Prints a function's or global value's name; whether it is a constant (a place or a
-    /// data object).
-    fn name(&mut self, name: &ir::ExternalName, site: Site) -> bool {
+    /// Writes a function's or global value's name; whether it is a constant (a place or a
+    /// data object). `None` for a user name `names` doesn't know.
+    fn name(&mut self, name: &ir::ExternalName, site: Site) -> Option<bool> {
         let ir::ExternalName::User(user) = name else {
-            self.text.push_str(&name.display(None).to_string());
-            return false;
+            self.u8(0);
+            self.plain(name);
+            return Some(false);
         };
-        let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone()) {
-            Some(Name::Place(place)) => Constant::Place(place),
-            Some(Name::Data(id)) => Constant::Data(id),
-            None => {
-                self.refused = true;
-                return false;
-            }
+        let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone())? {
+            Name::Place(place) => Constant::Place(place),
+            Name::Data(id) => Constant::Data(id),
         };
-        self.text.push_str(&format!("#{}", self.constants.len()));
-        self.constants.push(constant);
-        self.sites.push(site);
-        true
+        self.u8(1);
+        self.constant(constant, site);
+        Some(true)
     }
 
     /// Whether `global` is a symbol with a name: a constant, which can't be another global
@@ -438,9 +731,8 @@ pub(crate) fn build(
             }
             let equal = match (mine, firsts) {
                 (Constant::Place(mine), Constant::Place(firsts)) => {
-                    let target = |refs: &Refs, place: u32| refs.get(place as usize).cloned();
-                    let mine = target(refs, mine);
-                    mine.is_some() && mine == target(members[0].2, firsts)
+                    let mine = refs.get(mine as usize);
+                    mine.is_some() && mine == members[0].2.get(firsts as usize)
                 }
                 (mine, firsts) => mine == firsts,
             };
@@ -492,50 +784,51 @@ fn body(
             body.dfg.append_block_param(entry, ty)
         })
         .collect();
-    let insts: Vec<ir::Inst> =
-        body.layout.blocks().flat_map(|block| body.layout.block_insts(block)).collect();
+    // A varying function's or global value's parameter, found in one pass over the body.
+    let (mut funcs, mut globals) = (Vec::new(), Vec::new());
     for (&at, &param) in group.varying.iter().zip(reads) {
         let param = params[param as usize];
         match walk.sites[at as usize] {
             Site::Inst(inst) => alias(&mut body, inst, param)?,
-            Site::Func(callee) => {
-                for &inst in &insts {
-                    let data = body.dfg.insts[inst];
-                    match data {
-                        InstructionData::FuncAddr { func_ref, .. } if func_ref == callee => {
-                            alias(&mut body, inst, param)?
-                        }
-                        InstructionData::Call { opcode, func_ref, .. } if func_ref == callee => {
-                            let sig = body.dfg.ext_funcs[func_ref].signature;
-                            let args = body.dfg.inst_args(inst).to_vec();
-                            match opcode {
-                                Opcode::Call => body.replace(inst).call_indirect(sig, param, &args),
-                                Opcode::ReturnCall => {
-                                    body.replace(inst).return_call_indirect(sig, param, &args)
-                                }
-                                other => return Err(format!("{other} of a varying function")),
-                            };
-                        }
-                        InstructionData::TryCall { func_ref, exception, .. }
-                            if func_ref == callee =>
-                        {
-                            let args = body.dfg.inst_args(inst).to_vec();
-                            body.replace(inst).try_call_indirect(param, &args, exception);
-                        }
-                        _ => {}
-                    }
+            Site::Func(callee) => funcs.push((callee, param)),
+            Site::Global(global) => globals.push((global, param)),
+        }
+    }
+    if funcs.is_empty() && globals.is_empty() {
+        return Ok(body);
+    }
+    let func_param = |callee| funcs.iter().find(|it: &&(ir::FuncRef, ir::Value)| it.0 == callee);
+    let insts: Vec<ir::Inst> =
+        body.layout.blocks().flat_map(|block| body.layout.block_insts(block)).collect();
+    for inst in insts {
+        let data = body.dfg.insts[inst];
+        match data {
+            InstructionData::FuncAddr { func_ref, .. } => {
+                if let Some(&(_, param)) = func_param(func_ref) {
+                    alias(&mut body, inst, param)?;
                 }
             }
-            Site::Global(global) => {
-                for &inst in &insts {
-                    let data = body.dfg.insts[inst];
-                    if let InstructionData::UnaryGlobalValue { global_value, .. } = data
-                        && global_value == global
-                    {
-                        alias(&mut body, inst, param)?;
-                    }
+            InstructionData::Call { opcode, func_ref, .. } => {
+                let Some(&(_, param)) = func_param(func_ref) else { continue };
+                let sig = body.dfg.ext_funcs[func_ref].signature;
+                let args = body.dfg.inst_args(inst).to_vec();
+                match opcode {
+                    Opcode::Call => body.replace(inst).call_indirect(sig, param, &args),
+                    Opcode::ReturnCall => body.replace(inst).return_call_indirect(sig, param, &args),
+                    other => return Err(format!("{other} of a varying function")),
+                };
+            }
+            InstructionData::TryCall { func_ref, exception, .. } => {
+                let Some(&(_, param)) = func_param(func_ref) else { continue };
+                let args = body.dfg.inst_args(inst).to_vec();
+                body.replace(inst).try_call_indirect(param, &args, exception);
+            }
+            InstructionData::UnaryGlobalValue { global_value, .. } => {
+                if let Some(&(_, param)) = globals.iter().find(|it| it.0 == global_value) {
+                    alias(&mut body, inst, param)?;
                 }
             }
+            _ => {}
         }
     }
     Ok(body)
@@ -671,8 +964,9 @@ pub(crate) fn merge(
     emit: impl Fn(&Unit, &Spec, &Function, ir::Function, &Refs) -> Result<Emitted, CodegenError>,
 ) -> Result<Merged, CodegenError> {
     let &(first, ..) = members.first().expect("a group has members");
+    let key = group.key();
     let fail = |what: String| CodegenError {
-        unit: group.key(),
+        unit: key,
         item: first.item,
         what: format!("folding {} functions into one body: {what}", group.members.len()),
     };
@@ -695,15 +989,17 @@ pub(crate) fn merge(
     let Folded { body, thunks } = build(group, &sources, pointer).map_err(fail)?;
     let (unit, spec, prepared, refs) = members[0];
     let mut body = emit(unit, spec, prepared, body, refs)?;
-    body.function.key = group.key();
-    let thunks = members
-        .iter()
-        .zip(thunks)
-        .map(|(&(unit, spec, prepared, refs), thunk)| {
-            emit(unit, spec, prepared, thunk, &group.thunk_refs(refs))
-        })
-        .collect::<Result<Vec<Emitted>, CodegenError>>()?;
-    Ok(Merged { body, thunks })
+    body.function.key = key;
+    // Each thunk's references are `Group::thunk_refs` of its member's.
+    let mut own: Vec<Target> = Vec::new();
+    let mut emitted = Vec::with_capacity(members.len());
+    for (&(unit, spec, prepared, refs), thunk) in members.iter().zip(thunks) {
+        own.clear();
+        own.extend_from_slice(refs);
+        own.push(Target::Direct(key));
+        emitted.push(emit(unit, spec, prepared, thunk, &own[..])?);
+    }
+    Ok(Merged { body, thunks: emitted })
 }
 
 #[cfg(test)]
@@ -823,8 +1119,7 @@ mod tests {
         assert_eq!(a.shape, b.shape);
         assert_eq!(b.constants[0], Constant::Int { bits: 64, value: u128::from(-4i64 as u64) });
         assert_eq!(b.constants[1], Constant::Place(2));
-        let text = String::from_utf8(a.shape).unwrap();
-        assert!(!text.contains(" 8") && !text.contains("; "), "{text}");
+        assert_eq!(a.shape.len(), 32);
     }
 
     #[test]

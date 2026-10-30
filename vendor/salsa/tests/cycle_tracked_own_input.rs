@@ -105,7 +105,6 @@ fn main() {
 
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: infer_class(Id(0)) }",
             "WillCheckCancellation",

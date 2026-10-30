@@ -18,29 +18,34 @@ use syntax::{
 };
 
 /// rustc's printing of `pred`, in `edition` (which decides whether a raw identifier keeps its
-/// `r#`).
-pub(crate) fn where_predicate(pred: &ast::WherePred, edition: Edition) -> String {
-    let mut p = Printer { out: String::new(), edition };
-    p.where_predicate(pred);
-    p.out
+/// `r#`), appended to `out`.
+pub(crate) fn where_predicate(out: &mut String, pred: &ast::WherePred, edition: Edition) {
+    Printer { out, edition }.where_predicate(pred);
 }
 
 /// rustc's printing of an identifier written `text` (`Ident`'s `Display`): with `r#` when it is
 /// a keyword of `edition`, else without, however it is written.
 pub(crate) fn ident(text: &str, edition: Edition) -> String {
-    let bare = text.strip_prefix("r#").unwrap_or(text);
-    match is_raw_identifier(bare, edition) {
-        true => format!("r#{bare}"),
-        false => bare.to_owned(),
-    }
+    let mut out = String::with_capacity(text.len() + 2);
+    push_ident(&mut out, text, edition);
+    out
 }
 
-struct Printer {
-    out: String,
+fn push_ident(out: &mut String, text: &str, edition: Edition) {
+    let bare = text.strip_prefix("r#").unwrap_or(text);
+    if is_raw_identifier(bare, edition) {
+        out.push_str("r#");
+    }
+    out.push_str(bare);
+}
+
+/// Writes into the suggestion's one buffer: nothing is allocated per node printed.
+struct Printer<'a> {
+    out: &'a mut String,
     edition: Edition,
 }
 
-impl Printer {
+impl Printer<'_> {
     fn word(&mut self, text: &str) {
         self.out.push_str(text);
     }
@@ -50,24 +55,16 @@ impl Printer {
         if let Some(binder) = pred.for_binder() {
             self.formal_generic_params(&binder);
         }
-        let bounds: Vec<ast::TypeBound> =
-            pred.type_bound_list().map(|it| it.bounds().collect()).unwrap_or_default();
         match (pred.lifetime(), pred.ty()) {
             (Some(lifetime), _) => {
                 self.lifetime(&lifetime);
                 self.word(":");
-                if !bounds.is_empty() {
-                    self.word(" ");
-                    self.lifetime_bounds(&bounds);
-                }
+                self.lifetime_bounds(" ", pred.type_bound_list());
             }
             (None, Some(ty)) => {
                 self.ty(&ty);
                 self.word(":");
-                if !bounds.is_empty() {
-                    self.word(" ");
-                    self.type_bounds(&bounds);
-                }
+                self.type_bounds(" ", pred.type_bound_list());
             }
             (None, None) => self.source(pred.syntax()),
         }
@@ -82,19 +79,18 @@ impl Printer {
     }
 
     fn ident(&mut self, text: &str) {
-        let printed = ident(text, self.edition);
-        self.word(&printed);
+        push_ident(&mut self.out, text, self.edition);
     }
 
     fn lifetime(&mut self, lifetime: &ast::Lifetime) {
         self.word(lifetime.text());
     }
 
-    fn lifetime_bounds(&mut self, bounds: &[ast::TypeBound]) {
-        for (i, bound) in bounds.iter().enumerate() {
-            if i != 0 {
-                self.word(" + ");
-            }
+    /// The bounds of `list` joined with ` + `, after `prefix` when there is one.
+    fn lifetime_bounds(&mut self, prefix: &str, list: Option<ast::TypeBoundList>) {
+        let Some(list) = list else { return };
+        for (i, bound) in list.bounds().enumerate() {
+            self.word(if i == 0 { prefix } else { " + " });
             match bound.lifetime() {
                 Some(lifetime) => self.lifetime(&lifetime),
                 None => self.source(bound.syntax()),
@@ -102,12 +98,12 @@ impl Printer {
         }
     }
 
-    fn type_bounds(&mut self, bounds: &[ast::TypeBound]) {
-        for (i, bound) in bounds.iter().enumerate() {
-            if i != 0 {
-                self.word(" + ");
-            }
-            self.type_bound(bound);
+    /// The bounds of `list` joined with ` + `, after `prefix` when there is one.
+    fn type_bounds(&mut self, prefix: &str, list: Option<ast::TypeBoundList>) {
+        let Some(list) = list else { return };
+        for (i, bound) in list.bounds().enumerate() {
+            self.word(if i == 0 { prefix } else { " + " });
+            self.type_bound(&bound);
         }
     }
 
@@ -153,42 +149,34 @@ impl Printer {
     /// `print_formal_generic_params`: `for<..> `.
     fn formal_generic_params(&mut self, binder: &ast::ForBinder) {
         let Some(list) = binder.generic_param_list() else { return };
-        let params: Vec<ast::GenericParam> = list.generic_params().collect();
-        if params.is_empty() {
+        let mut params = list.generic_params().peekable();
+        if params.peek().is_none() {
             return;
         }
         self.word("for");
-        self.generic_params(&params);
+        self.generic_params(params);
         self.word(" ");
     }
 
-    fn generic_params(&mut self, params: &[ast::GenericParam]) {
+    fn generic_params(&mut self, params: impl Iterator<Item = ast::GenericParam>) {
         self.word("<");
-        for (i, param) in params.iter().enumerate() {
+        for (i, param) in params.enumerate() {
             if i != 0 {
                 self.word(", ");
             }
             self.outer_attrs(param.syntax());
-            match param {
+            match &param {
                 ast::GenericParam::LifetimeParam(it) => {
                     if let Some(lifetime) = it.lifetime() {
                         self.lifetime(&lifetime);
                     }
-                    let bounds: Vec<_> = it.type_bound_list().map(|it| it.bounds().collect()).unwrap_or_default();
-                    if !bounds.is_empty() {
-                        self.word(": ");
-                        self.lifetime_bounds(&bounds);
-                    }
+                    self.lifetime_bounds(": ", it.type_bound_list());
                 }
                 ast::GenericParam::TypeParam(it) => {
                     if let Some(name) = it.name() {
                         self.ident(name.text());
                     }
-                    let bounds: Vec<_> = it.type_bound_list().map(|it| it.bounds().collect()).unwrap_or_default();
-                    if !bounds.is_empty() {
-                        self.word(": ");
-                        self.type_bounds(&bounds);
-                    }
+                    self.type_bounds(": ", it.type_bound_list());
                     if let Some(default) = it.default_type() {
                         self.word(" = ");
                         self.ty(&default);
@@ -238,15 +226,16 @@ impl Printer {
             }
             ast::Type::NeverType(_) => self.word("!"),
             ast::Type::TupleType(it) => {
-                let fields: Vec<ast::Type> = it.fields().collect();
                 self.word("(");
-                for (i, field) in fields.iter().enumerate() {
-                    if i != 0 {
+                let mut count = 0;
+                for field in it.fields() {
+                    if count != 0 {
                         self.word(", ");
                     }
-                    self.ty(field);
+                    self.ty(&field);
+                    count += 1;
                 }
-                if fields.len() == 1 {
+                if count == 1 {
                     self.word(",");
                 }
                 self.word(")");
@@ -305,8 +294,7 @@ impl Printer {
     }
 
     fn bound_list(&mut self, list: Option<ast::TypeBoundList>) {
-        let bounds: Vec<_> = list.map(|it| it.bounds().collect()).unwrap_or_default();
-        self.type_bounds(&bounds);
+        self.type_bounds("", list);
     }
 
     /// `print_ty_fn` of a function pointer: `unsafe extern "C" fn(u8) -> u8`.
@@ -452,11 +440,7 @@ impl Printer {
                 (None, None) => {}
             }
         } else {
-            let bounds: Vec<_> = it.type_bound_list().map(|it| it.bounds().collect()).unwrap_or_default();
-            if !bounds.is_empty() {
-                self.word(": ");
-                self.type_bounds(&bounds);
-            }
+            self.type_bounds(": ", it.type_bound_list());
         }
     }
 
@@ -547,7 +531,9 @@ mod tests {
         let text = format!("fn f() where {predicate} {{}}");
         let file = SourceFile::parse(&text, Edition::Edition2021).tree();
         let pred = file.syntax().descendants().find_map(ast::WherePred::cast).unwrap();
-        where_predicate(&pred, Edition::Edition2021)
+        let mut out = String::new();
+        where_predicate(&mut out, &pred, Edition::Edition2021);
+        out
     }
 
     #[test]

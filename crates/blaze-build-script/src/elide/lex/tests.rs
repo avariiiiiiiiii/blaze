@@ -11,8 +11,12 @@ fn texts(source: &str) -> Vec<&str> {
     lex(source).unwrap().into_iter().map(|it| it.text).collect()
 }
 
-fn string(value: &str) -> Kind {
-    Kind::Str { value: value.to_owned(), escaped_brace: false }
+fn string(value: &str) -> Kind<'_> {
+    Kind::Str { value: value.into(), escaped_brace: false }
+}
+
+fn raw(value: &str) -> Kind<'_> {
+    Kind::RawStr { value }
 }
 
 #[test]
@@ -62,7 +66,7 @@ fn strings_and_every_escape() {
     assert_eq!(kinds("\"two\nlines\""), [string("two\nlines")]);
     assert_eq!(kinds("\"é ünïcode {}\""), [string("é ünïcode {}")]);
     assert_eq!(kinds(r#""\u{7b}\x7d""#), [Kind::Str {
-        value: "{}".to_owned(),
+        value: "{}".into(),
         escaped_brace: true
     }]);
     for refused in [
@@ -85,7 +89,6 @@ fn strings_and_every_escape() {
 
 #[test]
 fn raw_strings() {
-    let raw = |value: &str| Kind::RawStr { value: value.to_owned() };
     assert_eq!(kinds(r#"r"a\n{}""#), [raw(r"a\n{}")]);
     assert_eq!(kinds(r###"r#"a "quoted" b"#"###), [raw(r#"a "quoted" b"#)]);
     assert_eq!(kinds(r###"r##"a "# b"##"###), [raw(r##"a "# b"##)]);
@@ -152,6 +155,61 @@ fn prefixes_and_what_is_refused() {
     }
     assert_eq!(kinds("b c r"), vec![Kind::Ident; 3], "the prefixes alone are identifiers");
     assert_eq!(lex("x é").unwrap_err().at, 2);
+}
+
+/// The byte search for text direction code points against the characters rustc's lints name,
+/// over every character, alone and after others.
+#[test]
+fn text_direction_is_found_as_by_its_characters() {
+    let named = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let mut source = String::new();
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        source.clear();
+        source.push_str("a\u{2020}é");
+        source.push(c);
+        let expected = named(c).then_some("a\u{2020}é".len());
+        assert_eq!(text_direction(&source), expected, "{c:?}");
+    }
+}
+
+/// A string's value borrows the source unless an escape made it differ, and is the same
+/// value either way.
+#[test]
+fn a_string_borrows_its_value_until_an_escape() {
+    let lexed = lex(r#""plain {} é" "a\nb" "x\\y" r"raw""#).unwrap();
+    let values: Vec<(&str, bool)> = lexed
+        .iter()
+        .map(|it| match &it.kind {
+            Kind::Str { value, .. } => (&**value, matches!(value, Cow::Borrowed(_))),
+            Kind::RawStr { value } => (*value, true),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(values, [("plain {} é", true), ("a\nb", false), ("x\\y", false), ("raw", true)]);
+}
+
+/// The value of a decimal integer read digit by digit against `str::parse` of its digits
+/// without `_`s, over seeded runs of digits and `_`s, short and past what a `u128` holds.
+#[test]
+fn an_integer_s_value_is_what_parse_gives() {
+    let mut state = 0xd1b5_4a32_d192_ed03u64;
+    for _ in 0..20_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let len = 1 + (state % 45) as usize;
+        let mut text = String::from(char::from(b'0' + (state >> 6) as u8 % 10));
+        for at in 1..len {
+            let pick = (state.rotate_left(at as u32 * 5) % 12) as u8;
+            text.push(if pick >= 10 { '_' } else { char::from(b'0' + pick) });
+        }
+        let digits: String = text.chars().filter(|c| *c != '_').collect();
+        let expected = match digits.parse::<u128>() {
+            Ok(value) => Kind::Int(value),
+            Err(_) => Kind::Number,
+        };
+        assert_eq!(kinds(&text), [expected], "{text}");
+    }
 }
 
 #[test]

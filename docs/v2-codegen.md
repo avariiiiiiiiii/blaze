@@ -37,7 +37,11 @@ instantiates the template with the keys this build gives the places. A callee ed
 relocations of its callers, and compiles none of them.
 
 The places come from the front end's walk of the MIR, not from the IR build. A backend that
-needs a reference the list lacks fails the unit: the list is what makes templates exact.
+needs a reference the list lacks fails the unit: the list is what makes templates exact. The
+one exception is an outside symbol the backend calls of its own accord, which no MIR names
+(LLVM's loop-idiom `memcpy`, `bcmp`, libm, compiler-rt, stack probes): the backend says so in
+`Emitted::extra`, and the template keeps it by name (`Template::externs`), since it follows
+from the code and the settings alone.
 
 `Target::Function` and `Target::Direct` are written as one kind of instruction (a direct
 call, or a direct address); a `Function` target is the callee's jump-table stub, which the
@@ -65,6 +69,13 @@ settings and architecture) to the template. `Vec<A>::drop` and `Vec<B>::drop` di
 which `drop_in_place` they call: one shape, one compile, two instantiations. Constants,
 layouts and symbols are in the shape, so the sharing is exact. Within one build, the first
 instance of a shape compiles and the others wait for its template.
+
+The memo is shared by every worker and every build of the daemon, and a read takes no lock
+and writes no shared memory (docs/v2/plan/design/concurrency.md): an append-only
+open-addressed table indexed by the shape's BLAKE3 bits, each slot a pointer to an immutable
+template published by one compare-and-swap, growing by levels of twice the slots. A hit is a
+borrow of the template for as long as the build borrows the memo; collection (`retain`) runs
+between builds, with the memo borrowed by nothing.
 
 The store key of an instance's template is its `InstanceKey` (dev) or
 `Imports::blob_key` (release), so a warm build builds no IR for an unchanged instance.

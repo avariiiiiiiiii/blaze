@@ -41,6 +41,9 @@ pub struct Output {
     pub tags: u64,
     /// The stack the main thread gets, where the format says it (PE, wasm).
     pub stack: Option<u64>,
+    /// PE: `#![windows_subsystem = "windows"]`, a GUI program with no console (rustc's
+    /// `/SUBSYSTEM:WINDOWS`). Other formats have no subsystem.
+    pub windows_subsystem: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

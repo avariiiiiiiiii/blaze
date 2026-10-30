@@ -3,6 +3,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -193,23 +194,36 @@ fn the_check_run_json_of_each_status() {
         if let Some(conclusion) = conclusion {
             want["conclusion"] = json!(conclusion);
         }
-        assert_eq!(check_run(&run(status), true), want, "{status:?}");
+        assert_eq!(body(&run(status), true), want, "{status:?}");
 
         want.as_object_mut().unwrap().remove("head_sha");
-        assert_eq!(check_run(&run(status), false), want, "{status:?} as an update");
+        assert_eq!(body(&run(status), false), want, "{status:?} as an update");
     }
+}
+
+/// [`check_run`]'s bytes, parsed.
+fn body(run: &CheckRun, create: bool) -> Value {
+    let mut out = vec![b'x'; 7];
+    check_run(&mut out, run, create);
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// What [`summary`] sends: the text kept, then the note.
+fn summarized(text: &str) -> String {
+    let (kept, cut) = summary(text);
+    format!("{kept}{cut}")
 }
 
 #[test]
 fn a_short_summary_is_kept_whole() {
     let text = "x".repeat(MOST_SUMMARY);
-    assert_eq!(summary(&text), text);
+    assert_eq!(summary(&text), (text.as_str(), ""));
 }
 
 #[test]
 fn a_long_summary_is_cut_at_a_char_boundary_saying_so() {
     let text = "é".repeat(MOST_SUMMARY);
-    let cut = summary(&text);
+    let cut = summarized(&text);
     assert!(cut.len() <= MOST_SUMMARY);
     assert!(cut.chars().count() <= MOST_SUMMARY);
     assert!(cut.ends_with(CUT));
@@ -218,17 +232,130 @@ fn a_long_summary_is_cut_at_a_char_boundary_saying_so() {
     assert!(kept.len() >= MOST_SUMMARY - CUT.len() - 1);
 
     let ascii = "y".repeat(MOST_SUMMARY + 1);
-    assert_eq!(summary(&ascii).len(), MOST_SUMMARY);
+    assert_eq!(summarized(&ascii).len(), MOST_SUMMARY);
 }
 
 #[test]
 fn a_cut_summary_goes_into_the_check_run() {
     let mut long = run(CheckStatus::Failure);
     long.summary = "z".repeat(100_000);
-    let body = check_run(&long, true);
+    let body = body(&long, true);
     let summary = body["output"]["summary"].as_str().unwrap();
     assert!(summary.len() <= MOST_SUMMARY);
     assert!(summary.ends_with(CUT));
+}
+
+/// A summary of every hard case: each byte below 0x20, quotes and backslashes at every offset
+/// in a word, DEL, multi-byte characters, and runs long enough to take the eight-byte path.
+fn hard_texts() -> Vec<String> {
+    let mut texts = vec![String::new(), "plain ascii only, longer than a word".to_owned()];
+    texts.push((0u8..0x20).map(char::from).collect());
+    for at in 0..9 {
+        let mut text = "a".repeat(at);
+        text.push('"');
+        text.push_str(&"b".repeat(17 - at));
+        text.push('\\');
+        texts.push(text);
+    }
+    texts.push("\u{7f}é—😀\u{1}\u{1f}\u{2028}x".repeat(5));
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..200 {
+        let len = (seed % 70) as usize;
+        let text: String = (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                match seed % 6 {
+                    0 => char::from((seed >> 8) as u8 % 0x20),
+                    1 => ['"', '\\', '/', '\u{7f}'][(seed >> 8) as usize % 4],
+                    2 => char::from_u32(0x80 + (seed >> 8) as u32 % 0x700).unwrap_or('é'),
+                    _ => char::from(b' ' + (seed >> 8) as u8 % 95),
+                }
+            })
+            .collect();
+        texts.push(text);
+    }
+    texts
+}
+
+#[test]
+fn json_strings_are_escaped_byte_for_byte_as_serde_json_escapes_them() {
+    for text in hard_texts() {
+        let mut out = Vec::new();
+        json_string(&mut out, &[&text]);
+        assert_eq!(String::from_utf8(out).unwrap(), serde_json::to_string(&text).unwrap(), "{text:?}");
+    }
+    let mut out = Vec::new();
+    json_string(&mut out, &["a\"", "", "\nb"]);
+    assert_eq!(out, serde_json::to_string("a\"\nb").unwrap().into_bytes());
+}
+
+#[test]
+fn the_word_test_finds_every_byte_that_needs_escaping() {
+    for byte in 0..=255u8 {
+        for at in 0..8 {
+            let mut word = [b'a'; 8];
+            word[at] = byte;
+            let needs = byte < 0x20 || byte == b'"' || byte == b'\\';
+            assert_eq!(needs_escape(u64::from_le_bytes(word)), needs, "{byte:#x} at {at}");
+            let mut high = [0xc3; 8];
+            high[at] = byte;
+            assert_eq!(needs_escape(u64::from_le_bytes(high)), needs, "{byte:#x} at {at} among 0xc3");
+        }
+    }
+}
+
+#[test]
+fn a_check_run_body_has_every_hard_summary_whole() {
+    for text in hard_texts() {
+        let mut check = run(CheckStatus::Success);
+        check.summary = text.clone();
+        check.name = text.clone();
+        let body = body(&check, true);
+        assert_eq!(body["output"]["summary"], Value::String(text.clone()));
+        assert_eq!(body["name"], Value::String(text));
+    }
+}
+
+#[test]
+fn requests_are_written_as_the_api_crate_writes_them() {
+    let path = PathOf { route: Route::CheckRun(42), installation: 7, repo: "o/r" };
+    let mut out = vec![1, 2, 3];
+    write_request(&mut out, "PATCH", "api.github.com", &path, ("token ", "t0k"), b"{\"a\":1}");
+    let want = http::request(
+        "PATCH",
+        "api.github.com",
+        "/repos/o/r/check-runs/42",
+        &[
+            ("Authorization", "token t0k"),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "blaze-ci"),
+            ("Content-Type", "application/json"),
+        ],
+        b"{\"a\":1}",
+    );
+    assert_eq!(out, want);
+
+    let path = PathOf { route: Route::Mint, installation: 7, repo: "o/r" };
+    write_request(&mut out, "POST", "api.github.com", &path, ("Bearer ", "j.w.t"), b"");
+    let want = http::request(
+        "POST",
+        "api.github.com",
+        "/app/installations/7/access_tokens",
+        &[
+            ("Authorization", "Bearer j.w.t"),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "blaze-ci"),
+        ],
+        b"",
+    );
+    assert_eq!(out, want);
+
+    let path = PathOf { route: Route::CheckRuns, installation: 7, repo: "o/r" };
+    assert_eq!(path.to_string(), "/repos/o/r/check-runs");
 }
 
 #[test]

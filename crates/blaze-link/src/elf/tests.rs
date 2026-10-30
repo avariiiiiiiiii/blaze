@@ -168,21 +168,22 @@ impl Fixture {
     }
 }
 
-/// The workspace's `object` reads ELF only from 8-aligned bytes.
-fn aligned(bytes: &[u8]) -> Vec<u64> {
-    bytes
-        .chunks(8)
-        .map(|it| {
-            let mut word = [0; 8];
-            word[..it.len()].copy_from_slice(it);
-            u64::from_le_bytes(word)
-        })
-        .collect()
+/// `bytes` copied to an 8-aligned start: the workspace's `object` reads ELF only from those.
+struct Aligned {
+    buffer: Vec<u8>,
+    start: usize,
 }
 
-fn view(words: &[u64], len: usize) -> &[u8] {
-    // SAFETY: `words` holds at least `len` initialized bytes, and u8 has no alignment.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), len) }
+fn aligned(bytes: &[u8]) -> Aligned {
+    let mut buffer = Vec::with_capacity(bytes.len() + 7);
+    let start = buffer.as_ptr().align_offset(8);
+    buffer.resize(start, 0);
+    buffer.extend_from_slice(bytes);
+    Aligned { buffer, start }
+}
+
+fn view(aligned: &Aligned, len: usize) -> &[u8] {
+    &aligned.buffer[aligned.start..aligned.start + len]
 }
 
 fn c_string(data: &[u8], at: u64) -> &str {
@@ -441,6 +442,8 @@ fn an_executable_reads_back() {
     let (_, line) = sections.section_by_name(endian, b".debug_line").unwrap();
     let at = line.sh_offset(endian) as usize;
     assert_eq!(bytes[at..at + 3], [1, 2, 3]);
+    let (_, verneed) = sections.section_by_name(endian, b".gnu.version_r").unwrap();
+    assert_eq!(verneed.sh_info(endian), 2, "one Elf64_Verneed per library with versions");
 }
 
 #[test]
@@ -741,4 +744,248 @@ fn native_relocations() {
     let mut bytes = [0u8; 2];
     apply(Aarch64, elf::R_AARCH64_PREL16, &mut bytes, 0x2000, 0x1000, 0).unwrap();
     assert_eq!(u16::from_le_bytes(bytes), (-0x1000i16) as u16);
+}
+
+/// A seeded Fisher-Yates shuffle.
+fn shuffled<T>(mut items: Vec<T>, mut seed: u64) -> Vec<T> {
+    for at in (1..items.len()).rev() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        items.swap(at, (seed >> 33) as usize % (at + 1));
+    }
+    items
+}
+
+impl Fixture {
+    fn synthetic(&self, name: &'static str) -> &[u8] {
+        &self.contents[self.index(&Class::Synthetic(name))]
+    }
+}
+
+/// `.gnu.hash` as it was built before the counting sort: a stable sort by bucket.
+fn gnu_hash_model(names: &[String], symoffset: u32) -> (Vec<u8>, Vec<usize>) {
+    let n = names.len() as u64;
+    let (buckets, mask_words) = ((n / 4).max(1), (n * 12 / 64 + 1).next_power_of_two());
+    let mut exports: Vec<(u32, u32, usize)> = names
+        .iter()
+        .enumerate()
+        .map(|(at, it)| {
+            let hash = elf::gnu_hash(it.as_bytes());
+            (hash % buckets as u32, hash, at)
+        })
+        .collect();
+    exports.sort_by_key(|&(bucket, _, _)| bucket);
+    let mut out = Vec::new();
+    for word in [buckets as u32, symoffset, mask_words as u32, 26] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut bloom = vec![0u64; mask_words as usize];
+    for &(_, hash, _) in &exports {
+        bloom[((hash as u64 / 64) % mask_words) as usize] |= (1 << (hash % 64)) | (1 << ((hash >> 26) % 64));
+    }
+    for word in bloom {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut first = vec![0u32; buckets as usize];
+    for (at, &(bucket, _, _)) in exports.iter().enumerate().rev() {
+        first[bucket as usize] = symoffset + at as u32;
+    }
+    for it in first {
+        out.extend_from_slice(&it.to_le_bytes());
+    }
+    for (at, &(bucket, hash, _)) in exports.iter().enumerate() {
+        let last = exports.get(at + 1).is_none_or(|next| next.0 != bucket);
+        out.extend_from_slice(&((hash & !1) | last as u32).to_le_bytes());
+    }
+    (out, exports.iter().map(|it| it.2).collect())
+}
+
+/// Past the parallel threshold, `.gnu.hash` and the order of `.dynsym` are the bytes the
+/// stable sort gave, and every export is found.
+#[test]
+fn many_exports_hash_as_the_model_does() {
+    let names: Vec<String> = (0..3 * super::dynamic::CHUNK).map(|it| format!("_ZN5blaze6export{it}17h{it:016x}E")).collect();
+    let counts = Counts {
+        imports: 2,
+        import_names: 6 + 4 + 2 * 11,
+        libraries: 1,
+        library_names: 9,
+        exports: names.len() as u64,
+        export_names: names.iter().map(|it| it.len() as u64).sum(),
+        ..Counts::default()
+    };
+    let kind = OutputKind::Shared { name: "libmany.so".into(), exports: names.clone() };
+    let output = output(blaze_codegen::Arch::X86_64, kind, None);
+    let mut image = Fixture::new(output, &[(Class::Text, 4 * names.len() as u64, 4)], &counts);
+    let text = image.at(&Class::Text);
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: true }];
+    image.imports = vec![import("malloc", Some(0), Some("GLIBC_2.2.5"), false), import("free", Some(0), Some("GLIBC_2.2.5"), false)];
+    image.exports = names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| Export { name: name.clone(), addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .collect();
+    let bytes = image.link();
+
+    let (model, order) = gnu_hash_model(&names, 3);
+    assert_eq!(image.synthetic(super::GNU_HASH), model);
+    let dynsym = image.synthetic(super::DYNSYM);
+    let dynstr = image.synthetic(super::DYNSTR);
+    for (at, &export) in order.iter().enumerate() {
+        let entry = &dynsym[24 * (3 + at)..][..24];
+        let name = u32::from_le_bytes(entry[..4].try_into().unwrap());
+        assert_eq!(c_string(dynstr, name.into()), names[export]);
+        assert_eq!(u64::from_le_bytes(entry[8..16].try_into().unwrap()), text + 4 * export as u64);
+    }
+    let versym = image.synthetic(super::VERSYM);
+    assert_eq!(versym.len(), 2 * (3 + names.len()));
+    assert!(versym[6..].chunks(2).all(|it| it == elf::VER_NDX_GLOBAL.to_le_bytes()));
+
+    let words = aligned(&bytes);
+    let data = view(&words, bytes.len());
+    let file = ElfFile64::<Endianness>::parse(data).unwrap();
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let dynsyms = sections.symbols(endian, data, elf::SHT_DYNSYM).unwrap();
+    let versions = sections.versions(endian, data).unwrap().unwrap();
+    let (hash, _) = sections.gnu_hash(endian, data).unwrap().unwrap();
+    for (at, name) in names.iter().enumerate() {
+        let (_, symbol) = hash
+            .find(endian, name.as_bytes(), elf::gnu_hash(name.as_bytes()), None, &dynsyms, &versions)
+            .unwrap_or_else(|| panic!("`{name}` is not in the hash table"));
+        assert_eq!(symbol.st_value(endian), text + 4 * at as u64);
+    }
+}
+
+/// `.rela.dyn` past the parallel threshold: the slid addresses sorted and first whatever order
+/// they come in, the bytes the sequential build gave.
+#[test]
+fn many_slid_addresses_are_relocated_as_the_model_does() {
+    let n = 3 * super::dynamic::CHUNK + 17;
+    let counts = Counts { absolute: n as u64 + 1, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
+    let pieces = [(Class::Text, 16, 16), (Class::Data, 8 * n as u64 + 8, 8)];
+    let mut image = Fixture::new(executable(), &pieces, &counts);
+    let data = image.at(&Class::Data);
+    let text = image.at(&Class::Text);
+    for at in 0..n {
+        image.put(&Class::Data, 8 * at, &(text + at as u64 * 3).to_le_bytes());
+    }
+    image.entry = Some(text);
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
+    image.imports = vec![import("malloc", Some(0), None, false)];
+    image.binds = vec![Bind { addr: data + 8 * n as u64, import: 0, addend: 0 }];
+    let sorted: Vec<u64> = (0..n as u64).map(|at| data + 8 * at).collect();
+
+    let mut expected: Vec<(u64, u32, u32, i64)> =
+        (0..n as u64).map(|at| (data + 8 * at, elf::R_X86_64_RELATIVE, 0, (text + at * 3) as i64)).collect();
+    expected.sort();
+    expected.push((data + 8 * n as u64, elf::R_X86_64_64, 1, 0));
+    let mut model = Vec::new();
+    for (at, r_type, sym, addend) in expected {
+        model.extend_from_slice(&at.to_le_bytes());
+        model.extend_from_slice(&((u64::from(sym) << 32) | u64::from(r_type)).to_le_bytes());
+        model.extend_from_slice(&addend.to_le_bytes());
+    }
+
+    for (rebase, what) in [(sorted.clone(), "sorted"), (shuffled(sorted.clone(), 7), "shuffled")] {
+        image.rebase = rebase;
+        let synthesized = image.synthesize().unwrap();
+        let rela = &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::RELA_DYN)).unwrap().1;
+        assert_eq!(*rela, model, "{what}");
+        let dynamic = &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::DYNAMIC)).unwrap().1;
+        let count = dynamic
+            .chunks(16)
+            .find(|it| u64::from_le_bytes(it[..8].try_into().unwrap()) == u64::from(elf::DT_RELACOUNT))
+            .map(|it| u64::from_le_bytes(it[8..].try_into().unwrap()));
+        assert_eq!(count, Some(n as u64), "{what}");
+    }
+
+    image.rebase = vec![data, text];
+    let error = image.synthesize().unwrap_err();
+    assert!(error.what.contains("text relocation"), "{}", error.what);
+}
+
+/// `.symtab` and `.strtab` built in parallel chunks: every function in order with its name,
+/// unnamed functions left out, an empty name at offset 0, then the exports and imports.
+#[test]
+fn many_functions_are_named_in_the_symbol_table() {
+    let n = 2 * super::dynamic::CHUNK + 100;
+    let counts = Counts { functions: n as u64, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
+    let mut image = Fixture::new(executable(), &[(Class::Text, 16 * n as u64, 16)], &counts);
+    let text = image.at(&Class::Text);
+    image.entry = Some(text);
+    image.functions = (0..n)
+        .map(|at| Function {
+            addr: text + 16 * at as u64,
+            size: 16,
+            fde: None,
+            windows: None,
+            name: match at % 7 {
+                0 => None,
+                3 if at == 3 => Some(String::new()),
+                _ => Some(format!("_ZN4test8function{at}E")),
+            },
+        })
+        .collect();
+    image.exports = vec![Export { name: "_ZN4test8function1E".into(), addr: text + 16, size: 16, kind: SymbolKind::Function }];
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
+    image.imports = vec![import("malloc", Some(0), None, false)];
+    let bytes = image.link();
+
+    let words = aligned(&bytes);
+    let data = view(&words, bytes.len());
+    let file = ElfFile64::<Endianness>::parse(data).unwrap();
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let symtab = sections.symbols(endian, data, elf::SHT_SYMTAB).unwrap();
+    let named: Vec<&Function> = image.functions.iter().filter(|it| it.name.is_some()).collect();
+    let symbols = symtab.symbols();
+    assert_eq!(symbols.len(), 1 + named.len() + 2);
+    let (_, shdr) = sections.section_by_name(endian, b".symtab").unwrap();
+    assert_eq!(shdr.sh_info(endian) as usize, 1 + named.len());
+    for (symbol, function) in symbols[1..].iter().zip(&named) {
+        assert_eq!(symbol.name(endian, symtab.strings()).unwrap(), function.name.as_deref().unwrap().as_bytes());
+        assert_eq!(symbol.st_value(endian), function.addr);
+        assert_eq!(symbol.st_size(endian), 16);
+        assert_eq!(symbol.st_bind(), elf::STB_LOCAL);
+        assert_eq!(symbol.st_shndx(endian), 1 + image.index(&Class::Text) as u16);
+    }
+    assert_eq!(symbols[1 + named.iter().position(|it| it.name.as_deref() == Some("")).unwrap()].st_name(endian), 0);
+    let export = &symbols[1 + named.len()];
+    assert_eq!(export.name(endian, symtab.strings()).unwrap(), b"_ZN4test8function1E");
+    assert_eq!(export.st_bind(), elf::STB_GLOBAL);
+    let import = &symbols[2 + named.len()];
+    assert_eq!(import.name(endian, symtab.strings()).unwrap(), b"malloc");
+    assert!(import.is_undefined(endian));
+}
+
+/// FDEs of two CIEs, each CIE parsed once: every FDE in the table, sorted by address.
+#[test]
+fn eh_frame_hdr_indexes_fdes_of_every_cie() {
+    use gimli::write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable};
+    let encoding = gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
+    let build = |text: u64| {
+        let mut table = FrameTable::default();
+        let a = table.add_cie(CommonInformationEntry::new(encoding, 1, -8, gimli::Register(16)));
+        let b = table.add_cie(CommonInformationEntry::new(encoding, 4, -8, gimli::Register(16)));
+        for at in 0..40u64 {
+            let cie = if at % 3 == 0 { b } else { a };
+            table.add_fde(cie, FrameDescriptionEntry::new(Address::Constant(text + 16 * ((at * 17) % 40)), 16));
+        }
+        let mut section = EhFrame(EndianVec::new(gimli::LittleEndian));
+        table.write_eh_frame(&mut section).unwrap();
+        section.0.into_vec()
+    };
+    let len = build(0).len() as u64;
+    let counts = Counts { fdes: 40, ..Counts::default() };
+    let mut image = Fixture::new(executable(), &[(Class::Text, 16 * 40, 16), (Class::EhFrame, len, 8)], &counts);
+    let text = image.at(&Class::Text);
+    image.entry = Some(text);
+    image.put(&Class::EhFrame, 0, &build(text));
+    image.link();
+    let hdr = image.at(&Class::Synthetic(super::EH_FRAME_HDR));
+    let table = image.synthetic(super::EH_FRAME_HDR);
+    let word = |at: usize| i32::from_le_bytes(table[at..at + 4].try_into().unwrap()) as i64;
+    assert_eq!(word(8), 40);
+    let pcs: Vec<i64> = (0..40).map(|at| word(12 + 8 * at) + hdr as i64).collect();
+    assert_eq!(pcs, (0..40).map(|at| text as i64 + 16 * at).collect::<Vec<_>>());
 }

@@ -1,12 +1,13 @@
-//! E0116, E0390 and E0785: an inherent impl of a type defined outside the crate, of a
-//! primitive type, or of a `dyn` of auto traits only (hir's `IncoherentImpl`, from
+//! E0116, E0390, E0118 and E0785: an inherent impl of a type defined outside the crate, of a
+//! primitive type, of a parameter, projection or opaque type, or of a `dyn` of auto traits only
+//! (hir's `IncoherentImpl`, from
 //! `is_inherent_impl_coherent`); and what the impl kinds share: the impl a diagnostic is of and
 //! the spans rustc gives its parts.
 //!
 //! Follows rustc's `compiler/rustc_hir_analysis/src/coherence/inherent_impls.rs`
 //! (`InherentCollect::check_item`, `check_def_id`, `check_primitive_impl`) and the structs
 //! `InherentTyOutsideNew`, `InherentTyOutside`, `InherentTyOutsideRelevant`,
-//! `InherentTyOutsidePrimitive`, `InherentPrimitiveTy` and `InherentDyn` of
+//! `InherentTyOutsidePrimitive`, `InherentPrimitiveTy`, `InherentNominal` and `InherentDyn` of
 //! `compiler/rustc_hir_analysis/src/diagnostics.rs` (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId, ItemKey};
@@ -194,6 +195,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
         } else {
             outside_new(cx, &at, span)
         }
+    } else if self_ty.as_type_param(cx.db).is_some()
+        || self_ty.as_associated_type_parent_trait(cx.db).is_some()
+        || self_ty.as_impl_traits(cx.db).is_some()
+    {
+        let mut diag = Diag::error(Some("E0118"), "no nominal type found for inherent implementation", span.clone());
+        diag.span_label(span, "impl requires a nominal type");
+        diag.note("either implement a trait on it or create a newtype to wrap it instead");
+        diag
     } else {
         let mut diag = Diag::error(Some("E0785"), "cannot define inherent `impl` for a dyn auto trait", span.clone());
         diag.span_label(span, "impl requires at least one non-auto trait");

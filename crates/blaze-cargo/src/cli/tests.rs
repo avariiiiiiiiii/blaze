@@ -1,0 +1,192 @@
+use std::{ffi::OsString, io, path::PathBuf, time::Instant};
+
+use blaze_api::{Request, Response, UnitStarted, Verb, client::ClientError};
+
+use super::*;
+use crate::cli::{
+    args::{Asked, Invocation},
+    say::Ended,
+    test::tests::{Fake, built},
+};
+
+fn os(words: &[&str]) -> impl Iterator<Item = OsString> {
+    words.iter().map(OsString::from).collect::<Vec<_>>().into_iter()
+}
+
+fn invocation(words: Vec<OsString>) -> Invocation {
+    match args::parse(words).unwrap() {
+        Asked::Cargo(asked) => *asked,
+        other => panic!("not a build: {other:?}"),
+    }
+}
+
+fn place() -> Place {
+    Place { cwd: PathBuf::from("/w"), manifest: PathBuf::from("/w/Cargo.toml"), root: PathBuf::from("/w") }
+}
+
+fn request_of(asked: &Invocation) -> Request {
+    let env = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
+    request(asked, place::cargo(asked, &place(), env, Vec::new(), false).unwrap())
+}
+
+#[test]
+fn cargo_blaze_and_blaze_are_the_same_command() {
+    let through_cargo = words(os(&["/home/u/.cargo/bin/cargo-blaze", "blaze", "build", "--release", "-p", "foo"]));
+    let direct = words(os(&["blaze", "build", "--release", "-p", "foo"]));
+    assert_eq!(through_cargo, direct);
+    let request = request_of(&invocation(direct));
+    assert_eq!(request, request_of(&invocation(through_cargo)));
+    let Request::Build { view, targets } = request else { panic!("not a build: {request:?}") };
+    assert_eq!(view, ViewRef::Head("/w".to_owned()));
+    assert_eq!(targets.packages, ["foo"]);
+    assert_eq!(targets.profile, "release");
+    let cargo = targets.cargo.unwrap();
+    assert_eq!(cargo.command, "build");
+    assert_eq!(cargo.args, ["--release", "-p", "foo"]);
+    assert_eq!((cargo.root.as_str(), cargo.cwd.as_str()), ("/w", "/w"));
+}
+
+#[test]
+fn each_command_its_request() {
+    let check = request_of(&invocation(words(os(&["blaze", "check", "--features", "a,b"]))));
+    let Request::Check { targets, .. } = check else { panic!("{check:?}") };
+    assert_eq!(targets.features, ["a", "b"]);
+    assert_eq!(targets.profile, "dev");
+
+    let test = request_of(&invocation(words(os(&["blaze", "t", "parse", "--", "--exact"]))));
+    let Request::Build { targets, .. } = test else { panic!("{test:?}") };
+    assert_eq!(targets.profile, "test");
+
+    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached", "parse"]))));
+    let Request::Test { filter, all, targets, .. } = reached else { panic!("{reached:?}") };
+    assert_eq!((filter, all), (vec!["parse".to_owned()], false));
+    // `--reached` is blaze's: cargo's command line does not have it.
+    assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+}
+
+#[test]
+fn usage_errors_exit_1() {
+    assert_eq!(command(words(os(&["blaze", "build", "--frobnicate"]))), USAGE);
+    assert_eq!(command(words(os(&["blaze", "build", "--jobs"]))), USAGE);
+    assert_eq!(command(words(os(&["blaze", "test", "--message-format", "xml"]))), USAGE);
+    assert_eq!(command(words(os(&["blaze", "frobnicate"]))), FAILED);
+}
+
+/// Answers every request with `responses`.
+struct FakeApi {
+    responses: Vec<Response>,
+    asked: Vec<Request>,
+    hangs_up: bool,
+}
+
+impl FakeApi {
+    fn answering(responses: Vec<Response>) -> FakeApi {
+        FakeApi { responses, asked: Vec::new(), hangs_up: false }
+    }
+}
+
+impl daemon::Api for FakeApi {
+    fn call<F: FnMut(Response)>(&mut self, request: Request, mut on: F) -> Result<bool, ClientError> {
+        self.asked.push(request);
+        let mut ok = false;
+        for response in &self.responses {
+            if let Response::Done { ok: it } = response {
+                ok = *it;
+            }
+            on(response.clone());
+        }
+        match self.hangs_up {
+            true => Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "the daemon hung up"))),
+            false => Ok(ok),
+        }
+    }
+}
+
+fn foo_compiling() -> Response {
+    Response::Unit(UnitStarted {
+        package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        name: "foo".to_owned(),
+        version: "0.1.0".to_owned(),
+        source: Some("(/w/foo)".to_owned()),
+        verb: Verb::Compiling,
+    })
+}
+
+fn tests_built() -> Vec<Response> {
+    vec![
+        foo_compiling(),
+        Response::Built { artifacts: built(), profile: "`test` profile [unoptimized + debuginfo]".to_owned() },
+        Response::Done { ok: true },
+    ]
+}
+
+fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, String, String) {
+    let asked = invocation(self::words(os(words)));
+    let request = request_of(&asked);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let shown = Shown { quiet: asked.flags.quiet, verbose: asked.flags.verbose, ..Shown::default() };
+    let then = drive(api, &asked, &place(), request, shown, Instant::now(), &mut out, &mut err, programs).unwrap();
+    (then, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn a_failing_test_executable_stops_the_tests() {
+    let mut api = FakeApi::answering(tests_built());
+    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+    let (then, out, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert_eq!(out, "");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines[0], "   Compiling foo v0.1.0 (/w/foo)");
+    assert!(lines[1].starts_with("    Finished `test` profile [unoptimized + debuginfo] target(s) in "), "{err}");
+    assert_eq!(&lines[2..], [
+        "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
+        "error: test failed, to rerun pass `--lib`",
+    ]);
+    assert_eq!(programs.ran.len(), 1);
+    assert!(matches!(api.asked.as_slice(), [Request::Build { .. }]));
+
+    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+    let (then, _, err) = driven(&mut api, &["blaze", "test", "--no-fail-fast"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert_eq!(programs.ran.len(), 4);
+    assert!(err.ends_with("   Doc-tests foo\n"), "{err}");
+}
+
+#[test]
+fn a_failed_build_runs_nothing() {
+    let mut api = FakeApi::answering(vec![foo_compiling(), Response::Done { ok: false }]);
+    let mut programs = Fake::default();
+    let (then, _, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert!(programs.ran.is_empty());
+    assert_eq!(err, "   Compiling foo v0.1.0 (/w/foo)\n");
+
+    let mut api = FakeApi { hangs_up: true, ..FakeApi::answering(vec![foo_compiling()]) };
+    let (then, _, err) = driven(&mut api, &["blaze", "build"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert!(err.ends_with("error: the daemon's connection: the daemon hung up\n"), "{err}");
+}
+
+#[test]
+fn run_becomes_its_program() {
+    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let built = Response::Built { artifacts: vec![foo], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
+    let mut api = FakeApi::answering(vec![built, Response::Done { ok: true }]);
+    let (then, _, err) = driven(&mut api, &["blaze", "run", "--release", "a", "--", "b"], &mut Fake::default());
+    let Then::Exec(exec) = then else { panic!("{then:?}") };
+    assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
+    assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
+    assert_eq!(exec.cwd, PathBuf::from("/w"));
+    assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
+
+    let two = [
+        crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
+        crate::cli::run::tests::artifact("foo", "bin", "bar", false, Some("bar")),
+    ];
+    let built = Response::Built { artifacts: two.to_vec(), profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
+    let mut api = FakeApi::answering(vec![built, Response::Done { ok: true }]);
+    let (then, _, err) = driven(&mut api, &["blaze", "run", "-q"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(101));
+    assert!(err.starts_with("error: `cargo run` could not determine which binary to run."), "{err}");
+}

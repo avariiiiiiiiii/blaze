@@ -54,6 +54,8 @@ pub(crate) enum SymKey {
     Got(GotKind, Box<SymKey>),
     /// A PLT stub of an import.
     Plt(Box<SymKey>),
+    /// The zero cell after a DLL's cells in an import address table, by the DLL's name.
+    IatEnd(Box<str>),
     /// A tentative definition merged by name.
     Common(Box<str>),
     /// The cell holding the address of the current jump table.

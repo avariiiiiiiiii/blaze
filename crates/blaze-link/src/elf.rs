@@ -8,6 +8,8 @@
 //! GOT) and writable data with the TLS template and `.bss` last. A region's file offset is
 //! its address, so a region never moves in the file while its address stays.
 
+#![forbid(unsafe_code)]
+
 mod dynamic;
 mod image;
 mod native;

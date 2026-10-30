@@ -23,8 +23,8 @@ use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
 use syntax_bridge::DocCommentDesugarMode;
 use tt::token_to_literal;
 
-use crate::item_tree::lower::Ctx;
-
+/// The attributes of one item, owned: what lowering one item's attributes alone gives (an
+/// [`ItemTree`](super::ItemTree) keeps every item's in one array, read as [`AttrsOrCfgRef`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttrsOrCfg {
     Enabled {
@@ -52,105 +52,87 @@ impl AttrsOrCfg {
         S: syntax_bridge::SpanMapper + Copy,
     {
         let mut attrs = Vec::new();
-        let result = collect_item_tree_attrs::<Infallible>(owner, cfg_options, |meta, _| {
-            // NOTE: We cannot early return from this function, *every* attribute must be pushed, otherwise we'll mess the `AttrId`
-            // tracking.
-            let path = meta.path();
-            let path_range = path
-                .as_ref()
-                .map(|path| path.syntax().text_range())
-                .unwrap_or_else(|| meta.syntax().text_range());
-            let (span, input) = match &meta {
-                ast::Meta::KeyValueMeta(meta) => {
-                    let span = span_map.span_for(path_range);
-                    let input = meta.expr().and_then(|value| {
-                        if let ast::Expr::Literal(value) = value {
-                            Some(Box::new(AttrInput::Literal(token_to_literal(
-                                value.token().text(),
-                                span_map.span_for(value.syntax().text_range()),
-                            ))))
-                        } else {
-                            None
-                        }
-                    });
-                    (span, input)
-                }
-                ast::Meta::TokenTreeMeta(meta) => {
-                    let span = span_map.span_for(path_range);
-                    let tt = syntax_bridge::syntax_node_to_token_tree(
-                        &meta
-                            .token_tree()
-                            .map(|it| it.syntax().clone())
-                            .unwrap_or_else(|| meta.syntax().clone()),
-                        span_map,
-                        span,
-                        DocCommentDesugarMode::ProcMacro,
-                    );
-                    let input = Some(Box::new(AttrInput::TokenTree(tt)));
-                    (span, input)
-                }
-                ast::Meta::PathMeta(_) => {
-                    let span = span_map.span_for(path_range);
-                    (span, None)
-                }
-                ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_) | ast::Meta::UnsafeMeta(_) => {
-                    unreachable!(
-                        "`cfg`, `cfg_attr` and `unsafe(...)` are handled in `collect_item_tree_attrs()`"
-                    )
-                }
-            };
-
-            let path = path.and_then(|path| {
-                ModPath::from_src(db, path, &mut |range| span_map.span_for(range).ctx)
-            });
-            let path = path.unwrap_or_else(|| Name::missing().into());
-
-            attrs.push(Attr { path: Interned::new(path), input, ctxt: span.ctx });
-            ControlFlow::Continue(())
-        });
+        let cfg = lower_attrs_into(db, owner, cfg_options, span_map, &mut attrs);
         let attrs = AttrsOwned(attrs.into_boxed_slice());
-        match result {
-            Some(Either::Right(cfg)) => AttrsOrCfg::CfgDisabled(Box::new((cfg, attrs))),
+        match cfg {
+            Some(cfg) => AttrsOrCfg::CfgDisabled(Box::new((cfg, attrs))),
             None => AttrsOrCfg::Enabled { attrs },
         }
     }
+}
 
-    // Merges two `AttrsOrCfg`s, assuming `self` is placed before `other` in the source code.
-    // The operation follows these rules:
-    //
-    //   - If `self` and `other` are both `AttrsOrCfg::Enabled`, the result is a new
-    //     `AttrsOrCfg::Enabled`. It contains the concatenation of `self`'s attributes followed by
-    //     `other`'s.
-    //   - If `self` is `AttrsOrCfg::Enabled` but `other` is `AttrsOrCfg::CfgDisabled`, the result
-    //     is a new `AttrsOrCfg::CfgDisabled`. It contains the concatenation of `self`'s attributes
-    //     followed by `other`'s.
-    //   - If `self` is `AttrsOrCfg::CfgDisabled`, return `self` as-is.
-    //
-    // The rationale is that attribute collection is sequential and order-sensitive. This operation
-    // preserves those semantics when combining attributes from two different sources.
-    // `AttrsOrCfg::CfgDisabled` marks a point where collection stops due to a false `#![cfg(...)]`
-    // condition. It acts as a "breakpoint": attributes beyond it are not collected. Therefore,
-    // when merging, an `AttrsOrCfg::CfgDisabled` on the left-hand side short-circuits the
-    // operation, while an `AttrsOrCfg::CfgDisabled` on the right-hand side preserves all
-    // attributes collected up to that point.
-    //
-    // Note that this operation is neither commutative nor associative.
-    pub(crate) fn merge(self, other: AttrsOrCfg) -> AttrsOrCfg {
-        match (self, other) {
-            (AttrsOrCfg::Enabled { attrs }, AttrsOrCfg::Enabled { attrs: other_attrs }) => {
-                let mut v = attrs.0.into_vec();
-                v.extend(other_attrs.0);
-                AttrsOrCfg::Enabled { attrs: AttrsOwned(v.into_boxed_slice()) }
+/// Appends `owner`'s attributes to `attrs`, and returns the `cfg` that disables it, if one
+/// does: the attributes appended are then those before that `cfg` (what crate-level attributes
+/// need), so lowering a second owner after a disabled one is never needed.
+pub(super) fn lower_attrs_into<'a, S>(
+    db: &dyn SourceDatabase,
+    owner: &dyn ast::HasAttrs,
+    cfg_options: &dyn Fn() -> &'a CfgOptions,
+    span_map: S,
+    attrs: &mut Vec<Attr>,
+) -> Option<CfgExpr>
+where
+    S: syntax_bridge::SpanMapper + Copy,
+{
+    let result = collect_item_tree_attrs::<Infallible>(owner, cfg_options, |meta, _| {
+        // NOTE: We cannot early return from this function, *every* attribute must be pushed, otherwise we'll mess the `AttrId`
+        // tracking.
+        let path = meta.path();
+        let path_range = path
+            .as_ref()
+            .map(|path| path.syntax().text_range())
+            .unwrap_or_else(|| meta.syntax().text_range());
+        let (span, input) = match &meta {
+            ast::Meta::KeyValueMeta(meta) => {
+                let span = span_map.span_for(path_range);
+                let input = meta.expr().and_then(|value| {
+                    if let ast::Expr::Literal(value) = value {
+                        Some(Box::new(AttrInput::Literal(token_to_literal(
+                            value.token().text(),
+                            span_map.span_for(value.syntax().text_range()),
+                        ))))
+                    } else {
+                        None
+                    }
+                });
+                (span, input)
             }
-            (AttrsOrCfg::Enabled { attrs }, AttrsOrCfg::CfgDisabled(mut other)) => {
-                let other_attrs = &mut other.1;
-                let mut v = attrs.0.into_vec();
-                v.extend(std::mem::take(&mut other_attrs.0));
-                other_attrs.0 = v.into_boxed_slice();
-                AttrsOrCfg::CfgDisabled(other)
+            ast::Meta::TokenTreeMeta(meta) => {
+                let span = span_map.span_for(path_range);
+                let tt = syntax_bridge::syntax_node_to_token_tree(
+                    &meta
+                        .token_tree()
+                        .map(|it| it.syntax().clone())
+                        .unwrap_or_else(|| meta.syntax().clone()),
+                    span_map,
+                    span,
+                    DocCommentDesugarMode::ProcMacro,
+                );
+                let input = Some(Box::new(AttrInput::TokenTree(tt)));
+                (span, input)
             }
-            (this @ AttrsOrCfg::CfgDisabled(_), _) => this,
-        }
+            ast::Meta::PathMeta(_) => {
+                let span = span_map.span_for(path_range);
+                (span, None)
+            }
+            ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_) | ast::Meta::UnsafeMeta(_) => {
+                unreachable!(
+                    "`cfg`, `cfg_attr` and `unsafe(...)` are handled in `collect_item_tree_attrs()`"
+                )
+            }
+        };
+
+        let path = path.and_then(|path| {
+            ModPath::from_src(db, path, &mut |range| span_map.span_for(range).ctx)
+        });
+        let path = path.unwrap_or_else(|| Name::missing().into());
+
+        attrs.push(Attr { path: Interned::new(path), input, ctxt: span.ctx });
+        ControlFlow::Continue(())
+    });
+    match result {
+        Some(Either::Right(cfg)) => Some(cfg),
+        None => None,
     }
 }
 
@@ -169,11 +151,12 @@ impl ops::Deref for Attrs<'_> {
     }
 }
 
-impl Ctx<'_> {
-    #[inline]
-    pub(super) fn lower_attrs(&self, owner: &dyn ast::HasAttrs) -> AttrsOrCfg {
-        AttrsOrCfg::lower(self.db, owner, &|| self.cfg_options(), self.span_map())
-    }
+/// The attributes of an item of an [`ItemTree`](super::ItemTree), borrowed from its columns.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AttrsOrCfgRef<'a> {
+    Enabled { attrs: Attrs<'a> },
+    /// The `cfg` that is false, and the attributes before it.
+    CfgDisabled(&'a CfgExpr, Attrs<'a>),
 }
 
 impl AttrsOwned {
@@ -181,15 +164,15 @@ impl AttrsOwned {
     pub(crate) fn as_ref(&self) -> Attrs<'_> {
         Attrs(&self.0)
     }
-
-    /// The attributes `attrs`, as lowering would have collected them.
-    pub(super) fn from_attrs(attrs: Box<[Attr]>) -> AttrsOwned {
-        AttrsOwned(attrs)
-    }
 }
 
 impl<'a> Attrs<'a> {
     pub(crate) const EMPTY: Self = Attrs(&[]);
+
+    #[inline]
+    pub(super) fn new(attrs: &'a [Attr]) -> Attrs<'a> {
+        Attrs(attrs)
+    }
 
     #[inline]
     pub(crate) fn by_key(self, key: Symbol) -> AttrQuery<'a> {
@@ -254,13 +237,6 @@ impl<'attr> AttrQuery<'attr> {
     pub(crate) fn attrs(self) -> impl Iterator<Item = &'attr Attr> + Clone {
         let key = self.key;
         self.attrs.0.iter().filter(move |attr| attr.path.as_ident().is_some_and(|s| *s == key))
-    }
-}
-
-impl AttrsOrCfg {
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        matches!(self, AttrsOrCfg::Enabled { attrs } if attrs.0.is_empty())
     }
 }
 

@@ -12,7 +12,6 @@ use salsa::plumbing::{AsId, FromId};
 use salsa::{Database, Setter};
 
 #[salsa::db]
-#[derive(Clone)]
 struct TestDb {
     storage: salsa::Storage<Self>,
 }
@@ -87,36 +86,37 @@ fn assert_unpublished_during_cleanup(non_reusable: bool) {
     payload(&db, old);
     input.set_value(&mut db).to(1);
 
-    let writer_db = db.clone();
-    let writer = std::thread::spawn(move || {
-        let replacement = if non_reusable {
-            // Values interned outside queries are non-reusable.
-            Value::new(&writer_db, SameShard(1))
-        } else {
-            intern(&writer_db, input)
-        };
-        assert_eq!(replacement.value(&writer_db), SameShard(1));
-        replacement.as_id()
-    });
+    let db = &db;
+    let (rejected, new_id) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let replacement = if non_reusable {
+                // Values interned outside queries are non-reusable.
+                Value::new(db, SameShard(1))
+            } else {
+                intern(db, input)
+            };
+            assert_eq!(replacement.value(db), SameShard(1));
+            replacement.as_id()
+        });
 
-    entered_receive
-        .recv_timeout(Duration::from_secs(5))
-        .expect("writer did not reach memo cleanup");
-    let reader_db = db.clone();
-    let (send, receive) = bounded(1);
-    let reader = std::thread::spawn(move || {
-        // Simulate a stale ID returned by a cached query without validating its producer.
-        let stale = Value::from_id(old_id);
-        let result = catch_unwind(AssertUnwindSafe(|| stale.value(&reader_db)));
-        send.send(result.is_err()).unwrap();
-    });
+        entered_receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not reach memo cleanup");
+        let (send, receive) = bounded(1);
+        let reader = scope.spawn(move || {
+            // Simulate a stale ID returned by a cached query without validating its producer.
+            let stale = Value::from_id(old_id);
+            let result = catch_unwind(AssertUnwindSafe(|| stale.value(db)));
+            send.send(result.is_err()).unwrap();
+        });
 
-    // The reader must reject the slot even while the writer holds its shard lock. Release
-    // the writer on timeout too, so a regression to locking fails instead of deadlocking.
-    let rejected = receive.recv_timeout(Duration::from_secs(5));
-    drop(resume_send);
-    reader.join().unwrap();
-    let new_id = writer.join().unwrap();
+        // The reader must reject the slot even while the writer holds its shard lock. Release
+        // the writer on timeout too, so a regression to locking fails instead of deadlocking.
+        let rejected = receive.recv_timeout(Duration::from_secs(5));
+        drop(resume_send);
+        reader.join().unwrap();
+        (rejected, writer.join().unwrap())
+    });
 
     assert!(rejected.expect("reader waited for the shard lock"));
     assert_eq!(new_id, old_id.next_generation().unwrap());

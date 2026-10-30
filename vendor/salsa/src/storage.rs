@@ -69,6 +69,7 @@ impl<Db: Database> Storage<Db> {
     /// apart from those made after the write.
     fn prepare_write(&mut self) -> &mut Zalsa {
         let zalsa = &mut *self.zalsa_impl;
+        self.task_locals.return_unfilled_pages(zalsa.table());
         let overflow = zalsa.runtime_mut().bump_cancellation_count();
         if overflow {
             zalsa.new_revision();

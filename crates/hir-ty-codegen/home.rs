@@ -6,6 +6,8 @@
 //! on every file of the workspace crate that happened to use it, and give it one cache entry
 //! per crate that does.
 
+use std::sync::LazyLock;
+
 use base_db::{Crate, FileId};
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -255,6 +257,10 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
     }
 }
 
+/// `BLAZE_NO_HOME`: every instance is compiled in the environment of the function that asks
+/// for it. Read once, as [`Homes::home`] is asked for each instance a function calls.
+static NO_HOME: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_NO_HOME").is_some());
+
 /// Picks the crate each instance is compiled as.
 #[derive(Default)]
 pub(super) struct Homes {
@@ -272,8 +278,7 @@ impl Homes {
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if std::env::var_os("BLAZE_NO_HOME").is_some()
-            || !asked.param_env(db).caller_bounds().is_empty()
+        if *NO_HOME || !asked.param_env(db).caller_bounds().is_empty()
         {
             return asked.clone();
         }

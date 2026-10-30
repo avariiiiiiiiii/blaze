@@ -78,7 +78,6 @@ trait Db: salsa::Database {
 }
 
 #[salsa::db]
-#[derive(Clone)]
 struct LazyInputDatabase {
     storage: Storage<Self>,
     logs: Arc<Mutex<Vec<String>>>,

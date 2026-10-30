@@ -1,6 +1,7 @@
 //! File and span related types.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -8,6 +9,8 @@ extern crate rustc_driver as _;
 use std::fmt::{self, Write};
 
 mod ast_id;
+// The one unsafe module: a `SyntaxContext` is a salsa id, made with `salsa::Id::from_index`.
+#[allow(unsafe_code)]
 mod hygiene;
 mod map;
 
@@ -203,9 +206,19 @@ impl EditionedFileId {
     }
 
     pub const fn edition(self) -> Edition {
-        let edition = (self.0 & Self::EDITION_MASK) >> Self::FILE_ID_BITS;
-        debug_assert!(edition <= Edition::LATEST as u32);
-        unsafe { std::mem::transmute(edition as u8) }
+        const E2015: u32 = Edition::Edition2015 as u32;
+        const E2018: u32 = Edition::Edition2018 as u32;
+        const E2021: u32 = Edition::Edition2021 as u32;
+        const E2024: u32 = Edition::Edition2024 as u32;
+        const _: () = assert!(Edition::LATEST as u32 == E2024, "a new edition: add it here");
+        // `new` and `from_raw` only make editions up to `Edition::LATEST`.
+        match (self.0 & Self::EDITION_MASK) >> Self::FILE_ID_BITS {
+            E2015 => Edition::Edition2015,
+            E2018 => Edition::Edition2018,
+            E2021 => Edition::Edition2021,
+            E2024 => Edition::Edition2024,
+            _ => panic!("an EditionedFileId with no edition"),
+        }
     }
 }
 

@@ -939,7 +939,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         {
             return self.llvm_intrinsic(name, args, dst_ty);
         }
-        self.inlined_fma(func, args)?;
+        self.inlined_fma(func, dst_ty)?;
         let arg_tys = self.operands(args)?;
         self.call_direct(func, generic_args, &arg_tys, dst_ty)
     }

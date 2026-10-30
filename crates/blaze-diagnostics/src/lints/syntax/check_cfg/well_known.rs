@@ -199,5 +199,6 @@ pub(super) const DISALLOWED: &[(&str, Option<bool>, &str)] = &[
     ("fmt_debug", None, "-Z fmt-debug"),
 ];
 
-/// The values of `panic` rustc refuses on the command line: those of its strategies.
-pub(super) const DISALLOWED_PANIC: &[&str] = &["abort", "unwind", "immediate_abort"];
+/// The values of `panic` rustc refuses on the command line (`-C panic`): those of its
+/// strategies (`sym::immediate_abort` is `"immediate-abort"`).
+pub(super) const DISALLOWED_PANIC: &[&str] = &["abort", "unwind", "immediate-abort"];

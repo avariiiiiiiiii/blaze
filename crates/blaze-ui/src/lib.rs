@@ -10,6 +10,17 @@
 //! - [`Plain`], elsewhere (CI, a pipe): one line per step and crate, as cargo writes them,
 //!   and a line every [`HEARTBEAT_NS`] that nothing else was said.
 //! - [`api`]: the agent API's responses, for a client of it to print.
+//!
+//! A record costs what it changes: [`Build`] keeps indexes and counts as records come (no
+//! scan of every crate, node or step), and the renderers write into one buffer each, with no
+//! `String` per line.
+
+/// `write!` into a `String`, which cannot fail.
+macro_rules! put {
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = ::std::fmt::Write::write_fmt(&mut *$out, format_args!($($arg)*));
+    }};
+}
 
 pub mod api;
 mod live;
@@ -20,13 +31,22 @@ mod tests;
 pub use live::Live;
 pub use plain::Plain;
 
+use std::fmt;
+use std::hash::BuildHasher;
+
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, SLOW_NS, Slow, Step,
     Summary, Took,
 };
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// The longest a plain rendering says nothing while a step is under way.
 pub const HEARTBEAT_NS: u64 = 15_000_000_000;
+
+/// No index: the end of an intrusive list, a kind of step with no count.
+const NONE: u32 = u32::MAX;
 
 /// A build as its records so far have it.
 #[derive(Default, Debug)]
@@ -66,6 +86,194 @@ pub struct Build {
     pub slowest: Vec<Slow>,
     /// Since when no step is under way, and the step that ended then.
     idle: Option<(u64, Step)>,
+    /// What each node of the graph waits for, by index in [`Build::graph`]: the node's
+    /// [`Noded::deps`] is its range (CSR).
+    deps: Vec<u32>,
+    index: Index,
+}
+
+/// What [`Build::apply`] keeps besides what it shows, so that a record costs what it changes
+/// and the region reads its counts whole. Each answer is what a scan of the build gives
+/// (tests: `indexes_agree`).
+#[derive(Default, Debug)]
+struct Index {
+    /// The row of [`Build::crates`] of each name, by its FxHash: 4 bytes a crate, one hash
+    /// and one compare of names a lookup, the name kept once, in its row.
+    rows: HashTable<u32>,
+    /// The index in [`Build::graph`] of the node said last with each id.
+    nodes: FxHashMap<u32, u32>,
+    /// The steps under way, by index in [`Build::steps`], in the order they began.
+    open: Vec<u32>,
+    /// Each kind of step begun, in the order it first began ([`Build::strip`]).
+    kinds: Vec<Kind>,
+    /// The functions of every crate together.
+    fns: Fns,
+    /// How many crates have functions done and no total yet.
+    unknown: u32,
+    /// How many crates are in each state ([`slot`]), and how many have ended.
+    states: [u32; STATES],
+    ended: u32,
+    /// Per node: whether it or something it waits for is under way, how many of what it
+    /// waits for are, and whether anything waits for it.
+    under_way: Vec<bool>,
+    under: Vec<u32>,
+    waited_for: Vec<bool>,
+    /// Who waits for each node, as intrusive lists: the node's first edge, and each edge's
+    /// node and next edge (8 bytes an edge).
+    first_dependent: Vec<u32>,
+    dependents: Vec<(u32, u32)>,
+    /// The nodes of each row, as intrusive lists: the row's first, and each node's next.
+    first_node: Vec<u32>,
+    next_node: Vec<u32>,
+    /// How many rows with a node of the graph are busy.
+    busy_graphed: u32,
+    /// The name of a node's row as it is looked up, and the nodes whose `under_way` may
+    /// change: buffers kept for the next record.
+    name: String,
+    flips: Vec<u32>,
+}
+
+/// A kind of step begun: how many of it are under way, how long those done took, and the
+/// step whose count it shows (the last one with a count), or [`NONE`]. 24 bytes.
+#[derive(Debug, Clone, Copy)]
+struct Kind {
+    closed_ns: u64,
+    open: u32,
+    count: u32,
+    step: Step,
+}
+
+const _: () = assert!(size_of::<Kind>() == 24);
+
+/// A kind of step in the line of steps as [`Build::strip_into`] gives it, with the step
+/// whose count it shows ([`NONE`] for none) and, for the renderer, how many characters
+/// its text is. 24 bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StripRow {
+    pub took_ns: u64,
+    pub count: u32,
+    pub chars: u32,
+    pub step: Step,
+    pub running: bool,
+}
+
+const _: () = assert!(size_of::<StripRow>() == 24);
+
+const STATES: usize = 8;
+
+/// The index of `state` in [`Index::states`].
+fn slot(state: CrateState) -> usize {
+    match state {
+        CrateState::Waiting => 0,
+        CrateState::Running => 1,
+        CrateState::UpToDate => 2,
+        CrateState::Built => 3,
+        CrateState::Failed => 4,
+        CrateState::Resolving => 5,
+        CrateState::Resolved => 6,
+        CrateState::Checking => 7,
+    }
+}
+
+fn unknown(fns: Fns) -> bool {
+    fns.total == 0 && fns.done > 0
+}
+
+impl Index {
+    /// The row named `name`, a new one waiting from `at` if none is.
+    fn row(&mut self, crates: &mut Vec<Crated>, name: &str, at: u64) -> usize {
+        let hash = FxBuildHasher.hash_one(name);
+        let entry = self.rows.entry(
+            hash,
+            |&row| crates[row as usize].name == name,
+            |&row| FxBuildHasher.hash_one(crates[row as usize].name.as_str()),
+        );
+        match entry {
+            Entry::Occupied(it) => *it.get() as usize,
+            Entry::Vacant(it) => {
+                let row = crates.len();
+                it.insert(row as u32);
+                crates.push(Crated::waiting(name, at));
+                self.states[slot(CrateState::Waiting)] += 1;
+                self.first_node.push(NONE);
+                row
+            }
+        }
+    }
+
+    fn kind(&mut self, step: Step) -> &mut Kind {
+        let at = match self.kinds.iter().position(|it| it.step == step) {
+            Some(at) => at,
+            None => {
+                self.kinds.push(Kind { closed_ns: 0, open: 0, count: NONE, step });
+                self.kinds.len() - 1
+            }
+        };
+        &mut self.kinds[at]
+    }
+
+    /// Node `node` of row `row` was added, waiting for `deps`; its row is `busy` or not.
+    fn node(&mut self, node: u32, row: usize, deps: &[u32], busy: bool) {
+        let mut under = 0;
+        for &dep in deps {
+            let dep = dep as usize;
+            self.waited_for[dep] = true;
+            under += u32::from(self.under_way[dep]);
+            let edge = self.dependents.len() as u32;
+            self.dependents.push((node, self.first_dependent[dep]));
+            self.first_dependent[dep] = edge;
+        }
+        self.under.push(under);
+        self.under_way.push(busy || under > 0);
+        self.waited_for.push(false);
+        self.first_dependent.push(NONE);
+        let first = self.first_node[row];
+        if first == NONE && busy {
+            self.busy_graphed += 1;
+        }
+        self.next_node.push(first);
+        self.first_node[row] = node;
+    }
+
+    /// Row `row` became busy, or stopped being: each of its nodes, and what waits for them,
+    /// may be under way now or no longer. Every change goes one way, so each node changes at
+    /// most once.
+    fn busy_changed(&mut self, row: usize, busy: bool, crates: &[Crated], graph: &[Noded]) {
+        let mut node = self.first_node[row];
+        if node == NONE {
+            return;
+        }
+        if busy {
+            self.busy_graphed += 1;
+        } else {
+            self.busy_graphed -= 1;
+        }
+        let mut flips = std::mem::take(&mut self.flips);
+        while node != NONE {
+            flips.push(node);
+            node = self.next_node[node as usize];
+        }
+        while let Some(node) = flips.pop() {
+            let at = node as usize;
+            let now = crates[graph[at].row as usize].is_busy() || self.under[at] > 0;
+            if now == self.under_way[at] {
+                continue;
+            }
+            self.under_way[at] = now;
+            let mut edge = self.first_dependent[at];
+            while edge != NONE {
+                let (dependent, next) = self.dependents[edge as usize];
+                if now {
+                    self.under[dependent as usize] += 1;
+                } else {
+                    self.under[dependent as usize] -= 1;
+                }
+                flips.push(dependent);
+                edge = next;
+            }
+        }
+        self.flips = flips;
+    }
 }
 
 /// Time a build spent with no step under way: what ran then is shown as nothing.
@@ -89,7 +297,7 @@ pub struct Strip {
     pub count: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stepped {
     pub step: Step,
     pub of: Option<String>,
@@ -115,40 +323,86 @@ impl Stepped {
     /// `3/14 files`, or `1200 fns` while the total is not known; nothing before a count.
     pub fn count(&self) -> Option<String> {
         let progress = self.progress.as_ref()?;
-        let counts = self.step.counts();
-        Some(match progress.total {
-            0 => format!("{} {counts}", progress.done),
-            total => format!("{}/{total} {counts}", progress.done),
-        })
+        Some(Count(progress, self.step).to_string())
     }
 }
 
-/// A node of the build's graph: its id, the row of [`Build::crates`] it moves, and the nodes
-/// it waits for, by their index in [`Build::graph`].
-#[derive(Debug, Clone)]
-pub struct Noded {
-    pub id: u32,
-    pub kind: NodeKind,
-    pub row: usize,
-    pub deps: Vec<usize>,
+/// [`Stepped::count`] as it is written.
+#[derive(Clone, Copy)]
+struct Count<'a>(&'a Progress, Step);
+
+impl fmt::Display for Count<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (progress, counts) = (self.0, self.1.counts());
+        match progress.total {
+            0 => write!(f, "{} {counts}", progress.done),
+            total => write!(f, "{}/{total} {counts}", progress.done),
+        }
+    }
 }
 
-/// What a node of `kind` named `name` is a row of: a crate's own, or one of its own named
-/// for what it does, and the word it is under way with.
-fn row_of(kind: NodeKind, name: &str) -> (String, Option<&'static str>) {
-    let own = |what: &str, word| (format!("{name} {what}"), Some(word));
+impl Count<'_> {
+    /// How many characters it is written in.
+    fn chars(self) -> usize {
+        let total = match self.0.total {
+            0 => 0,
+            total => 1 + digits(total),
+        };
+        digits(self.0.done) + total + 1 + self.1.counts().len()
+    }
+}
+
+fn digits(mut n: u64) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// A node of the build's graph: its id, the row of [`Build::crates`] it moves, and the range
+/// of [`Build::deps`] it waits for. 20 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Noded {
+    pub id: u32,
+    pub row: u32,
+    deps: (u32, u32),
+    pub kind: NodeKind,
+}
+
+const _: () = assert!(size_of::<Noded>() == 20);
+
+/// What a node of `kind` is a row of when that is not its crate's own: the words after the
+/// crate's name.
+fn own(kind: NodeKind) -> Option<&'static str> {
     match kind {
-        NodeKind::Names | NodeKind::Bodies | NodeKind::Codegen | NodeKind::Std => {
-            (name.to_owned(), None)
-        }
-        NodeKind::Script => own("build script", "compiling"),
-        NodeKind::ScriptRun => own("build script", "running"),
-        NodeKind::Macro => own("proc macro", "linking"),
-        NodeKind::Fetch => own("source", "fetching"),
-        NodeKind::Manifest => (name.to_owned(), Some("reading")),
-        NodeKind::Store => own("to the store", "writing"),
-        NodeKind::Link => own("link", "linking"),
-        NodeKind::Test => own("tests", "running"),
+        NodeKind::Names
+        | NodeKind::Bodies
+        | NodeKind::Codegen
+        | NodeKind::Std
+        | NodeKind::Manifest => None,
+        NodeKind::Script | NodeKind::ScriptRun => Some("build script"),
+        NodeKind::Macro => Some("proc macro"),
+        NodeKind::Fetch => Some("source"),
+        NodeKind::Store => Some("to the store"),
+        NodeKind::Link => Some("link"),
+        NodeKind::Test => Some("tests"),
+    }
+}
+
+/// The word a row is under way with while its node of `kind` is.
+fn doing(kind: NodeKind) -> Option<&'static str> {
+    match kind {
+        NodeKind::Names | NodeKind::Bodies | NodeKind::Codegen | NodeKind::Std => None,
+        NodeKind::Script => Some("compiling"),
+        NodeKind::ScriptRun => Some("running"),
+        NodeKind::Macro => Some("linking"),
+        NodeKind::Fetch => Some("fetching"),
+        NodeKind::Manifest => Some("reading"),
+        NodeKind::Store => Some("writing"),
+        NodeKind::Link => Some("linking"),
+        NodeKind::Test => Some("running"),
     }
 }
 
@@ -170,7 +424,7 @@ fn crate_state(kind: NodeKind, state: &NodeState) -> CrateState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Crated {
     pub name: String,
     pub state: CrateState,
@@ -243,7 +497,7 @@ fn busy(state: CrateState) -> bool {
     matches!(state, CrateState::Resolving | CrateState::Checking | CrateState::Running)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
     pub ok: bool,
     pub summary: Summary,
@@ -261,9 +515,10 @@ pub struct Finished {
     pub slowest: Vec<Slow>,
 }
 
-/// What a record changed, for a renderer to say.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
+/// What a record changed, for a renderer to say. What it says of the record's own text
+/// borrows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change<'a> {
     Nothing,
     /// The step at this index of [`Build::steps`] began, or ended.
     Began(usize),
@@ -273,14 +528,14 @@ pub enum Change {
         at: usize,
         moved: bool,
     },
-    Said(Level, String),
+    Said(Level, &'a str),
     Refused(usize),
     Rebuilt(usize),
     Finished,
 }
 
 impl Build {
-    pub fn apply(&mut self, record: &Record) -> Change {
+    pub fn apply<'a>(&mut self, record: &'a Record) -> Change<'a> {
         let at = record.at_ns;
         self.last_ns = self.last_ns.max(at);
         match &record.event {
@@ -290,34 +545,63 @@ impl Build {
             }
             Event::Started { step, of } => {
                 self.named(at);
-                let of = of.clone();
-                let (began_ns, ended_ns, progress) = (at, None, None);
+                let index = self.steps.len();
+                let (of, began_ns, ended_ns, progress) = (of.clone(), at, None, None);
                 self.steps.push(Stepped { step: *step, of, began_ns, ended_ns, progress });
-                Change::Began(self.steps.len() - 1)
+                self.index.open.push(index as u32);
+                self.index.kind(*step).open += 1;
+                Change::Began(index)
             }
             Event::Progress { step, done, total, longest } => {
-                let open =
-                    self.steps.iter().rposition(|it| it.step == *step && it.ended_ns.is_none());
-                if let Some(index) = open {
-                    let longest = longest.clone();
-                    self.steps[index].progress =
-                        Some(Progress { done: *done, total: *total, longest });
+                let steps = &self.steps;
+                let mut open = self.index.open.iter().rev();
+                if let Some(&index) = open.find(|&&it| steps[it as usize].step == *step) {
+                    match &mut self.steps[index as usize].progress {
+                        Some(progress) => {
+                            (progress.done, progress.total) = (*done, *total);
+                            progress.longest.clone_from(longest);
+                        }
+                        none => {
+                            let longest = longest.clone();
+                            *none = Some(Progress { done: *done, total: *total, longest });
+                        }
+                    }
+                    let kind = self.index.kind(*step);
+                    if kind.count == NONE || kind.count < index {
+                        kind.count = index;
+                    }
                 }
                 Change::Nothing
             }
             Event::Node { id, kind, name, deps } => {
-                let row = self.row(&row_of(*kind, name).0, at);
-                let deps = deps.iter().filter_map(|dep| self.node(*dep)).collect();
-                self.graph.push(Noded { id: *id, kind: *kind, row, deps });
+                let mut row_name = std::mem::take(&mut self.index.name);
+                row_name.clear();
+                row_name.push_str(name);
+                if let Some(what) = own(*kind) {
+                    row_name.push(' ');
+                    row_name.push_str(what);
+                }
+                let row = self.index.row(&mut self.crates, &row_name, at);
+                self.index.name = row_name;
+                let node = self.graph.len() as u32;
+                let from = self.deps.len();
+                let nodes = &self.index.nodes;
+                self.deps.extend(deps.iter().filter_map(|dep| nodes.get(dep).copied()));
+                let to = self.deps.len();
+                let deps = (from as u32, to as u32);
+                self.graph.push(Noded { id: *id, row: row as u32, deps, kind: *kind });
+                let busy = self.crates[row].is_busy();
+                self.index.node(node, row, &self.deps[from..to], busy);
+                self.index.nodes.insert(*id, node);
                 Change::Nothing
             }
-            Event::Moved { id, state } => match self.node(*id) {
-                Some(node) => {
-                    let Noded { kind, row, .. } = self.graph[node];
-                    let krate = &mut self.crates[row];
+            Event::Moved { id, state } => match self.index.nodes.get(id) {
+                Some(&node) => {
+                    let Noded { kind, row, .. } = self.graph[node as usize];
+                    let row = row as usize;
                     // A row of several nodes says what the one that moved last does.
-                    krate.doing = row_of(kind, "").1;
-                    let moved = krate.moved(crate_state(kind, state), at);
+                    self.crates[row].doing = doing(kind);
+                    let moved = self.moved(row, crate_state(kind, state), at);
                     Change::Crate { at: row, moved }
                 }
                 None => Change::Nothing,
@@ -327,14 +611,21 @@ impl Build {
                 Change::Nothing
             }
             Event::Ended { step, of } => {
-                let open = self
-                    .steps
-                    .iter()
-                    .rposition(|it| it.step == *step && it.of == *of && it.ended_ns.is_none());
+                let steps = &self.steps;
+                let open = self.index.open.iter().rposition(|&it| {
+                    let it = &steps[it as usize];
+                    it.step == *step && it.of == *of
+                });
                 match open {
-                    Some(index) => {
-                        self.steps[index].ended_ns = Some(at);
-                        if self.running().next().is_none() {
+                    Some(open) => {
+                        let index = self.index.open.remove(open) as usize;
+                        let stepped = &mut self.steps[index];
+                        stepped.ended_ns = Some(at);
+                        let took_ns = at.saturating_sub(stepped.began_ns);
+                        let kind = self.index.kind(*step);
+                        kind.open -= 1;
+                        kind.closed_ns += took_ns;
+                        if self.index.open.is_empty() {
                             self.idle = Some((at, *step));
                         }
                         Change::Ended(index)
@@ -344,10 +635,15 @@ impl Build {
             }
             Event::Crate { name, state, fns } => {
                 let rows = self.crates.len();
-                let index = self.row(name, at);
-                let krate = &mut self.crates[index];
-                let moved = krate.moved(*state, at) || index == rows;
-                krate.fns = *fns;
+                let index = self.index.row(&mut self.crates, name, at);
+                let moved = self.moved(index, *state, at) || index == rows;
+                let was = std::mem::replace(&mut self.crates[index].fns, *fns);
+                let all = &mut self.index.fns;
+                all.total = all.total - was.total + fns.total;
+                all.done = all.done - was.done + fns.done;
+                all.kept = all.kept - was.kept + fns.kept;
+                self.index.unknown = self.index.unknown - u32::from(unknown(was))
+                    + u32::from(unknown(*fns));
                 Change::Crate { at: index, moved }
             }
             Event::Rebuilt { name, krate, cause } => {
@@ -362,7 +658,7 @@ impl Build {
                 self.refused.push((name.clone(), why.clone()));
                 Change::Refused(self.refused.len() - 1)
             }
-            Event::Said { level, text } => Change::Said(*level, text.clone()),
+            Event::Said { level, text } => Change::Said(*level, text),
             Event::Finished { ok, summary } => {
                 self.named(at);
                 let (chain, chain_ns) = self.critical_path(at);
@@ -386,7 +682,10 @@ impl Build {
                 Change::Finished
             }
             Event::Critical { path } => {
-                self.critical = path.iter().filter_map(|&it| self.node(it)).collect();
+                let nodes = &self.index.nodes;
+                self.critical.clear();
+                let critical = path.iter().filter_map(|it| nodes.get(it));
+                self.critical.extend(critical.map(|&it| it as usize));
                 Change::Nothing
             }
             Event::Cores { busy, of } => {
@@ -396,7 +695,15 @@ impl Build {
             }
             Event::Compiling { functions } => {
                 let since = |it: &Slow| at.saturating_sub(it.ns);
-                self.compiling = functions.iter().map(|it| (it.clone(), since(it))).collect();
+                self.compiling.truncate(functions.len());
+                for (kept, it) in self.compiling.iter_mut().zip(functions) {
+                    kept.0.krate.clone_from(&it.krate);
+                    kept.0.name.clone_from(&it.name);
+                    kept.0.ns = it.ns;
+                    kept.1 = since(it);
+                }
+                let kept = self.compiling.len();
+                self.compiling.extend(functions[kept..].iter().map(|it| (it.clone(), since(it))));
                 Change::Nothing
             }
             Event::Slowest { functions } => {
@@ -408,6 +715,37 @@ impl Build {
         }
     }
 
+    /// Has the crate at `row` in `state` from `at` ([`Crated::moved`]), and the counts with it.
+    fn moved(&mut self, row: usize, state: CrateState, at: u64) -> bool {
+        let krate = &mut self.crates[row];
+        let (was, was_ended) = (krate.state, krate.ended_ns.is_some());
+        let moved = krate.moved(state, at);
+        let ended = krate.ended_ns.is_some();
+        let index = &mut self.index;
+        index.states[slot(was)] -= 1;
+        index.states[slot(state)] += 1;
+        match (was_ended, ended) {
+            (false, true) => index.ended += 1,
+            (true, false) => index.ended -= 1,
+            _ => {}
+        }
+        if busy(was) != busy(state) {
+            index.busy_changed(row, busy(state), &self.crates, &self.graph);
+        }
+        moved
+    }
+
+    /// What node `node` of [`Build::graph`] waits for, by index in it.
+    pub fn deps(&self, node: usize) -> &[u32] {
+        let (from, to) = self.graph[node].deps;
+        &self.deps[from as usize..to as usize]
+    }
+
+    /// How many crates are in `state`.
+    pub fn in_state(&self, state: CrateState) -> usize {
+        self.index.states[slot(state)] as usize
+    }
+
     /// The functions of crate `krate` compiling for [`SLOW_NS`] or more by `now_ns`, longest
     /// first: their names and for how long.
     pub fn compiling_of(&self, krate: &str, now_ns: u64) -> Vec<(&str, u64)> {
@@ -416,6 +754,31 @@ impl Build {
         let mut of: Vec<_> = of.filter(|it| it.1 >= SLOW_NS).collect();
         of.sort_by_key(|it| std::cmp::Reverse(it.1));
         of
+    }
+
+    /// The first `N` of [`Build::compiling_of`], each as its index in [`Build::compiling`],
+    /// with no allocation, and how many there are of them.
+    fn compiling_top<const N: usize>(
+        &self,
+        krate: &str,
+        now_ns: u64,
+    ) -> ([(usize, u64); N], usize) {
+        let (mut top, mut len) = ([(0, 0); N], 0);
+        for (at, (it, since)) in self.compiling.iter().enumerate() {
+            let ns = now_ns.saturating_sub(*since);
+            if ns < SLOW_NS || it.krate != krate {
+                continue;
+            }
+            // After every one as long: the first said of the same length stays first.
+            let place = top[..len].iter().position(|it| it.1 < ns).unwrap_or(len);
+            if place == N {
+                continue;
+            }
+            len = (len + 1).min(N);
+            top.copy_within(place..len - 1, place + 1);
+            top[place] = (at, ns);
+        }
+        (top, len)
     }
 
     /// A step began, or the build ended, at `at`: the time since the last step ended went
@@ -431,22 +794,36 @@ impl Build {
     /// Each kind of step begun, in the order it first began: whether one of it is under way,
     /// and how long they took by `now_ns`. Done ones too quick to matter are left out.
     pub fn strip(&self, now_ns: u64) -> Vec<Strip> {
-        let mut strip: Vec<Strip> = Vec::new();
-        for stepped in &self.steps {
-            let took_ns = stepped.ended_ns.unwrap_or(now_ns).saturating_sub(stepped.began_ns);
-            let running = stepped.ended_ns.is_none();
-            let count = stepped.count();
-            match strip.iter_mut().find(|it| it.step == stepped.step) {
-                Some(it) => {
-                    it.took_ns += took_ns;
-                    it.running |= running;
-                    it.count = count.or(it.count.take());
-                }
-                None => strip.push(Strip { step: stepped.step, running, took_ns, count }),
+        let mut rows = Vec::new();
+        self.strip_into(now_ns, &mut rows);
+        let count = |at: u32| self.steps.get(at as usize).and_then(Stepped::count);
+        let strip = rows.iter().map(|it| Strip {
+            step: it.step,
+            running: it.running,
+            took_ns: it.took_ns,
+            count: count(it.count),
+        });
+        strip.collect()
+    }
+
+    /// [`Build::strip`] into `rows`, from the kinds' totals: what a step of each kind under
+    /// way took so far is all it adds up, not every step begun.
+    pub(crate) fn strip_into(&self, now_ns: u64, rows: &mut Vec<StripRow>) {
+        rows.clear();
+        rows.extend(self.index.kinds.iter().map(|it| StripRow {
+            took_ns: it.closed_ns,
+            count: it.count,
+            chars: 0,
+            step: it.step,
+            running: it.open > 0,
+        }));
+        for &open in &self.index.open {
+            let stepped = &self.steps[open as usize];
+            if let Some(row) = rows.iter_mut().find(|it| it.step == stepped.step) {
+                row.took_ns += now_ns.saturating_sub(stepped.began_ns);
             }
         }
-        strip.retain(|it| it.running || it.took_ns >= 50_000_000);
-        strip
+        rows.retain(|it| it.running || it.took_ns >= 50_000_000);
     }
 
     /// Every step in the order it began, and the time spent at no step between them, as
@@ -526,25 +903,9 @@ impl Build {
         (spent > 0).then(|| sum / spent as f64)
     }
 
-    /// The row of [`Build::crates`] named `name`, a new one waiting from `at` if none is.
-    fn row(&mut self, name: &str, at: u64) -> usize {
-        match self.crates.iter().position(|it| it.name == name) {
-            Some(row) => row,
-            None => {
-                self.crates.push(Crated::waiting(name, at));
-                self.crates.len() - 1
-            }
-        }
-    }
-
-    /// The index in [`Build::graph`] of the node said last with `id`.
-    fn node(&self, id: u32) -> Option<usize> {
-        self.graph.iter().rposition(|it| it.id == id)
-    }
-
     /// The steps under way, the one begun last at the end.
     pub fn running(&self) -> impl Iterator<Item = &Stepped> {
-        self.steps.iter().filter(|it| it.ended_ns.is_none())
+        self.index.open.iter().map(|&it| &self.steps[it as usize])
     }
 
     /// What the records so far come to, for the last line of a build that took `took_ns`:
@@ -554,7 +915,7 @@ impl Build {
         let rebuilt = self.rebuilt.iter().take(LISTED);
         let rebuilt = rebuilt.map(|(name, _, cause)| (name.clone(), cause.clone())).collect();
         let more = self.rebuilt.len().saturating_sub(LISTED) as u64 + self.unlisted;
-        let crates = self.crates.iter().filter(|it| it.state != CrateState::Waiting).count();
+        let crates = self.crates.len() - self.in_state(CrateState::Waiting);
         let (fns, cache, slowest) = (self.fns(), self.cache.clone(), self.slowest(took_ns));
         Summary { took_ns, crates: crates as u64, fns, rebuilt, more, error, cache, slowest }
     }
@@ -595,7 +956,7 @@ impl Build {
     pub fn critical_path(&self, now_ns: u64) -> (Vec<usize>, u64) {
         let mut chain: Vec<usize> = Vec::new();
         for &node in self.critical.iter().rev() {
-            let row = self.graph[node].row;
+            let row = self.graph[node].row as usize;
             if !chain.contains(&row) {
                 chain.push(row);
             }
@@ -615,11 +976,7 @@ impl Build {
 
     /// The functions of every crate together.
     pub fn fns(&self) -> Fns {
-        self.crates.iter().fold(Fns::default(), |all, it| Fns {
-            total: all.total + it.fns.total,
-            done: all.done + it.fns.done,
-            kept: all.kept + it.fns.kept,
-        })
+        self.index.fns
     }
 }
 
@@ -635,11 +992,31 @@ pub fn tail(text: &str, most: usize) -> String {
 
 /// A duration as a person reads it: `0.21s`, `33.2s`, `1m17s`.
 pub fn took(ns: u64) -> String {
-    let ms = ns / 1_000_000;
-    match ms {
-        0..=9_999 => format!("{}.{:02}s", ms / 1000, ms % 1000 / 10),
-        10_000..=59_999 => format!("{}.{}s", ms / 1000, ms % 1000 / 100),
-        _ => format!("{}m{:02}s", ms / 60_000, ms % 60_000 / 1000),
+    Dur(ns).to_string()
+}
+
+/// [`took`] as it is written. It takes no width (`{:>6}`): pad [`took`]'s `String`.
+#[derive(Clone, Copy)]
+struct Dur(u64);
+
+impl fmt::Display for Dur {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = self.0 / 1_000_000;
+        match ms {
+            0..=9_999 => write!(f, "{}.{:02}s", ms / 1000, ms % 1000 / 10),
+            10_000..=59_999 => write!(f, "{}.{}s", ms / 1000, ms % 1000 / 100),
+            _ => write!(f, "{}m{:02}s", ms / 60_000, ms % 60_000 / 1000),
+        }
+    }
+}
+
+impl Dur {
+    /// How many characters it is written in: `0.21s` and `33.2s` are five.
+    fn chars(self) -> usize {
+        match self.0 / 1_000_000 {
+            0..=59_999 => 5,
+            ms => digits(ms / 60_000) + 4,
+        }
     }
 }
 
@@ -790,7 +1167,7 @@ pub fn summary_line(finished: &Finished, color: bool) -> String {
         let listed = summary.rebuilt.len() as u64 + summary.more;
         let mut said = format!("{listed} {}: {}", plural(listed, "fn"), causes(&summary.rebuilt));
         if summary.more > 0 {
-            said.push_str(&format!(" and {} more", summary.more));
+            put!(&mut said, " and {} more", summary.more);
         }
         ("Rebuilt", said)
     } else if compiled > 0 {
@@ -840,33 +1217,29 @@ fn done_word(step: Step) -> &'static str {
 /// before it has gone on for this long ([`Plain`]).
 const NEWS_NS: u64 = 500_000_000;
 
-/// The lines `change` adds that stay: on a terminal (`live`) above the region, elsewhere all
-/// there is.
+/// Writes the lines `change` adds that stay, each ending in a newline: on a terminal
+/// (`live`) above the region, elsewhere all there is.
 fn staying(
     build: &Build,
-    change: &Change,
+    change: &Change<'_>,
     color: bool,
     live: bool,
     errors_said: bool,
-) -> Vec<String> {
-    let status =
-        |word: &str, rest: &str| format!("{} {rest}", paint(GREEN, &format!("{word:>12}"), color));
-    match change {
+    out: &mut String,
+) {
+    match *change {
         Change::Ended(at) => {
-            let stepped = &build.steps[*at];
+            let stepped = &build.steps[at];
             let took_ns = stepped.ended_ns.unwrap_or(stepped.began_ns) - stepped.began_ns;
             // The crates say how their compiling went.
             let said_by_crates = stepped.step == Step::Codegen && !build.crates.is_empty();
-            match took_ns >= NEWS_NS && !said_by_crates {
-                true => {
-                    let rest = format!("{} in {}", stepped.what(), took(took_ns));
-                    vec![status(done_word(stepped.step), &rest)]
-                }
-                false => Vec::new(),
+            if took_ns >= NEWS_NS && !said_by_crates {
+                status(out, done_word(stepped.step), color);
+                put!(out, "{} in {}\n", stepped.what(), Dur(took_ns));
             }
         }
         Change::Crate { at, moved: true } => {
-            let krate = &build.crates[*at];
+            let krate = &build.crates[at];
             // The time it was worked on, not that it waited between steps.
             let took_ns = krate.busy_ns(krate.ended_ns.unwrap_or(krate.since_ns));
             match krate.state {
@@ -877,34 +1250,49 @@ fn staying(
                             it.step == Step::Codegen && it.of.as_deref() == Some(&krate.name)
                         }) =>
                 {
-                    vec![status("Compiling", &krate.name)]
+                    status(out, "Compiling", color);
+                    out.push_str(&krate.name);
+                    out.push('\n');
                 }
                 // Of a graph's crates the tree showed each, and `blaze why` lists them.
                 CrateState::Built if build.graph.is_empty() && (live || took_ns >= NEWS_NS) => {
-                    let compiled = krate.fns.compiled();
-                    let fns = match krate.fns.total {
-                        0 => String::new(),
-                        _ => format!(
-                            ": {compiled} {} compiled, {} kept",
-                            plural(compiled, "fn"),
-                            krate.fns.kept
-                        ),
-                    };
-                    vec![status("Compiled", &format!("{}{fns} in {}", krate.name, took(took_ns)))]
+                    status(out, "Compiled", color);
+                    out.push_str(&krate.name);
+                    if krate.fns.total != 0 {
+                        let compiled = krate.fns.compiled();
+                        let (s, kept) = (plural_s(compiled), krate.fns.kept);
+                        put!(out, ": {compiled} fn{s} compiled, {kept} kept");
+                    }
+                    put!(out, " in {}\n", Dur(took_ns));
                 }
-                _ => Vec::new(),
+                _ => {}
             }
         }
-        Change::Said(level, text) => vec![said_line(*level, text, color)],
+        Change::Said(level, text) => {
+            said(out, level, text, color);
+            out.push('\n');
+        }
         Change::Refused(at) => {
-            let (name, why) = &build.refused[*at];
-            vec![said_line(Level::Error, &format!("blaze does not build `{name}`: {why}"), color)]
+            let (name, why) = &build.refused[at];
+            said(out, Level::Error, format_args!("blaze does not build `{name}`: {why}"), color);
+            out.push('\n');
         }
         Change::Finished if !live => {
-            build.finished.iter().flat_map(|it| last_lines(it, color, errors_said)).collect()
+            for finished in &build.finished {
+                for line in last_lines(finished, color, errors_said) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
+}
+
+/// `word` right-aligned in 12 columns and painted, then a space: what cargo's status lines
+/// start with.
+fn status(out: &mut String, word: &str, color: bool) {
+    put!(out, "{} ", Painted(GREEN, format_args!("{word:>12}"), color));
 }
 
 /// `render (body edited), draw, tick (calls render)`: names with the same cause one after
@@ -917,7 +1305,7 @@ fn causes(rebuilt: &[(String, Cause)]) -> String {
         }
         said.push_str(name);
         if rebuilt.get(at + 1).is_none_or(|next| next.1 != *cause) {
-            said.push_str(&format!(" ({})", cause.short()));
+            put!(&mut said, " ({})", cause.short());
         }
     }
     said
@@ -925,6 +1313,10 @@ fn causes(rebuilt: &[(String, Cause)]) -> String {
 
 fn plural(n: u64, word: &str) -> String {
     if n == 1 { word.to_owned() } else { format!("{word}s") }
+}
+
+fn plural_s(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 const GREEN: &str = "\x1b[1m\x1b[92m";
@@ -938,12 +1330,31 @@ fn paint(color: &str, text: &str, colored: bool) -> String {
     if colored { format!("{color}{text}{RESET}") } else { text.to_owned() }
 }
 
+/// [`paint`] as it is written. It takes no width: pad what it paints.
+struct Painted<T>(&'static str, T, bool);
+
+impl<T: fmt::Display> fmt::Display for Painted<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.2 {
+            true => write!(f, "{}{}{RESET}", self.0, self.1),
+            false => write!(f, "{}", self.1),
+        }
+    }
+}
+
 /// A line of `level`, as cargo writes them.
 fn said_line(level: Level, text: &str, color: bool) -> String {
+    let mut line = String::new();
+    said(&mut line, level, text, color);
+    line
+}
+
+/// [`said_line`], written into `out` with no newline.
+fn said(out: &mut String, level: Level, text: impl fmt::Display, color: bool) {
     let (word, color_of) = match level {
         Level::Note => ("note", GREEN),
         Level::Warning => ("warning", YELLOW),
         Level::Error => ("error", RED),
     };
-    format!("{}: {text}", paint(color_of, word, color))
+    put!(out, "{}: {text}", Painted(color_of, word, color));
 }

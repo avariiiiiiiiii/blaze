@@ -25,13 +25,13 @@ use hir_ty::{
 
 use super::{
     Ctx,
-    bitset::{BitMatrix, BitSet, union_words},
+    bitset::{BitMatrix, BitSet, Transfer, union_words},
     cfg::{Cfg, Location, index},
     dataflow::{GenKill, backward, forward},
     intervals::IntervalSet,
     moves::{InitKind, MoveData},
     regions::{Regions, Rv, regions_of, rv_of},
-    relation::{Facts, Relation},
+    relation::{Csr, Facts, Relation},
 };
 
 /// The kinds of the facts of what each point does to a local: uses it, defines it (assigns
@@ -211,12 +211,13 @@ fn live_ranges(
     let locals = body.locals.len();
     let mut transfer = GenKill::new(body.basic_blocks.len(), locals);
     for &block in &cfg.order {
+        let mut row = transfer.row(index(block));
         for point in (cfg.block_start(block)..=cfg.block_end(body, block)).rev() {
             for &local in effects.get(DEF, point) {
-                transfer.kill_bit(index(block), local as usize);
+                row.kill(local as usize);
             }
             for &local in effects.get(uses, point) {
-                transfer.gen_bit(index(block), local as usize);
+                row.gen_(local as usize);
             }
         }
     }
@@ -228,7 +229,7 @@ fn live_ranges(
     let mut along = vec![0u64; live.words().len()];
     for &block in &cfg.order {
         live.clear();
-        for &successor in &cfg.successors[index(block)] {
+        for &successor in cfg.successors(block) {
             along.copy_from_slice(entry.row(index(successor)));
             edge(block, successor, &mut along);
             union_words(live.words_mut(), &along);
@@ -280,11 +281,12 @@ pub(super) fn region_liveness<'db>(
     // A drop of what cannot be initialized there does nothing.
     let (drops_initialized, init_at_exit) = maybe_initialized_at_drops(body, cfg, moves);
     let statement_values = statement_values(ctx);
-    let mut facts = Facts::default();
+    let mut facts = Facts::with_capacity(cfg.points * 2);
     for &block in &cfg.order {
-        for point in cfg.block_start(block)..=cfg.block_end(body, block) {
-            let location = cfg.location(point);
-            let effects = &mut Effects { facts: &mut facts, point };
+        let start = cfg.block_start(block);
+        for statement in 0..=body.basic_blocks[block].statements.len() {
+            let location = Location { block, statement };
+            let effects = &mut Effects { facts: &mut facts, point: start + statement };
             effects_at(ctx, body, location, &statement_values, &drops_initialized, effects);
         }
     }
@@ -292,21 +294,22 @@ pub(super) fn region_liveness<'db>(
         facts.push(USE, cfg.point(location), raw(local));
     }
     let effects = facts.freeze(&[cfg.points; 3]);
-    let local_regions: Vec<Vec<Rv>> = regions
-        .local_tys
-        .iter()
-        .map(|&ty| {
-            let mut out = Vec::new();
-            live_regions_of(ctx, regions, ty, &mut out);
-            out
-        })
-        .collect();
+    let mut local_regions = Csr::with_capacity(regions.local_tys.len(), regions.local_tys.len());
+    let mut scratch = Vec::new();
+    for &ty in &regions.local_tys {
+        scratch.clear();
+        live_regions_of(ctx, regions, ty, &mut scratch);
+        for &rv in &scratch {
+            local_regions.push(rv);
+        }
+        local_regions.end_node();
+    }
     let use_live = live_ranges(body, cfg, &effects, USE, |_, _, _| ());
     for (local, points) in use_live.iter().enumerate() {
         if points.is_empty() {
             continue;
         }
-        for &rv in &local_regions[local] {
+        for &rv in local_regions.of(local) {
             if rv < count {
                 values[rv].union(points);
             }
@@ -365,58 +368,29 @@ fn maybe_initialized_at_drops(
     cfg: &Cfg,
     moves: &MoveData,
 ) -> (BitSet, InitAtExit) {
-    let paths = moves.paths.len();
+    let paths = moves.len();
     let blocks = body.basic_blocks.len();
     let locals = body.locals.len();
-    let apply = |location: Location, state: &mut BitSet, returned: bool| {
-        let point = cfg.point(location);
-        if !returned {
-            for &it in moves.moves_at(point) {
-                moves.with_descendants(moves.moves[it as usize].path, &mut |path| {
-                    state.remove(path)
-                });
-            }
-        }
-        for &it in moves.inits_at(point) {
-            let init = moves.inits[it as usize];
-            if (init.kind == InitKind::Deep) != returned {
-                moves.with_descendants(init.path, &mut |path| {
-                    state.insert(path);
-                });
-            }
-        }
-    };
-    let runs = |run: &dyn Fn(&mut BitSet)| {
-        let (mut made, mut kept) = (BitSet::new(paths), BitSet::filled(paths));
-        run(&mut made);
-        run(&mut kept);
-        (made, kept)
-    };
     let mut transfer = GenKill::new(blocks, paths);
     let mut on_return = GenKill::new(blocks, paths);
     let mut returns_to: Vec<Option<BasicBlockId>> = vec![None; blocks];
     for &block in &cfg.order {
         let data = &body.basic_blocks[block];
-        let (made, kept) = runs(&|state| {
-            for statement in 0..=data.statements.len() {
-                apply(Location { block, statement }, state, false);
-            }
-        });
-        transfer.set_from(index(block), &made, &kept);
+        let mut row = transfer.row(index(block));
+        for statement in 0..=data.statements.len() {
+            maybe_init_effect(moves, cfg, Location { block, statement }, &mut row, false);
+        }
         if let Some(TerminatorKind::Call { target: Some(target), .. }) =
             data.terminator.as_ref().map(|it| &it.kind)
         {
             returns_to[index(block)] = Some(*target);
             let terminator = Location { block, statement: data.statements.len() };
-            let (made, kept) = runs(&|state| apply(terminator, state, true));
-            on_return.set_from(index(block), &made, &kept);
+            maybe_init_effect(moves, cfg, terminator, &mut on_return.row(index(block)), true);
         }
     }
     let mut start = BitSet::new(paths);
     for init in moves.inits.iter().filter(|it| it.location.is_none()) {
-        moves.with_descendants(init.path, &mut |it| {
-            start.insert(it);
-        });
+        start.gen_range(moves.subtree(init.path));
     }
     let entry = forward(cfg, &transfer, body.start_block, &start, |from, to, state| {
         if returns_to[index(from)] == Some(to) {
@@ -433,32 +407,58 @@ fn maybe_initialized_at_drops(
         state.load(entry.row(index(block)));
         let data = &body.basic_blocks[block];
         for statement in 0..data.statements.len() {
-            apply(Location { block, statement }, &mut state, false);
+            maybe_init_effect(moves, cfg, Location { block, statement }, &mut state, false);
         }
         let terminator = Location { block, statement: data.statements.len() };
         if let Some(TerminatorKind::Drop { place, .. }) =
             data.terminator.as_ref().map(|it| &it.kind)
             && place.projection.is_empty()
+            && moves.first_in(moves.local_path(place.local), &state).is_some()
         {
-            let path = moves.local_path(place.local);
-            if moves.find_in_descendants(path, &|it| state.contains(it)).is_some() {
-                found.insert(cfg.point(terminator));
-            }
+            found.insert(cfg.point(terminator));
         }
-        apply(terminator, &mut state, false);
-        // Every path of a local is below the local's own: the local may be initialized, if
-        // partly, where one of its paths may be.
-        for path in state.iter() {
-            exit.insert(index(block), raw(moves.paths[path].local));
-        }
+        maybe_init_effect(moves, cfg, terminator, &mut state, false);
+        locals_in(moves, &state, |local| exit.insert(index(block), local));
         if returns_to[index(block)].is_some() {
-            apply(terminator, &mut state, true);
-            for path in state.iter() {
-                returned.insert(index(block), raw(moves.paths[path].local));
-            }
+            maybe_init_effect(moves, cfg, terminator, &mut state, true);
+            locals_in(moves, &state, |local| returned.insert(index(block), local));
         }
     }
     (found, InitAtExit { exit, returned, returns_to, reached })
+}
+
+/// What the statement or terminator at `location` does to what may be initialized; with
+/// `returned`, what the call there returning does on its return edge instead.
+fn maybe_init_effect(
+    moves: &MoveData,
+    cfg: &Cfg,
+    location: Location,
+    state: &mut impl Transfer,
+    returned: bool,
+) {
+    let point = cfg.point(location);
+    if !returned {
+        for &it in moves.moves_at(point) {
+            state.kill_range(moves.subtree(moves.moves[it as usize].path));
+        }
+    }
+    for &it in moves.inits_at(point) {
+        let init = moves.inits[it as usize];
+        if (init.kind == InitKind::Deep) != returned {
+            state.gen_range(moves.subtree(init.path));
+        }
+    }
+}
+
+/// Each local one of whose paths is in `state`: the local may be initialized, if partly. A
+/// local's paths are one range, so this is a scan of the words that skips each local found.
+fn locals_in(moves: &MoveData, state: &BitSet, mut found: impl FnMut(usize)) {
+    let mut at = 0;
+    while let Some(path) = state.first_in(at..moves.len()) {
+        let local = moves.local(path);
+        found(raw(local));
+        at = moves.subtree(moves.local_path(local)).end;
+    }
 }
 
 /// The locals that may be initialized, if partly, leaving each block, and leaving a call's
@@ -495,13 +495,20 @@ impl InitAtExit {
 /// that hold it again are one strongly connected component of that graph with one answer, so
 /// each type is expanded once, as rustc's dropck keeps a set of the types it has seen; walking
 /// the tree of drops instead is exponential in a type like `Value(Vec<Value>, Box<Value>)`.
+///
+/// Every answer is a range of one pool, shared by the members of a component. What a type
+/// uses and the types it drops are kept on two stacks shared by the whole walk: an open
+/// component's regions stay where its members left them until its root takes them all.
 struct DropComponents<'c, 'a, 'db> {
     ctx: &'c Ctx<'a, 'db>,
     regions: &'c Regions<'db>,
-    done: FxHashMap<Ty<'db>, Vec<Rv>>,
-    /// Tarjan's: each type on the stack, its number in the walk, and its place on the stack.
-    open: FxHashMap<Ty<'db>, (usize, usize)>,
-    stack: Vec<(Ty<'db>, Vec<Rv>)>,
+    done: FxHashMap<Ty<'db>, (u32, u32)>,
+    pool: Vec<Rv>,
+    /// Tarjan's: each type on the stack and its number in the walk.
+    open: FxHashMap<Ty<'db>, usize>,
+    stack: Vec<Ty<'db>>,
+    found: Vec<Rv>,
+    children: Vec<Ty<'db>>,
     next: usize,
 }
 
@@ -515,15 +522,18 @@ impl<'c, 'a, 'db> DropComponents<'c, 'a, 'db> {
             ctx,
             regions,
             done: FxHashMap::default(),
+            pool: Vec::new(),
             open: FxHashMap::default(),
             stack: Vec::new(),
+            found: Vec::new(),
+            children: Vec::new(),
             next: 0,
         }
     }
 
     fn of(&mut self, ty: Ty<'db>) -> &[Rv] {
         self.visit(ty, 0);
-        self.done.get(&ty).map_or(&[], |it| it.as_slice())
+        self.done.get(&ty).map_or(&[], |&(from, to)| &self.pool[from as usize..to as usize])
     }
 
     /// Walks `ty`: `Some(low)`, the lowest number it reaches, while its component is open.
@@ -531,104 +541,119 @@ impl<'c, 'a, 'db> DropComponents<'c, 'a, 'db> {
         if depth > DROP_DEPTH || self.done.contains_key(&ty) {
             return None;
         }
-        if let Some(&(number, _)) = self.open.get(&ty) {
+        if let Some(&number) = self.open.get(&ty) {
             return Some(number);
         }
         let number = self.next;
         self.next += 1;
         let at = self.stack.len();
-        self.open.insert(ty, (number, at));
-        self.stack.push((ty, Vec::new()));
-        let mut found = Vec::new();
-        let mut children = Vec::new();
-        self.expand(ty, &mut found, &mut children);
+        self.open.insert(ty, number);
+        self.stack.push(ty);
+        let found = self.found.len();
+        let children = self.children.len();
+        expand(self.ctx, self.regions, ty, &mut self.found, &mut self.children);
+        let mine = self.children.len();
         let mut low = number;
-        for child in children {
+        for child in children..mine {
+            let child = self.children[child];
             match self.visit(child, depth + 1) {
                 Some(it) => low = low.min(it),
-                None => found.extend(self.done.get(&child).into_iter().flatten()),
+                None => {
+                    if let Some(&(from, to)) = self.done.get(&child) {
+                        self.found.extend_from_slice(&self.pool[from as usize..to as usize]);
+                    }
+                }
             }
         }
+        self.children.truncate(children);
         if low < number {
-            self.stack[at].1 = found;
             return Some(low);
         }
-        let members: Vec<_> = self.stack.drain(at..).collect();
-        for (_, theirs) in &members {
-            found.extend_from_slice(theirs);
+        let all = &mut self.found[found..];
+        all.sort_unstable();
+        let from = self.pool.len() as u32;
+        for (index, &rv) in all.iter().enumerate() {
+            if index == 0 || all[index - 1] != rv {
+                self.pool.push(rv);
+            }
         }
-        found.sort_unstable();
-        found.dedup();
-        for (member, _) in members {
+        let range = (from, self.pool.len() as u32);
+        self.found.truncate(found);
+        for member in self.stack.drain(at..) {
             self.open.remove(&member);
-            self.done.insert(member, found.clone());
+            self.done.insert(member, range);
         }
         None
     }
+}
 
-    /// The regions dropping a `ty` uses itself, and the types it drops.
-    fn expand(&self, ty: Ty<'db>, found: &mut Vec<Rv>, children: &mut Vec<Ty<'db>>) {
-        let ctx = self.ctx;
-        match ty.kind() {
-            // Dropping a `ManuallyDrop` drops nothing.
-            TyKind::Adt(def, _) if def.is_manually_drop() => (),
-            TyKind::Adt(def, args) => {
-                let adt = def.def_id();
-                if def.is_box() || def.is_phantom_data() {
-                    if let Some(GenericArgKind::Type(inner)) =
-                        args.iter().next().map(|it| it.kind())
-                    {
-                        children.push(inner);
-                    }
-                    return;
+/// The regions dropping a `ty` uses itself, and the types it drops.
+fn expand<'db>(
+    ctx: &Ctx<'_, 'db>,
+    regions: &Regions<'db>,
+    ty: Ty<'db>,
+    found: &mut Vec<Rv>,
+    children: &mut Vec<Ty<'db>>,
+) {
+    match ty.kind() {
+        // Dropping a `ManuallyDrop` drops nothing.
+        TyKind::Adt(def, _) if def.is_manually_drop() => (),
+        TyKind::Adt(def, args) => {
+            let adt = def.def_id();
+            if def.is_box() || def.is_phantom_data() {
+                if let Some(GenericArgKind::Type(inner)) =
+                    args.iter().next().map(|it| it.kind())
+                {
+                    children.push(inner);
                 }
-                let interner = ctx.infcx.interner;
-                let constraint = drop_constraint(ctx.db, adt);
-                for region in &constraint.regions {
-                    let region = rustc_type_ir::EarlyBinder::bind(region.as_ref())
-                        .instantiate(interner, args)
-                        .skip_norm_wip();
-                    found.extend(super::regions::rv_of(region));
-                }
-                for whole in &constraint.whole {
-                    let whole = rustc_type_ir::EarlyBinder::bind(whole.as_ref())
-                        .instantiate(interner, args)
-                        .skip_norm_wip();
-                    regions_of(whole, found);
-                }
-                children.extend(constraint.tys.iter().map(|it| {
-                    rustc_type_ir::EarlyBinder::bind(it.as_ref())
-                        .instantiate(interner, args)
-                        .skip_norm_wip()
-                }));
+                return;
             }
-            TyKind::Array(inner, _) | TyKind::Slice(inner) => children.push(inner),
-            TyKind::Tuple(tys) => children.extend(tys.iter()),
-            TyKind::Closure(_, args) => children.push(args.as_closure().tupled_upvars_ty()),
-            // rustc's dropck drops what a coroutine captures too, all of it where what it keeps
-            // across an `await` needs dropping, which is not known here.
-            TyKind::CoroutineClosure(_, args) => {
-                children.push(args.as_coroutine_closure().tupled_upvars_ty())
+            let interner = ctx.infcx.interner;
+            let constraint = drop_constraint(ctx.db, adt);
+            for region in &constraint.regions {
+                let region = rustc_type_ir::EarlyBinder::bind(region.as_ref())
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
+                found.extend(super::regions::rv_of(region));
             }
-            TyKind::Coroutine(_, args) => children.push(args.as_coroutine().tupled_upvars_ty()),
-            TyKind::Dynamic(..) => regions_of(ty, found),
-            // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
-            // another alias holds what its bounds and captures let it, as for liveness.
-            TyKind::Alias(alias) => {
-                let normalized = match alias.kind {
-                    rustc_type_ir::AliasTyKind::Projection { .. } => {
-                        super::regions::normalize(ctx, ty)
-                            .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_)))
-                    }
-                    _ => None,
-                };
-                match normalized {
-                    Some(it) => children.push(it),
-                    None => live_regions_of(ctx, self.regions, ty, found),
-                }
+            for whole in &constraint.whole {
+                let whole = rustc_type_ir::EarlyBinder::bind(whole.as_ref())
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
+                regions_of(whole, found);
             }
-            _ => (),
+            children.extend(constraint.tys.iter().map(|it| {
+                rustc_type_ir::EarlyBinder::bind(it.as_ref())
+                    .instantiate(interner, args)
+                    .skip_norm_wip()
+            }));
         }
+        TyKind::Array(inner, _) | TyKind::Slice(inner) => children.push(inner),
+        TyKind::Tuple(tys) => children.extend(tys.iter()),
+        TyKind::Closure(_, args) => children.push(args.as_closure().tupled_upvars_ty()),
+        // rustc's dropck drops what a coroutine captures too, all of it where what it keeps
+        // across an `await` needs dropping, which is not known here.
+        TyKind::CoroutineClosure(_, args) => {
+            children.push(args.as_coroutine_closure().tupled_upvars_ty())
+        }
+        TyKind::Coroutine(_, args) => children.push(args.as_coroutine().tupled_upvars_ty()),
+        TyKind::Dynamic(..) => regions_of(ty, found),
+        // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
+        // another alias holds what its bounds and captures let it, as for liveness.
+        TyKind::Alias(alias) => {
+            let normalized = match alias.kind {
+                rustc_type_ir::AliasTyKind::Projection { .. } => {
+                    super::regions::normalize(ctx, ty)
+                        .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_)))
+                }
+                _ => None,
+            };
+            match normalized {
+                Some(it) => children.push(it),
+                None => live_regions_of(ctx, regions, ty, found),
+            }
+        }
+        _ => (),
     }
 }
 

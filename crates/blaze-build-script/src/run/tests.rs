@@ -185,3 +185,45 @@ fn a_run_in_cargos_second_layout() {
     assert!(dir.join("invoked.timestamp").exists() && !dir.join("output").exists());
     assert!(!is_second_layout(&target.join("debug/build/foo-1/out")));
 }
+
+/// What is logged, read in the bytes, against `str::lines` of the output read lossily (what
+/// it was before), over seeded outputs of the pieces that matter: the prefixes, line breaks
+/// with and without a carriage return, a carriage return at the end, bytes not UTF-8.
+#[test]
+fn what_is_logged_is_read_as_the_lossy_lines_have_it() {
+    let pieces: [&[u8]; 10] = [
+        b"cargo::error=", b"cargo:warning=", b"cargo::warning=", b"cargo:rustc-cfg=x", b"\n",
+        b"\r\n", b"\r", b"a b", b"\xff\xfe", "é".as_bytes(),
+    ];
+    let model = |stdout: &[u8]| -> Vec<(Severity, String)> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter_map(|line| {
+                if let Some(error) = line.strip_prefix("cargo::error=") {
+                    return Some((Severity::Error, error.to_owned()));
+                }
+                let warning = line
+                    .strip_prefix("cargo:warning=")
+                    .or_else(|| line.strip_prefix("cargo::warning="))?;
+                Some((Severity::Warning, warning.to_owned()))
+            })
+            .collect()
+    };
+    let mut state = 0x9fb2_1c65_1e98_df25u64;
+    for _ in 0..20_000 {
+        let mut stdout = Vec::new();
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for at in 0..(state % 9) {
+            stdout.extend_from_slice(pieces[(state.rotate_left(at as u32 * 7) % 10) as usize]);
+        }
+        let ran = Ran {
+            began: SystemTime::UNIX_EPOCH,
+            status: ExitStatus::default(),
+            stdout: stdout.clone(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(ran.logged(), model(&stdout), "{stdout:?}");
+    }
+}

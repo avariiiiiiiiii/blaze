@@ -35,7 +35,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use base_db::{Crate, LangCrateOrigin};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
-use cranelift_module::ModuleRelocTarget;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
     signatures::{
@@ -2321,20 +2320,11 @@ fn trouble<'db>(
 /// Hashes compiled code without what tells where it was written: the lines it is of and
 /// where its variables are.
 fn hash_code(hasher: &mut impl Hasher, code: &Code) {
-    let Code { signature, bytes, align, relocs, elf_types, unwind, lines: _, slots: _ } = code;
-    (signature, bytes, align, elf_types).hash(hasher);
+    let Code { signature, bytes, align, relocs, unwind, lines: _, slots: _ } = code;
+    (signature, bytes, align).hash(hasher);
+    relocs.hash_elf_types(hasher);
     format!("{unwind:?}").hash(hasher);
-    relocs.len().hash(hasher);
-    for reloc in relocs {
-        (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(hasher);
-        std::mem::discriminant(&reloc.name).hash(hasher);
-        match &reloc.name {
-            ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(hasher),
-            ModuleRelocTarget::LibCall(call) => call.hash(hasher),
-            ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(hasher),
-            ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(hasher),
-        }
-    }
+    relocs.hash_as_module(hasher);
 }
 
 impl<'db> FunctionCx<'_, 'db> {
@@ -2388,7 +2378,10 @@ impl<'db> FunctionCx<'_, 'db> {
 mod tests {
     use cranelift_codegen::{ir::Signature, isa::CallConv};
 
-    use super::super::debuginfo::{LineRow, SlotPlaces};
+    use super::super::{
+        debuginfo::{LineRow, SlotPlaces},
+        fragment::Relocs,
+    };
     use super::*;
 
     fn code(bytes: &[u8], lines: Vec<LineRow>) -> Code {
@@ -2396,8 +2389,7 @@ mod tests {
             signature: Signature::new(CallConv::SystemV),
             bytes: bytes.to_vec(),
             align: 16,
-            relocs: Vec::new(),
-            elf_types: Vec::new(),
+            relocs: Relocs::default(),
             unwind: None,
             lines,
             slots: SlotPlaces::default(),

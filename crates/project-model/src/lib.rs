@@ -16,6 +16,7 @@
 //! * Lowering of concrete model to a `base_db::CrateGraph`
 
 // It's useful to refer to code that is private in doc comments.
+#![forbid(unsafe_code)]
 #![allow(rustdoc::private_intra_doc_links)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 

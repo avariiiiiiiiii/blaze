@@ -2,24 +2,23 @@
 
 mod valtree;
 
-use std::hash::Hash;
+use std::{hash::Hash, marker::PhantomData, num::NonZeroU32};
 
 use hir_def::ConstParamId;
-use intern::{Interned, InternedRef, impl_internable};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::TargetDataLayout;
 use rustc_ast_ir::visit::VisitorResult;
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ConstVid, DebruijnIndex, FlagComputation, Flags,
     GenericTypeVisitable, InferConst, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable,
-    TypeVisitable, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind, relate::Relate,
+    TypeVisitable, TypeVisitableExt, inherent::IntoKind, relate::Relate,
 };
 
 use crate::{
     ParamEnvAndCrate,
     next_solver::{
         AllocationData, ClauseKind, ParamEnv, impl_foldable_for_interned_slice,
-        impl_stored_interned, interned_slice,
+        impl_stored_interned, interned_slice, interner::table, persist,
     },
 };
 
@@ -30,50 +29,64 @@ pub use self::valtree::*;
 pub type ConstKind<'db> = rustc_type_ir::ConstKind<DbInterner<'db>>;
 pub type UnevaluatedConst<'db> = rustc_type_ir::UnevaluatedConst<DbInterner<'db>>;
 
+/// Every interned [`Const`]. A `GenericArg` holds a row in 30 bits.
+static CONSTS: table::Rows = table::Rows::new("consts", table::LAST_ROW);
+
+/// A constant: its row in [`CONSTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Const<'db> {
-    pub(super) interned: InternedRef<'db, ConstInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[repr(align(4))] // Required for `GenericArg` bit-tagging.
-pub(super) struct ConstInterned(pub(super) WithCachedTypeInfo<ConstKind<'static>>);
+const _: () = assert!(size_of::<Option<Const<'static>>>() == 4);
 
-impl_internable!(gc; ConstInterned);
-impl_stored_interned!(ConstInterned, Const, StoredConst);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Const<'static>>();
-};
+impl_stored_interned!(Const, StoredConst);
 
 impl<'db> Const<'db> {
     /// You should avoid using this if you can, since we want `Ty` to be defined in `rustc_type_ir` and then this method
     /// will become more difficult to use.
     #[inline]
     pub fn new_without_interner(kind: ConstKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<ConstKind<'db>, ConstKind<'static>>(kind) };
-        let flags = FlagComputation::for_const_kind(&kind);
-        let cached = WithCachedTypeInfo {
-            internee: kind,
-            flags: flags.flags,
-            outer_exclusive_binder: flags.outer_exclusive_binder,
-        };
-        Self { interned: Interned::new_gc(ConstInterned(cached)) }
+        Self::intern(kind)
     }
 
     pub fn new(_interner: DbInterner<'db>, kind: ConstKind<'db>) -> Self {
-        Self::new_without_interner(kind)
+        Self::intern(kind)
     }
 
-    pub fn inner(&self) -> &WithCachedTypeInfo<ConstKind<'db>> {
-        let inner = &self.interned.0;
-        unsafe {
-            std::mem::transmute::<
-                &WithCachedTypeInfo<ConstKind<'static>>,
-                &WithCachedTypeInfo<ConstKind<'db>>,
-            >(inner)
+    pub(super) fn intern(kind: ConstKind<'db>) -> Self {
+        let words = persist::encode(&kind);
+        Self::at(CONSTS.intern(&words, || {
+            let computed = FlagComputation::for_const_kind(&kind);
+            (computed.flags, computed.outer_exclusive_binder)
+        }))
+    }
+
+    /// This constant's row: the same number for the same constant, on every thread, for the
+    /// life of the process.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.index.get()
+    }
+
+    /// The constant at `index`, which [`Self::index`] gave. Panics on any other number.
+    pub fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
+        match NonZeroU32::new(index) {
+            Some(index) if CONSTS.published(index) => Self::at(index),
+            _ => panic!("{index} is not the index of an interned constant"),
         }
+    }
+
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Const { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
     }
 
     pub fn error(interner: DbInterner<'db>) -> Self {
@@ -174,7 +187,7 @@ impl<'db> Const<'db> {
 
 impl<'db> std::fmt::Debug for Const<'db> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner().internee.fmt(f)
+        self.kind().fmt(f)
     }
 }
 
@@ -241,14 +254,16 @@ impl rustc_type_ir::inherent::ParamLike for ParamConst {
 impl<'db> IntoKind for Const<'db> {
     type Kind = ConstKind<'db>;
 
+    #[inline]
     fn kind(self) -> Self::Kind {
-        self.inner().internee
+        // SAFETY: a `Const` is a row of `CONSTS`.
+        persist::decode(unsafe { CONSTS.fields(self.index) })
     }
 }
 
 impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Const<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(CONSTS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }
@@ -342,12 +357,16 @@ impl<'db> Relate<DbInterner<'db>> for Const<'db> {
 }
 
 impl<'db> Flags for Const<'db> {
+    #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        self.inner().flags
+        // SAFETY: a `Const` is a row of `CONSTS`.
+        unsafe { CONSTS.flags(self.index) }
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        self.inner().outer_exclusive_binder
+        // SAFETY: as in `flags`.
+        unsafe { CONSTS.binder(self.index) }
     }
 }
 

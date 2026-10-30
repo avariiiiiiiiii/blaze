@@ -464,12 +464,28 @@ struct Wrong<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
     seg: &'a Segment,
     def: GenericDef,
+    /// The const parameter the arguments are given to, which `def` is the parent of.
+    param: Option<hir::ConstParam>,
     info: Info,
     /// The arguments written, constraints left out.
     args: Vec<ast::GenericArg>,
 }
 
 impl Wrong<'_, '_, '_> {
+    fn descr(&self) -> &'static str {
+        match self.param {
+            Some(_) => "const parameter",
+            None => def_descr(self.cx, self.def),
+        }
+    }
+
+    fn def_span(&self) -> Option<Span> {
+        let Some(param) = self.param else { return def_name_span(self.cx, self.def) };
+        let src = param.merge().source(self.cx.db)?;
+        let Either::Left(ast::TypeOrConstParam::Const(it)) = &src.value else { return None };
+        Some(self.cx.span(src.with_value(it.name()?.syntax().text_range())))
+    }
+
     fn missing_lifetimes(&self) -> bool {
         matches!(self.info, Info::MissingLifetimes { .. } | Info::ExcessLifetimes { .. })
     }
@@ -593,7 +609,7 @@ impl Wrong<'_, '_, '_> {
     }
 
     fn message(&self) -> String {
-        let descr = def_descr(self.cx, self.def);
+        let descr = self.descr();
         if !self.has_brackets() {
             return format!("missing generics for {descr} `{}`", def_path(self.cx, self.def));
         }
@@ -768,7 +784,7 @@ impl Wrong<'_, '_, '_> {
     /// `Into::<T>::into(x)`.
     fn suggest_moving_args_from_assoc_fn_to_trait(&self, diag: &mut Diag) {
         let db = self.cx.db;
-        let GenericDef::Function(f) = self.def else { return };
+        let (GenericDef::Function(f), None) = (self.def, self.param) else { return };
         let Some(AssocItemContainer::Trait(trait_)) = f.as_assoc_item(db).map(|it| it.container(db)) else {
             return;
         };
@@ -948,7 +964,7 @@ impl Wrong<'_, '_, '_> {
     /// rustc's `get_unbound_associated_item`.
     fn unbound_associated_types(&self) -> Vec<String> {
         let db = self.cx.db;
-        let GenericDef::Trait(trait_) = self.def else { return Vec::new() };
+        let (GenericDef::Trait(trait_), None) = (self.def, self.param) else { return Vec::new() };
         let bound: Vec<String> = self
             .seg
             .constraints()
@@ -966,7 +982,7 @@ impl Wrong<'_, '_, '_> {
 
     /// Whether the segment names the trait of the impl it is the header of.
     fn is_in_trait_impl(&self) -> bool {
-        if !matches!(self.def, GenericDef::Trait(_)) {
+        if !matches!(self.def, GenericDef::Trait(_)) || self.param.is_some() {
             return false;
         }
         let Some(path) = self.seg.path() else { return false };
@@ -977,7 +993,7 @@ impl Wrong<'_, '_, '_> {
 
     /// rustc's `show_definition`: "struct defined here, with 1 generic parameter: `T`".
     fn show_definition(&self, diag: &mut Diag) {
-        let Some(def_span) = def_name_span(self.cx, self.def) else { return };
+        let Some(def_span) = self.def_span() else { return };
         let mut spans = MultiSpan::of(def_span);
         let (quantifier, bound) = self.quantifier_and_bound();
         let params = match bound {
@@ -1002,7 +1018,7 @@ impl Wrong<'_, '_, '_> {
         };
         let msg = format!(
             "{} defined here, with {quantifier}{bound} {} parameter{}{params}",
-            def_descr(self.cx, self.def),
+            self.descr(),
             self.kind(),
             s(bound),
         );
@@ -1100,7 +1116,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
         return vec![Found::new(diag, Phase::Items)];
     };
     let args = seg.args();
-    let wrong = Wrong { cx, seg: &seg, def: d.def, info, args };
+    let wrong = Wrong { cx, seg: &seg, def: d.def, param: None, info, args };
     if wrong.all_params_are_bound() {
         return Vec::new();
     }
@@ -1112,4 +1128,41 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
     generics_fact(cx, &mut diag, d.def);
     site_fact(cx, &mut diag, InFile::new(seg.file, &seg.node));
     vec![Found::new(diag, phase_at(&seg.node))]
+}
+
+/// E0107 of generic arguments given to a static or a const parameter named by a value path,
+/// which take none: rustc counts the last segment's arguments as any value's
+/// (`probe_generic_path_segments`), the lifetimes' error first, then the types' and consts'.
+pub(crate) fn takes_none(
+    cx: &Cx<'_, '_>,
+    seg: &Segment,
+    def: GenericDef,
+    param: Option<hir::ConstParam>,
+) -> Vec<Found> {
+    let args = seg.args();
+    let lifetimes = args.iter().filter(|it| matches!(it, ast::GenericArg::LifetimeArg(_))).count();
+    let others = match seg.list.is_none() && seg.parenthesized().is_some() {
+        true => 1,
+        false => args.len() - lifetimes,
+    };
+    let infos = [
+        (lifetimes > 0).then_some(Info::ExcessLifetimes { redundant: lifetimes }),
+        (others > 0).then_some(Info::ExcessTypesOrConsts {
+            redundant: others,
+            defaults: 0,
+            synth_provided: false,
+        }),
+    ];
+    let mut found = Vec::new();
+    for info in infos.into_iter().flatten() {
+        let wrong = Wrong { cx, seg, def, param, info, args: args.clone() };
+        let mut diag = Diag::error(Some("E0107"), wrong.message(), seg.name_span(cx));
+        wrong.notify(&mut diag);
+        wrong.suggest(&mut diag);
+        wrong.show_definition(&mut diag);
+        generics_fact(cx, &mut diag, def);
+        site_fact(cx, &mut diag, InFile::new(seg.file, &seg.node));
+        found.push(Found::new(diag, phase_at(&seg.node)));
+    }
+    found
 }

@@ -419,9 +419,12 @@ impl<'db> Wfcx<'db> {
             .iter()
             .map(|it| (it.sup_type, it.sub_region))
             .collect();
-        let constraints = inner.unwrap_region_constraints().region_constraint_data().constraints
-            [mark.1..]
-            .to_vec();
+        let constraints: Vec<Constraint<'db>> = inner
+            .unwrap_region_constraints()
+            .region_constraint_data()
+            .constraints
+            .iter_from(mark.1)
+            .collect();
         drop(inner);
         // The impl's lifetimes are inference variables the solver equates with the item's.
         let mut equal: FxHashMap<rustc_type_ir::RegionVid, Region<'db>> = FxHashMap::default();

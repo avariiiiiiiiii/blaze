@@ -337,18 +337,9 @@ pub(crate) fn lower_type_alias(
 {
     let mut expr_collector =
         ExprCollector::new(db, container.module(db), alias.file_id, LoweringMode::Analysis);
-    let bounds = alias
-        .value
-        .type_bound_list()
-        .map(|bounds| {
-            bounds
-                .bounds()
-                .map(|bound| {
-                    expr_collector.lower_type_bound(bound, &mut ExprCollector::impl_trait_allocator)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let bounds_mark = expr_collector
+        .type_bounds_from_ast(alias.value.type_bound_list(), &mut ExprCollector::impl_trait_allocator);
+    let bounds: Box<[TypeBound]> = expr_collector.store.drain_bounds(bounds_mark).collect();
     let mut collector = generics::GenericParamsCollector::new(type_alias_id.into());
     collector.lower(
         &mut expr_collector,
@@ -396,7 +387,7 @@ pub(crate) fn lower_function(
     let mut expr_collector = ExprCollector::new(db, module, fn_.file_id, LoweringMode::Analysis);
     let mut collector = generics::GenericParamsCollector::new(function_id.into());
     collector.lower(&mut expr_collector, fn_.value.generic_param_list(), fn_.value.where_clause());
-    let mut params = vec![];
+    let params_mark = expr_collector.store.list_mark();
     let mut has_self_param = false;
     let mut has_variadic = false;
     collector.collect_impl_trait(&mut expr_collector, |collector, mut impl_trait_lower_fn| {
@@ -406,37 +397,37 @@ pub(crate) fn lower_function(
                     let enabled = collector.check_cfg(&param);
                     if enabled {
                         has_self_param = true;
-                        params.push(match param.ty() {
+                        let self_param_ty = match param.ty() {
                             Some(ty) => collector.lower_type_ref(ty, &mut impl_trait_lower_fn),
                             None => {
-                                let self_type = collector.alloc_type_ref_desugared(TypeRef::Path(
+                                let self_type = collector.alloc_type_ref_path_desugared(
                                     Name::new_symbol_root(sym::Self_).into(),
-                                ));
+                                );
                                 let lifetime = param
                                     .lifetime()
                                     .map(|lifetime| collector.lower_lifetime_ref(lifetime));
                                 match param.kind() {
                                     ast::SelfParamKind::Owned => self_type,
                                     ast::SelfParamKind::Ref => collector.alloc_type_ref_desugared(
-                                        TypeRef::Reference(Box::new(RefType {
+                                        TypeRef::Reference(&RefType {
                                             ty: self_type,
                                             lifetime,
                                             mutability: Mutability::Shared,
-                                        })),
+                                        }),
                                     ),
                                     ast::SelfParamKind::MutRef => collector
-                                        .alloc_type_ref_desugared(TypeRef::Reference(Box::new(
-                                            RefType {
-                                                ty: self_type,
-                                                lifetime,
-                                                mutability: Mutability::Mut,
-                                            },
-                                        ))),
+                                        .alloc_type_ref_desugared(TypeRef::Reference(&RefType {
+                                            ty: self_type,
+                                            lifetime,
+                                            mutability: Mutability::Mut,
+                                        })),
                                 }
                             }
-                        });
+                        };
+                        collector.store.push_list_type(self_param_ty);
                     }
                 }
+                // Every parameter's cfg is checked before any type is lowered.
                 let p = param_list
                     .params()
                     .filter(|param| collector.check_cfg(param))
@@ -446,14 +437,16 @@ pub(crate) fn lower_function(
                         !is_variadic
                     })
                     .map(|param| param.ty())
-                    // FIXME
-                    .collect::<Vec<_>>();
+                    .collect::<SmallVec<[_; 8]>>();
                 for p in p {
-                    params.push(collector.lower_type_ref_opt(p, &mut impl_trait_lower_fn));
+                    let ty = collector.lower_type_ref_opt(p, &mut impl_trait_lower_fn);
+                    collector.store.push_list_type(ty);
                 }
             }
         })
     });
+    let params: Box<[TypeRefId]> = expr_collector.store.lists_since(params_mark).types.into();
+    expr_collector.store.truncate_to(params_mark);
     let return_type = fn_.value.ret_type().map(|ret_type| {
         expr_collector.with_lifetime_bound_scope(LifetimeBoundScope::Return, |this| {
             this.lower_type_ref_opt(ret_type.ty(), &mut ExprCollector::impl_trait_allocator)
@@ -479,7 +472,7 @@ pub(crate) fn lower_function(
             args: None,
             type_ref: Some(
                 return_type
-                    .unwrap_or_else(|| expr_collector.alloc_type_ref_desugared(TypeRef::unit())),
+                    .unwrap_or_else(|| expr_collector.alloc_type_ref_desugared(TypeRef::UNIT)),
             ),
             bounds: Box::default(),
         };
@@ -487,14 +480,10 @@ pub(crate) fn lower_function(
             .push(Some(GenericArgs { bindings: Box::new([binding]), ..GenericArgs::empty() }));
 
         let path = Path::from_known_path(path, generic_args);
-        let path = PathId::from_type_ref_unchecked(
-            expr_collector.alloc_type_ref_desugared(TypeRef::Path(path)),
-        );
+        let path =
+            PathId::from_type_ref_unchecked(expr_collector.alloc_type_ref_path_desugared(path));
         let ty_bound = TypeBound::Path(path, TraitBoundModifier::None);
-        Some(
-            expr_collector
-                .alloc_type_ref_desugared(TypeRef::ImplTrait(ThinVec::from_iter([ty_bound]))),
-        )
+        Some(expr_collector.alloc_type_ref_desugared(TypeRef::ImplTrait(&[ty_bound])))
     } else {
         return_type
     };
@@ -503,7 +492,7 @@ pub(crate) fn lower_function(
         store,
         source_map,
         generics,
-        params.into_boxed_slice(),
+        params,
         return_type,
         has_self_param,
         has_variadic,
@@ -544,14 +533,17 @@ pub struct ExprCollector<'db> {
 
     name_generator_index: usize,
 
-    /// Emptied statement lists, one per block being lowered at once, reused so a block costs no
-    /// allocation once the deepest nesting has been seen.
-    stmt_buffers: Vec<Vec<Statement>>,
+    // Stacks for the owned lists of a `Path`, `GenericArgs` and `FnType` while they are built,
+    // like the builder's node lists: a nested one pushes and pops above, and the finished list
+    // is moved out in one exact allocation.
+    path_segments: Vec<Name>,
+    path_generic_args: Vec<Option<GenericArgs>>,
+    generic_args: Vec<GenericArg>,
+    assoc_bindings: Vec<AssociatedTypeBinding>,
+    fn_params: Vec<(Option<Name>, TypeRefId)>,
+    /// A coroutine closure's parameters while its body is desugared.
+    closure_params: Vec<Param<PatId>>,
 }
-
-/// A node's child list while it is being built; nested lowering builds its own.
-type ExprList = SmallVec<[ExprId; 8]>;
-type PatList = SmallVec<[PatId; 8]>;
 
 #[derive(Clone, Debug)]
 struct LabelRib {
@@ -754,7 +746,7 @@ impl<'db> ExprCollector<'db> {
             def_map,
             local_def_map,
             lang_items: OnceCell::new(),
-            store: ExpressionStoreBuilder::default(),
+            store: ExpressionStoreBuilder::new(),
             expander,
             current_try_block: None,
             is_lowering_coroutine: false,
@@ -767,7 +759,12 @@ impl<'db> ExprCollector<'db> {
             name_generator_index: 0,
             named_lifetime_store: NamedLifetimeStore::default(),
             for_type_binder: None,
-            stmt_buffers: Vec::new(),
+            path_segments: Vec::new(),
+            path_generic_args: Vec::new(),
+            generic_args: Vec::new(),
+            assoc_bindings: Vec::new(),
+            fn_params: Vec::new(),
+            closure_params: Vec::new(),
         };
         result.store.inference_roots = Some(SmallVec::new());
         result
@@ -777,15 +774,6 @@ impl<'db> ExprCollector<'db> {
         let index = self.name_generator_index;
         self.name_generator_index += 1;
         Name::generate_new_name(index)
-    }
-
-    fn take_stmt_buffer(&mut self) -> Vec<Statement> {
-        self.stmt_buffers.pop().unwrap_or_default()
-    }
-
-    fn return_stmt_buffer(&mut self, mut buffer: Vec<Statement>) {
-        buffer.clear();
-        self.stmt_buffers.push(buffer);
     }
 
     #[inline]
@@ -828,41 +816,49 @@ impl<'db> ExprCollector<'db> {
         node: ast::Type,
         impl_trait_lower_fn: ImplTraitLowerFn<'_>,
     ) -> TypeRefId {
-        let ty = match &node {
-            ast::Type::ParenType(inner) => {
-                return self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
+        let ptr = AstPtr::new(&node);
+        match &node {
+            ast::Type::ParenType(inner) => self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn),
+            ast::Type::TupleType(inner) => {
+                let mark = self.store.list_mark();
+                for field in inner.fields() {
+                    let ty = self.lower_type_ref(field, impl_trait_lower_fn);
+                    self.store.push_list_type(ty);
+                }
+                let id = self.store.alloc_type_ref_from(mark, |lists| TypeRef::Tuple(lists.types));
+                self.map_type_ref(id, ptr, false)
             }
-            ast::Type::TupleType(inner) => TypeRef::Tuple(ThinVec::from_iter(Vec::from_iter(
-                inner.fields().map(|it| self.lower_type_ref(it, impl_trait_lower_fn)),
-            ))),
-            ast::Type::NeverType(..) => TypeRef::Never,
-            ast::Type::PathType(inner) => inner
-                .path()
-                .and_then(|it| self.lower_path(it, impl_trait_lower_fn))
-                .map(TypeRef::Path)
-                .unwrap_or(TypeRef::Error),
+            ast::Type::NeverType(..) => self.alloc_type_ref(TypeRef::Never, ptr),
+            ast::Type::PathType(inner) => {
+                match inner.path().and_then(|it| self.lower_path(it, impl_trait_lower_fn)) {
+                    Some(path) => self.alloc_type_ref_path(path, ptr),
+                    None => self.alloc_type_ref(TypeRef::Error, ptr),
+                }
+            }
             ast::Type::PtrType(inner) => {
                 let inner_ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 let mutability = Mutability::from_mutable(inner.mut_token().is_some());
-                TypeRef::RawPtr(inner_ty, mutability)
+                self.alloc_type_ref(TypeRef::RawPtr(inner_ty, mutability), ptr)
             }
             ast::Type::ArrayType(inner) => {
                 let len = self.lower_const_arg_opt(inner.const_arg());
-                TypeRef::Array(ArrayType {
-                    ty: self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn),
-                    len,
-                })
+                let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
+                self.alloc_type_ref(TypeRef::Array(&ArrayType { ty, len }), ptr)
             }
             ast::Type::SliceType(inner) => {
-                TypeRef::Slice(self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn))
+                let inner_ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
+                self.alloc_type_ref(TypeRef::Slice(inner_ty), ptr)
             }
             ast::Type::RefType(inner) => {
                 let inner_ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 let lifetime = inner.lifetime().map(|lt| self.lower_lifetime_ref(lt));
                 let mutability = Mutability::from_mutable(inner.mut_token().is_some());
-                TypeRef::Reference(Box::new(RefType { ty: inner_ty, lifetime, mutability }))
+                self.alloc_type_ref(
+                    TypeRef::Reference(&RefType { ty: inner_ty, lifetime, mutability }),
+                    ptr,
+                )
             }
-            ast::Type::InferType(_inner) => TypeRef::Placeholder,
+            ast::Type::InferType(_inner) => self.alloc_type_ref(TypeRef::Placeholder, ptr),
             ast::Type::FnPtrType(inner) => {
                 // Taken before the parameters are lowered: a function pointer among them
                 // is not what the `for` is written on.
@@ -871,29 +867,25 @@ impl<'db> ExprCollector<'db> {
                     .ret_type()
                     .and_then(|rt| rt.ty())
                     .map(|it| self.lower_type_ref(it, impl_trait_lower_fn))
-                    .unwrap_or_else(|| self.alloc_type_ref_desugared(TypeRef::unit()));
+                    .unwrap_or_else(|| self.alloc_type_ref_desugared(TypeRef::UNIT));
                 let mut is_varargs = false;
-                let mut params = if let Some(pl) = inner.param_list() {
+                let params_base = self.fn_params.len();
+                if let Some(pl) = inner.param_list() {
                     if let Some(param) = pl.params().last() {
                         is_varargs = param.dotdotdot_token().is_some();
                     }
 
-                    pl.params()
-                        .filter(|it| it.dotdotdot_token().is_none())
-                        .map(|it| {
-                            let type_ref = self.lower_type_ref_opt(it.ty(), impl_trait_lower_fn);
-                            let name = match it.pat() {
-                                Some(ast::Pat::IdentPat(it)) => Some(
-                                    it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing),
-                                ),
-                                _ => None,
-                            };
-                            (name, type_ref)
-                        })
-                        .collect()
-                } else {
-                    Vec::with_capacity(1)
-                };
+                    for it in pl.params().filter(|it| it.dotdotdot_token().is_none()) {
+                        let type_ref = self.lower_type_ref_opt(it.ty(), impl_trait_lower_fn);
+                        let name = match it.pat() {
+                            Some(ast::Pat::IdentPat(it)) => Some(
+                                it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing),
+                            ),
+                            _ => None,
+                        };
+                        self.fn_params.push((name, type_ref));
+                    }
+                }
                 fn lower_abi(abi: ast::Abi) -> ExternAbi {
                     abi.abi_string()
                         .and_then(|abi| abi.text_without_quotes().parse().ok())
@@ -901,15 +893,17 @@ impl<'db> ExprCollector<'db> {
                 }
 
                 let abi = inner.abi().map(lower_abi).unwrap_or(ExternAbi::Rust);
-                params.push((None, ret_ty));
+                self.fn_params.push((None, ret_ty));
 
-                TypeRef::Fn(Box::new(FnType {
+                let fn_ = FnType {
                     is_varargs,
                     is_unsafe: inner.unsafe_token().is_some(),
                     abi,
-                    params: params.into_boxed_slice(),
+                    params: self.fn_params.drain(params_base..).collect(),
                     binder,
-                }))
+                };
+                let id = self.store.alloc_type_ref_fn(fn_);
+                self.map_type_ref(id, ptr, false)
             }
             // for types are close enough for our purposes to the inner type for now...
             ast::Type::ForType(inner) => {
@@ -1218,8 +1212,8 @@ impl<'db> ExprCollector<'db> {
         // If `<pattern>` is a simple ident, then it is lowered to a single
         // `let <pattern> = <pattern>;` statement as an optimization.
 
-        let mut statements =
-            Vec::with_capacity(usize::from(self_param.is_some()) + (params.len() * 2));
+        let mut statements = self.take_stmt_buffer();
+        statements.reserve(usize::from(self_param.is_some()) + (params.len() * 2));
 
         if let Some(self_param) = self_param {
             let Binding { ref name, mode, hygiene, .. } = self.store.bindings[self_param.formal];
@@ -1228,7 +1222,7 @@ impl<'db> ExprCollector<'db> {
             let child_pat_id =
                 self.alloc_pat_desugared(Pat::Bind { id: child_binding_id, subpat: None });
             self.add_definition_to_binding(child_binding_id, child_pat_id);
-            let expr = self.alloc_expr_desugared(Expr::Path(name.into()));
+            let expr = self.alloc_expr_desugared(Expr::Path(&Path::from(name)));
             if !hygiene.is_root() {
                 self.store.ident_hygiene.insert(expr.into(), hygiene);
             }
@@ -1243,7 +1237,7 @@ impl<'db> ExprCollector<'db> {
         }
 
         for param in params {
-            let (name, hygiene, is_simple_parameter) = match self.store.pats[param.formal] {
+            let (name, hygiene, is_simple_parameter) = match self.store.pat(param.formal) {
                 // Check if this is a binding pattern, if so, we can optimize and avoid adding a
                 // `let <pat> = __argN;` statement. In this case, we do not rename the parameter.
                 Pat::Bind { id, subpat: None, .. }
@@ -1273,7 +1267,7 @@ impl<'db> ExprCollector<'db> {
                 if let Some(pat_syntax) = pat_syntax {
                     self.store.pat_map_back.insert(child_pat_id, pat_syntax);
                 }
-                let expr = self.alloc_expr_desugared(Expr::Path(name.clone().into()));
+                let expr = self.alloc_expr_desugared(Expr::Path(&Path::from(name.clone())));
                 if !hygiene.is_root() {
                     self.store.ident_hygiene.insert(expr.into(), hygiene);
                 }
@@ -1285,7 +1279,7 @@ impl<'db> ExprCollector<'db> {
                     is_super: false,
                 });
             }
-            let expr = self.alloc_expr_desugared(Expr::Path(name.clone().into()));
+            let expr = self.alloc_expr_desugared(Expr::Path(&Path::from(name.clone())));
             if !hygiene.is_root() {
                 self.store.ident_hygiene.insert(expr.into(), hygiene);
             }
@@ -1316,9 +1310,10 @@ impl<'db> ExprCollector<'db> {
             // all async closures would default to `FnOnce` as their calling mode.
             CaptureBy::Ref,
             None,
-            statements.into_boxed_slice(),
+            &statements,
             Some(body),
         );
+        self.return_stmt_buffer(statements);
         // It's important that this comes last, see the lowering of async closures for why.
         self.alloc_expr_desugared(coroutine)
     }
@@ -1329,9 +1324,9 @@ impl<'db> ExprCollector<'db> {
         source: CoroutineSource,
         capture_by: CaptureBy,
         id: Option<BlockId>,
-        statements: Box<[Statement]>,
+        statements: &[Statement],
         tail: Option<ExprId>,
-    ) -> Expr {
+    ) -> Expr<'static> {
         let block = self.alloc_expr_desugared(Expr::Block {
             label: None,
             id,
@@ -1340,8 +1335,8 @@ impl<'db> ExprCollector<'db> {
             unsafe_: Unsafe::No,
         });
         Expr::Closure {
-            args: Box::default(),
-            arg_types: Box::default(),
+            args: &[],
+            arg_types: &[],
             ret_type: None,
             body: block,
             closure_kind: ClosureKind::Coroutine { kind, source },
@@ -1379,10 +1374,10 @@ impl<'db> ExprCollector<'db> {
                 this.associate_unowned_bindings_with(0, coroutine);
                 // ...except the formal parameters, which are *not* necessarily what was passed as parameters into `collect()`,
                 // since `lower_coroutine_body_with_moved_arguments()` might have changed them.
-                params
+                let formals: SmallVec<[BindingId; 8]> = params
                     .iter()
                     .filter_map(|param| {
-                        if let Pat::Bind { id, .. } = this.store.pats[param.formal] {
+                        if let Pat::Bind { id, .. } = this.store.pat(param.formal) {
                             Some(id)
                         } else {
                             never!(
@@ -1393,10 +1388,11 @@ impl<'db> ExprCollector<'db> {
                         }
                     })
                     .chain(self_param.map(|param| param.formal))
-                    .for_each(|param| {
-                        // They are owned by the top-level function, so should not be present in `bindings_owner`.
-                        this.store.binding_owners.remove(&param);
-                    });
+                    .collect();
+                for param in formals {
+                    // They are owned by the top-level function, so should not be present in `bindings_owner`.
+                    this.store.binding_owners.remove(&param);
+                }
                 coroutine
             } else {
                 body
@@ -1654,35 +1650,38 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::ForExpr(e) => self.collect_for_loop(syntax_ptr, e),
             ast::Expr::CallExpr(e) => {
                 let callee = self.collect_expr_opt(e.expr());
-                let args = if let Some(arg_list) = e.arg_list() {
+                let args: ExprList = if let Some(arg_list) = e.arg_list() {
                     arg_list.args().filter_map(|e| self.maybe_collect_expr(e)).collect()
                 } else {
-                    Box::default()
+                    ExprList::new()
                 };
-                self.alloc_expr(Expr::Call { callee, args }, syntax_ptr)
+                self.alloc_expr(Expr::Call { callee, args: &args }, syntax_ptr)
             }
             ast::Expr::MethodCallExpr(e) => {
                 let receiver = self.collect_expr_opt(e.receiver());
-                let args = if let Some(arg_list) = e.arg_list() {
+                let args: ExprList = if let Some(arg_list) = e.arg_list() {
                     arg_list.args().filter_map(|e| self.maybe_collect_expr(e)).collect()
                 } else {
-                    Box::default()
+                    ExprList::new()
                 };
                 let method_name = e.name_ref().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
-                let generic_args = e
-                    .generic_arg_list()
-                    .and_then(|it| {
-                        self.lower_generic_args(it, &mut Self::impl_trait_error_allocator)
-                    })
-                    .map(Box::new);
+                let generic_args = e.generic_arg_list().and_then(|it| {
+                    self.lower_generic_args(it, &mut Self::impl_trait_error_allocator)
+                });
                 self.alloc_expr(
-                    Expr::MethodCall { receiver, method_name, args, generic_args },
+                    Expr::MethodCall {
+                        receiver,
+                        method_name: &method_name,
+                        args: &args,
+                        generic_args: generic_args.as_ref(),
+                    },
                     syntax_ptr,
                 )
             }
             ast::Expr::MatchExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
-                let arms = if let Some(match_arm_list) = e.match_arm_list() {
+                let arms: SmallVec<[MatchArm; 4]> = if let Some(match_arm_list) = e.match_arm_list()
+                {
                     match_arm_list
                         .arms()
                         .filter_map(|arm| {
@@ -1700,16 +1699,17 @@ impl<'db> ExprCollector<'db> {
                         })
                         .collect()
                 } else {
-                    Box::default()
+                    SmallVec::new()
                 };
-                self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
+                self.alloc_expr(Expr::Match { expr, arms: &arms }, syntax_ptr)
             }
             ast::Expr::PathExpr(e) => {
-                let (path, hygiene) = self
-                    .collect_expr_path(e)
-                    .map(|(path, hygiene)| (Expr::Path(path), hygiene))
-                    .unwrap_or((Expr::Missing, HygieneId::ROOT));
-                let expr_id = self.alloc_expr(path, syntax_ptr);
+                let (expr_id, hygiene) = match self.collect_expr_path(e) {
+                    Some((path, hygiene)) => {
+                        (self.alloc_expr(Expr::Path(&path), syntax_ptr), hygiene)
+                    }
+                    None => (self.alloc_expr(Expr::Missing, syntax_ptr), HygieneId::ROOT),
+                };
                 if !hygiene.is_root() {
                     self.store.ident_hygiene.insert(expr_id.into(), hygiene);
                 }
@@ -1767,8 +1767,8 @@ impl<'db> ExprCollector<'db> {
                 let Some(path) = path else {
                     return Some(self.missing_expr());
                 };
-                let record_lit = if let Some(nfl) = e.record_expr_field_list() {
-                    let fields = nfl
+                if let Some(nfl) = e.record_expr_field_list() {
+                    let fields: SmallVec<[RecordLitField; 4]> = nfl
                         .fields()
                         .filter_map(|field| {
                             if !self.check_cfg(&field) {
@@ -1793,12 +1793,16 @@ impl<'db> ExprCollector<'db> {
                         (None, true) => RecordSpread::FieldDefaults,
                         (Some(expr), _) => RecordSpread::Expr(expr),
                     };
-                    Expr::RecordLit { path, fields, spread }
+                    self.alloc_expr(
+                        Expr::RecordLit { path: &path, fields: &fields, spread },
+                        syntax_ptr,
+                    )
                 } else {
-                    Expr::RecordLit { path, fields: ThinVec::default(), spread: RecordSpread::None }
-                };
-
-                self.alloc_expr(record_lit, syntax_ptr)
+                    self.alloc_expr(
+                        Expr::RecordLit { path: &path, fields: &[], spread: RecordSpread::None },
+                        syntax_ptr,
+                    )
+                }
             }
             ast::Expr::FieldExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -1806,7 +1810,7 @@ impl<'db> ExprCollector<'db> {
                     Some(kind) => kind.as_name(),
                     _ => Name::missing(),
                 };
-                self.alloc_expr(Expr::Field { expr, name }, syntax_ptr)
+                self.alloc_expr(Expr::Field { expr, name: &name }, syntax_ptr)
             }
             ast::Expr::AwaitExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -1845,8 +1849,8 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::ClosureExpr(e) => self.with_label_rib(RibKind::Closure, |this| {
                 let mut is_coroutine_closure = false;
                 let closure = this.with_binding_owner_and_return(|this| {
-                    let mut args = Vec::new();
-                    let mut arg_types = Vec::new();
+                    let mut args = PatList::new();
+                    let mut arg_types = SmallVec::<[Option<TypeRefId>; 8]>::new();
                     // For coroutine closures, the body, aka. the coroutine is the bindings owner, and not the closure.
                     if let Some(pl) = e.param_list() {
                         let num_params = pl.params().count();
@@ -1894,7 +1898,8 @@ impl<'db> ExprCollector<'db> {
                     let closure_kind = if let Some(kind) = kind {
                         // It's important that this expr is allocated immediately before the closure.
                         // We rely on it for `coroutine_for_closure()`.
-                        let mut args_with_user_written = args.iter().copied().map(Param::new).collect::<Vec<_>>();
+                        let mut args_with_user_written =
+                            args.iter().copied().map(Param::new).collect::<SmallVec<[_; 8]>>();
                         body = this.lower_coroutine_body_with_moved_arguments(
                             &mut None,
                             &mut args_with_user_written,
@@ -1922,8 +1927,8 @@ impl<'db> ExprCollector<'db> {
                     this.current_try_block = prev_try_block;
                     let closure = this.alloc_expr(
                         Expr::Closure {
-                            args: args.into(),
-                            arg_types: arg_types.into(),
+                            args: &args,
+                            arg_types: &arg_types,
                             ret_type,
                             body,
                             closure_kind,
@@ -1942,14 +1947,20 @@ impl<'db> ExprCollector<'db> {
                 });
 
                 if is_coroutine_closure {
-                    let Expr::Closure { args, .. } = &this.store.exprs[closure] else {
+                    let Expr::Closure { args, .. } = this.store.expr(closure) else {
                         unreachable!()
                     };
-                    for &arg in args {
-                        let Pat::Bind { id, .. } = this.store.pats[arg] else {
-                            never!("`lower_coroutine_body_with_moved_arguments()` should make sure the coroutine closure only have simple bind args");
-                            continue;
-                        };
+                    let arg_bindings: SmallVec<[BindingId; 8]> = args
+                        .iter()
+                        .filter_map(|&arg| {
+                            let Pat::Bind { id, .. } = this.store.pat(arg) else {
+                                never!("`lower_coroutine_body_with_moved_arguments()` should make sure the coroutine closure only have simple bind args");
+                                return None;
+                            };
+                            Some(id)
+                        })
+                        .collect();
+                    for id in arg_bindings {
                         this.store.binding_owners.insert(id, closure);
                     }
                 }
@@ -1969,24 +1980,27 @@ impl<'db> ExprCollector<'db> {
                 }
             }
             ast::Expr::TupleExpr(e) => {
-                let mut exprs: Vec<_> = e.fields().filter_map(|expr| self.maybe_collect_expr(expr)).collect();
+                let mut exprs: ExprList = e.fields().filter_map(|expr| self.maybe_collect_expr(expr)).collect();
                 // if there is a leading comma, the user is most likely to type out a leading expression
                 // so we insert a missing expression at the beginning for IDE features
                 if comma_follows_token(e.l_paren_token()) {
                     exprs.insert(0, self.missing_expr());
                 }
 
-                self.alloc_expr(Expr::Tuple { exprs: exprs.into_boxed_slice() }, syntax_ptr)
+                self.alloc_expr(Expr::Tuple { exprs: &exprs }, syntax_ptr)
             }
             ast::Expr::ArrayExpr(e) => {
                 let kind = e.kind();
 
                 match kind {
                     ArrayExprKind::ElementList(e) => {
-                        let elements = e
+                        let elements: ExprList = e
                             .filter_map(|expr| self.maybe_collect_expr(expr))
                             .collect();
-                        self.alloc_expr(Expr::Array(Array::ElementList { elements }), syntax_ptr)
+                        self.alloc_expr(
+                            Expr::Array(Array::ElementList { elements: &elements }),
+                            syntax_ptr,
+                        )
                     }
                     ArrayExprKind::Repeat { initializer, repeat } => {
                         let initializer = self.collect_expr_opt(initializer);
@@ -2007,7 +2021,7 @@ impl<'db> ExprCollector<'db> {
 
             ast::Expr::Literal(e) => {
                 let literal = self.module_path_literal(&e).unwrap_or_else(|| e.kind().into());
-                self.alloc_expr(Expr::Literal(literal), syntax_ptr)
+                self.alloc_expr(Expr::Literal(&literal), syntax_ptr)
             }
             ast::Expr::IndexExpr(e) => {
                 let base = self.collect_expr_opt(e.base());
@@ -2051,13 +2065,13 @@ impl<'db> ExprCollector<'db> {
                         _ => vec![it.as_name()],
                     })
                     .collect();
-                self.alloc_expr(Expr::OffsetOf(OffsetOf { container, fields }), syntax_ptr)
+                self.alloc_expr(Expr::OffsetOf(&OffsetOf { container, fields }), syntax_ptr)
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
             ast::Expr::IncludeBytesExpr(_) => self.alloc_expr(Expr::IncludeBytes, syntax_ptr),
             ast::Expr::CfgPredExpr(e) => {
-                let enabled = Expr::Literal(Literal::Bool(self.check_cfg_pred(e.cfg_predicate())));
-                self.alloc_expr(enabled, syntax_ptr)
+                let enabled = Literal::Bool(self.check_cfg_pred(e.cfg_predicate()));
+                self.alloc_expr(Expr::Literal(&enabled), syntax_ptr)
             },
         })
     }
@@ -2123,11 +2137,11 @@ impl<'db> ExprCollector<'db> {
                 },
             )
         });
-        let fields = std::iter::chain(lhs, rhs)
+        let fields: SmallVec<[RecordLitField; 2]> = std::iter::chain(lhs, rhs)
             .map(|(expr, name)| RecordLitField { name: Name::new_symbol_root(name), expr })
             .collect();
         self.alloc_expr(
-            Expr::RecordLit { path: struct_path, fields, spread: RecordSpread::None },
+            Expr::RecordLit { path: &struct_path, fields: &fields, spread: RecordSpread::None },
             syntax_ptr,
         )
     }
@@ -2139,8 +2153,10 @@ impl<'db> ExprCollector<'db> {
         lhs: ExprId,
         rhs: ExprId,
     ) -> ExprId {
-        let fn_path = self.alloc_expr_desugared(self.lang_path_expr(lang_items.RangeInclusiveNew));
-        self.alloc_expr(Expr::Call { callee: fn_path, args: Box::new([lhs, rhs]) }, syntax_ptr)
+        let fn_path = self.lang_path(lang_items.RangeInclusiveNew);
+        let fn_path =
+            self.alloc_expr_desugared(fn_path.as_ref().map_or(Expr::Missing, Expr::Path));
+        self.alloc_expr(Expr::Call { callee: fn_path, args: &[lhs, rhs] }, syntax_ptr)
     }
 
     fn collect_expr_path(&mut self, e: ast::PathExpr) -> Option<(Path, HygieneId)> {
@@ -2201,7 +2217,7 @@ impl<'db> ExprCollector<'db> {
             let src = self.expander.in_file(AstPtr::new(&expr).wrap_left());
             let expr = self.collect_expr(expr);
             // Do not use `alloc_pat_from_expr()` here, it will override the entry in `expr_map`.
-            let id = self.store.pats.alloc(Pat::Expr(expr));
+            let id = self.store.alloc_pat(Pat::Expr(expr));
             self.store.pat_map_back.insert(id, src);
             id
         })
@@ -2221,7 +2237,7 @@ impl<'db> ExprCollector<'db> {
                     && range.is_range_full()
                 {
                     return Some(self.alloc_pat_from_expr(
-                        Pat::Tuple { args: Box::default(), ellipsis: Some(0) },
+                        Pat::Tuple { args: &[], ellipsis: Some(0) },
                         syntax_ptr,
                     ));
                 }
@@ -2229,7 +2245,7 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Expr::TupleExpr(e) => {
                 let (ellipsis, args) = collect_tuple(self, e.fields());
-                self.alloc_pat_from_expr(Pat::Tuple { args, ellipsis }, syntax_ptr)
+                self.alloc_pat_from_expr(Pat::Tuple { args: &args, ellipsis }, syntax_ptr)
             }
             ast::Expr::ArrayExpr(e) => {
                 if e.semicolon_token().is_some() {
@@ -2238,7 +2254,7 @@ impl<'db> ExprCollector<'db> {
 
                 let mut elements = e.exprs();
                 let mut rest_ptr = None;
-                let prefix = elements
+                let prefix: PatList = elements
                     .by_ref()
                     .map_while(|elem| match collect_possibly_rest(self, elem.clone()) {
                         Either::Left(elem) => Some(elem),
@@ -2248,9 +2264,12 @@ impl<'db> ExprCollector<'db> {
                         }
                     })
                     .collect();
-                let suffix = elements.map(|elem| self.collect_expr_as_pat(elem)).collect();
+                let suffix: PatList = elements.map(|elem| self.collect_expr_as_pat(elem)).collect();
                 let slice = rest_ptr.map(|ptr| self.alloc_pat_from_expr(Pat::Rest, ptr));
-                self.alloc_pat_from_expr(Pat::Slice { prefix, slice, suffix }, syntax_ptr)
+                self.alloc_pat_from_expr(
+                    Pat::Slice { prefix: &prefix, slice, suffix: &suffix },
+                    syntax_ptr,
+                )
             }
             ast::Expr::CallExpr(e) => {
                 let path = collect_path(self, e.expr()?)?;
@@ -2261,13 +2280,16 @@ impl<'db> ExprCollector<'db> {
                     return Some(self.missing_pat());
                 };
                 let (ellipsis, args) = collect_tuple(self, e.arg_list()?.args());
-                self.alloc_pat_from_expr(Pat::TupleStruct { path, args, ellipsis }, syntax_ptr)
+                self.alloc_pat_from_expr(
+                    Pat::TupleStruct { path: &path, args: &args, ellipsis },
+                    syntax_ptr,
+                )
             }
             ast::Expr::PathExpr(e) => {
                 let (path, hygiene) = self.collect_expr_path(e.clone())?;
                 let mod_path = path.mod_path().expect("should not lower to lang path");
                 if self.path_is_destructuring_assignment(mod_path) {
-                    let pat_id = self.alloc_pat_from_expr(Pat::Path(path), syntax_ptr);
+                    let pat_id = self.alloc_pat_from_expr(Pat::Path(&path), syntax_ptr);
                     if !hygiene.is_root() {
                         self.store.ident_hygiene.insert(pat_id.into(), hygiene);
                     }
@@ -2302,7 +2324,7 @@ impl<'db> ExprCollector<'db> {
                         },
                     );
                 }
-                let args = record_field_list
+                let args: SmallVec<[RecordFieldPat; 4]> = record_field_list
                     .fields()
                     .filter_map(|f| {
                         if !self.check_cfg(&f) {
@@ -2316,7 +2338,10 @@ impl<'db> ExprCollector<'db> {
                         Some(RecordFieldPat { name, pat })
                     })
                     .collect();
-                self.alloc_pat_from_expr(Pat::Record { path, args, ellipsis }, syntax_ptr)
+                self.alloc_pat_from_expr(
+                    Pat::Record { path: &path, args: &args, ellipsis },
+                    syntax_ptr,
+                )
             }
             _ => return None,
         };
@@ -2374,7 +2399,7 @@ impl<'db> ExprCollector<'db> {
         fn collect_tuple(
             this: &mut ExprCollector<'_>,
             fields: ast::AstChildren<ast::Expr>,
-        ) -> (Option<u32>, Box<[la_arena::Idx<Pat>]>) {
+        ) -> (Option<u32>, PatList) {
             let mut ellipsis = None;
             let args = fields
                 .enumerate()
@@ -2446,24 +2471,20 @@ impl<'db> ExprCollector<'db> {
             (btail, block)
         });
 
-        let callee = self
-            .alloc_expr_desugared_with_ptr(try_from_output.map_or(Expr::Missing, Expr::Path), ptr);
+        let callee = self.alloc_expr_desugared_with_ptr(
+            try_from_output.as_ref().map_or(Expr::Missing, Expr::Path),
+            ptr,
+        );
         let next_tail = match btail {
-            Some(tail) => self
-                .alloc_expr_desugared_with_ptr(Expr::Call { callee, args: Box::new([tail]) }, ptr),
+            Some(tail) => {
+                self.alloc_expr_desugared_with_ptr(Expr::Call { callee, args: &[tail] }, ptr)
+            }
             None => {
-                let unit =
-                    self.alloc_expr_desugared_with_ptr(Expr::Tuple { exprs: Box::new([]) }, ptr);
-                self.alloc_expr_desugared_with_ptr(
-                    Expr::Call { callee, args: Box::new([unit]) },
-                    ptr,
-                )
+                let unit = self.alloc_expr_desugared_with_ptr(Expr::Tuple { exprs: &[] }, ptr);
+                self.alloc_expr_desugared_with_ptr(Expr::Call { callee, args: &[unit] }, ptr)
             }
         };
-        let Expr::Block { tail, .. } = &mut self.store.exprs[expr_id] else {
-            unreachable!("block was lowered to non-block");
-        };
-        *tail = Some(next_tail);
+        self.set_block_tail(expr_id, next_tail);
         self.current_try_block = old_try_block;
         match result_type {
             Some(ty) => {
@@ -2478,17 +2499,17 @@ impl<'db> ExprCollector<'db> {
                 let pat = self.alloc_pat_desugared(Pat::Bind { id: binding, subpat: None });
                 self.add_definition_to_binding(binding, pat);
                 let tail_expr =
-                    self.alloc_expr_desugared_with_ptr(Expr::Path(Path::from(name)), ptr);
+                    self.alloc_expr_desugared_with_ptr(Expr::Path(&Path::from(name)), ptr);
                 self.alloc_expr_desugared_with_ptr(
                     Expr::Block {
                         id: None,
-                        statements: Box::new([Statement::Let {
+                        statements: &[Statement::Let {
                             pat,
                             type_ref: Some(type_ref),
                             initializer: Some(expr_id),
                             else_branch: None,
                             is_super: false,
-                        }]),
+                        }],
                         tail: Some(tail_expr),
                         label: None,
                         unsafe_: Unsafe::No,
@@ -2498,6 +2519,21 @@ impl<'db> ExprCollector<'db> {
             }
             None => expr_id,
         }
+    }
+
+    /// Gives the already built block `block` the tail `tail`, keeping everything else of it.
+    fn set_block_tail(&mut self, block: ExprId, tail: ExprId) {
+        let mut statements = self.take_stmt_buffer();
+        let Expr::Block { id, statements: written, label, unsafe_, .. } = self.store.expr(block)
+        else {
+            unreachable!("block was lowered to non-block");
+        };
+        statements.extend_from_slice(written);
+        self.store.set_expr(
+            block,
+            Expr::Block { id, statements: &statements, tail: Some(tail), label, unsafe_ },
+        );
+        self.return_stmt_buffer(statements);
     }
 
     /// Desugar `ast::WhileExpr` from: `[opt_ident]: while <cond> <body>` into:
@@ -2581,51 +2617,51 @@ impl<'db> ExprCollector<'db> {
         let loop_body = e.loop_body().map(|it| it.into());
         let head = self.collect_expr_opt(iterable);
         let into_iter_fn_expr =
-            self.alloc_expr_desugared_with_ptr(Expr::Path(into_iter_fn), syntax_ptr_iterable);
+            self.alloc_expr_desugared_with_ptr(Expr::Path(&into_iter_fn), syntax_ptr_iterable);
         let iterator = self.alloc_expr_desugared_with_ptr(
-            Expr::Call { callee: into_iter_fn_expr, args: Box::new([head]) },
+            Expr::Call { callee: into_iter_fn_expr, args: &[head] },
             syntax_ptr_iterable,
         );
         let none_arm = MatchArm {
-            pat: self.alloc_pat_desugared(Pat::Path(option_none)),
+            pat: self.alloc_pat_desugared(Pat::Path(&option_none)),
             guard: None,
             expr: self
                 .alloc_expr_desugared_with_ptr(Expr::Break { expr: None, label: None }, syntax_ptr),
         };
-        let some_pat = Pat::TupleStruct {
-            path: option_some,
-            args: Box::new([self.collect_pat_top(e.pat())]),
-            ellipsis: None,
-        };
+        let some_pat_args = [self.collect_pat_top(e.pat())];
         let label = e.label().map(|label| {
             (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
         });
         let some_arm = MatchArm {
-            pat: self.alloc_pat_desugared(some_pat),
+            pat: self.alloc_pat_desugared(Pat::TupleStruct {
+                path: &option_some,
+                args: &some_pat_args,
+                ellipsis: None,
+            }),
             guard: None,
             expr: self.with_opt_labeled_rib(label, |this| this.collect_expr_opt(loop_body)),
         };
         let iter_name = self.generate_new_name();
         let iter_expr = self
-            .alloc_expr_desugared_with_ptr(Expr::Path(Path::from(iter_name.clone())), syntax_ptr);
+            .alloc_expr_desugared_with_ptr(Expr::Path(&Path::from(iter_name.clone())), syntax_ptr);
         let iter_expr_mut = self.alloc_expr_desugared_with_ptr(
             Expr::Ref { expr: iter_expr, rawness: Rawness::Ref, mutability: Mutability::Mut },
             syntax_ptr,
         );
         let iter_next_fn_expr =
-            self.alloc_expr_desugared_with_ptr(Expr::Path(iter_next_fn), syntax_ptr);
+            self.alloc_expr_desugared_with_ptr(Expr::Path(&iter_next_fn), syntax_ptr);
         let iter_next_expr = self.alloc_expr_desugared_with_ptr(
-            Expr::Call { callee: iter_next_fn_expr, args: Box::new([iter_expr_mut]) },
+            Expr::Call { callee: iter_next_fn_expr, args: &[iter_expr_mut] },
             syntax_ptr,
         );
         let loop_inner = self.alloc_expr_desugared_with_ptr(
-            Expr::Match { expr: iter_next_expr, arms: Box::new([none_arm, some_arm]) },
+            Expr::Match { expr: iter_next_expr, arms: &[none_arm, some_arm] },
             syntax_ptr,
         );
         let loop_inner = self.alloc_expr_desugared_with_ptr(
             Expr::Block {
                 id: None,
-                statements: Box::default(),
+                statements: &[],
                 tail: Some(loop_inner),
                 label: None,
                 unsafe_: Unsafe::No,
@@ -2647,7 +2683,7 @@ impl<'db> ExprCollector<'db> {
         self.alloc_expr(
             Expr::Match {
                 expr: iterator,
-                arms: Box::new([MatchArm { pat: iter_pat, guard: None, expr: loop_outer }]),
+                arms: &[MatchArm { pat: iter_pat, guard: None, expr: loop_outer }],
             },
             syntax_ptr,
         )
@@ -2676,9 +2712,9 @@ impl<'db> ExprCollector<'db> {
             return self.missing_expr();
         };
         let operand = self.collect_expr_opt(e.expr());
-        let try_branch = self.alloc_expr(Expr::Path(try_branch), syntax_ptr);
-        let expr = self
-            .alloc_expr(Expr::Call { callee: try_branch, args: Box::new([operand]) }, syntax_ptr);
+        let try_branch = self.alloc_expr(Expr::Path(&try_branch), syntax_ptr);
+        let expr =
+            self.alloc_expr(Expr::Call { callee: try_branch, args: &[operand] }, syntax_ptr);
         let continue_name = self.generate_new_name();
         let continue_binding = self.alloc_binding(
             continue_name.clone(),
@@ -2690,12 +2726,12 @@ impl<'db> ExprCollector<'db> {
         self.add_definition_to_binding(continue_binding, continue_bpat);
         let continue_arm = MatchArm {
             pat: self.alloc_pat_desugared(Pat::TupleStruct {
-                path: cf_continue,
-                args: Box::new([continue_bpat]),
+                path: &cf_continue,
+                args: &[continue_bpat],
                 ellipsis: None,
             }),
             guard: None,
-            expr: self.alloc_expr(Expr::Path(Path::from(continue_name)), syntax_ptr),
+            expr: self.alloc_expr(Expr::Path(&Path::from(continue_name)), syntax_ptr),
         };
         let break_name = self.generate_new_name();
         let break_binding =
@@ -2704,13 +2740,13 @@ impl<'db> ExprCollector<'db> {
         self.add_definition_to_binding(break_binding, break_bpat);
         let break_arm = MatchArm {
             pat: self.alloc_pat_desugared(Pat::TupleStruct {
-                path: cf_break,
-                args: Box::new([break_bpat]),
+                path: &cf_break,
+                args: &[break_bpat],
                 ellipsis: None,
             }),
             guard: None,
             expr: {
-                let it = self.alloc_expr(Expr::Path(Path::from(break_name)), syntax_ptr);
+                let it = self.alloc_expr(Expr::Path(&Path::from(break_name)), syntax_ptr);
                 let convert_fn = match self.current_try_block {
                     Some(TryBlock::Homogeneous { .. }) => {
                         self.lang_path(lang_items.ResidualIntoTryType)
@@ -2719,10 +2755,9 @@ impl<'db> ExprCollector<'db> {
                         self.lang_path(lang_items.TryTraitFromResidual)
                     }
                 };
-                let callee =
-                    self.alloc_expr(convert_fn.map_or(Expr::Missing, Expr::Path), syntax_ptr);
-                let result =
-                    self.alloc_expr(Expr::Call { callee, args: Box::new([it]) }, syntax_ptr);
+                let callee = self
+                    .alloc_expr(convert_fn.as_ref().map_or(Expr::Missing, Expr::Path), syntax_ptr);
+                let result = self.alloc_expr(Expr::Call { callee, args: &[it] }, syntax_ptr);
                 self.alloc_expr(
                     match self.current_try_block {
                         Some(
@@ -2734,8 +2769,8 @@ impl<'db> ExprCollector<'db> {
                 )
             },
         };
-        let arms = Box::new([continue_arm, break_arm]);
-        self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
+        let arms = [continue_arm, break_arm];
+        self.alloc_expr(Expr::Match { expr, arms: &arms }, syntax_ptr)
     }
 
     /// The literal with the path of the module being lowered where `module_path!()` left its
@@ -2759,7 +2794,10 @@ impl<'db> ExprCollector<'db> {
             if !module.is_block_module(self.db) {
                 segments.push(module.name(self.db)?.symbol().as_str().to_owned());
             }
-            // SAFETY: the module is of this database.
+            // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
+            // `module` is a local of this loop, only read for names with `self.db`, and dropped
+            // before this function returns a `String`; nothing stores it. If it were stored, a
+            // later revision could read a freed salsa slot through it.
             module = unsafe { parent.to_static() };
         }
         let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
@@ -3021,12 +3059,23 @@ impl<'db> ExprCollector<'db> {
     fn collect_block_(
         &mut self,
         block: ast::BlockExpr,
-        mk_block: impl FnOnce(&mut Self, Option<BlockId>, Box<[Statement]>, Option<ExprId>) -> Expr,
+        mk_block: impl for<'s> FnOnce(
+            &mut Self,
+            Option<BlockId>,
+            &'s [Statement],
+            Option<ExprId>,
+        ) -> Expr<'s>,
     ) -> ExprId {
         let block_id = (|| {
             let token = self.lowering_mode.allow_tracked_structs()?;
             let file_local_id = self.expander.ast_id_map().ast_id_for_block(&block)?;
             let ast_id = self.expander.in_file(file_local_id);
+            // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
+            // `token` exists only in `LoweringMode::Analysis` (`allow_tracked_structs`), which runs
+            // inside the lowering queries (`Body::of`, the signature queries); the id goes only
+            // into `store.block_scopes` and the block's `Expr::Block`, both part of that query's
+            // result, which salsa invalidates with it. IDE lowering gets no token and makes no id.
+            // A leaked id would name a freed salsa slot in a later revision.
             Some(unsafe { BlockIdLt::new(self.db, ast_id, self.module, token).to_static() })
         })();
 
@@ -3046,7 +3095,7 @@ impl<'db> ExprCollector<'db> {
             None => self.current_block_legacy_macro_defs_count.clone(),
         };
 
-        let mut statements = Vec::new();
+        let mut statements = self.take_stmt_buffer();
         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));
         let tail = block.tail_expr().and_then(|e| match e {
             ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(&mut statements, mac, true),
@@ -3067,8 +3116,9 @@ impl<'db> ExprCollector<'db> {
             .map(|it| self.expander.ctx_for_range(it.text_range()))
             .filter(|it| !it.is_root());
         let syntax_node_ptr = AstPtr::new(&block.into());
-        let expr = mk_block(self, block_id, statements.into_boxed_slice(), tail);
+        let expr = mk_block(self, block_id, &statements, tail);
         let expr_id = self.alloc_expr(expr, syntax_node_ptr);
+        self.return_stmt_buffer(statements);
         if let Some(written_in) = written_in {
             self.store.block_editions.insert(expr_id, written_in.edition(self.db));
         }
@@ -3140,6 +3190,7 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn collect_pat(&mut self, pat: ast::Pat, binding_list: &mut BindingList) -> PatId {
+        let ptr = AstPtr::new(&pat);
         let pattern = match &pat {
             ast::Pat::IdentPat(bp) => {
                 let name = bp.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
@@ -3154,7 +3205,7 @@ impl<'db> ExprCollector<'db> {
 
                 let is_simple_ident_pat =
                     annotation == BindingAnnotation::Unannotated && subpat.is_none();
-                let (binding, pattern) = if is_simple_ident_pat {
+                let is_path = is_simple_ident_pat && {
                     // This could also be a single-segment path pattern. To
                     // decide that, we need to try resolving the name.
                     let (resolved, _) = self.def_map.resolve_path(
@@ -3168,28 +3219,23 @@ impl<'db> ExprCollector<'db> {
                     // Funnily enough, record structs/variants *can* be shadowed
                     // by pattern bindings (but unit or tuple structs/variants
                     // can't).
-                    match resolved.take_values() {
-                        Some(ModuleDefId::ConstId(_)) => (None, Pat::Path(name.into())),
-                        Some(ModuleDefId::EnumVariantId(_)) => (None, Pat::Path(name.into())),
-                        Some(ModuleDefId::AdtId(AdtId::StructId(_))) => {
-                            (None, Pat::Path(name.into()))
-                        }
-                        // shadowing statics is an error as well, so we just ignore that case here
-                        _ => {
-                            let id = binding_list.find(self, name, hygiene, annotation);
-                            (Some(id), Pat::Bind { id, subpat })
-                        }
-                    }
-                } else {
-                    let id = binding_list.find(self, name, hygiene, annotation);
-                    (Some(id), Pat::Bind { id, subpat })
+                    // Shadowing statics is an error as well, so we just ignore that case here.
+                    matches!(
+                        resolved.take_values(),
+                        Some(
+                            ModuleDefId::ConstId(_)
+                                | ModuleDefId::EnumVariantId(_)
+                                | ModuleDefId::AdtId(AdtId::StructId(_))
+                        )
+                    )
                 };
-
-                let ptr = AstPtr::new(&pat);
-                let pat = self.alloc_pat(pattern, ptr);
-                if let Some(binding_id) = binding {
-                    self.add_definition_to_binding(binding_id, pat);
+                if is_path {
+                    return self.alloc_pat(Pat::Path(&Path::from(name)), ptr);
                 }
+
+                let id = binding_list.find(self, name, hygiene, annotation);
+                let pat = self.alloc_pat(Pat::Bind { id, subpat }, ptr);
+                self.add_definition_to_binding(id, pat);
                 return pat;
             }
             ast::Pat::TupleStructPat(p) => {
@@ -3204,7 +3250,8 @@ impl<'db> ExprCollector<'db> {
                     comma_follows_token(p.l_paren_token()),
                     binding_list,
                 );
-                Pat::TupleStruct { path, args, ellipsis }
+                return self
+                    .alloc_pat(Pat::TupleStruct { path: &path, args: &args, ellipsis }, ptr);
             }
             ast::Pat::RefPat(p) => {
                 let pat = self.collect_pat_opt(p.pat(), binding_list);
@@ -3215,15 +3262,15 @@ impl<'db> ExprCollector<'db> {
                 let path = p
                     .path()
                     .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
-                path.map(Pat::Path).unwrap_or(Pat::Missing)
+                return self.alloc_pat(path.as_ref().map_or(Pat::Missing, Pat::Path), ptr);
             }
-            ast::Pat::OrPat(p) => 'b: {
+            ast::Pat::OrPat(p) => {
                 let prev_is_used = mem::take(&mut binding_list.is_used);
                 let prev_reject_new = mem::take(&mut binding_list.reject_new);
-                let mut pats = Vec::with_capacity(p.pats().count());
+                let mut pats = PatList::new();
                 let mut it = p.pats();
                 let Some(first) = it.next() else {
-                    break 'b Pat::Or(Box::new([]));
+                    return self.alloc_pat(Pat::Or(&[]), ptr);
                 };
                 binding_list.push(PatBoundCtx::Or);
                 binding_list.push(PatBoundCtx::Product);
@@ -3254,7 +3301,7 @@ impl<'db> ExprCollector<'db> {
                     // Leading pipe without real OR pattern. Leaving an one-item OR pattern may confuse later stages.
                     return pat;
                 }
-                Pat::Or(pats.into())
+                return self.alloc_pat(Pat::Or(&pats), ptr);
             }
             ast::Pat::ParenPat(p) => return self.collect_pat_opt(p.pat(), binding_list),
             ast::Pat::TuplePat(p) => {
@@ -3263,7 +3310,7 @@ impl<'db> ExprCollector<'db> {
                     comma_follows_token(p.l_paren_token()),
                     binding_list,
                 );
-                Pat::Tuple { args, ellipsis }
+                return self.alloc_pat(Pat::Tuple { args: &args, ellipsis }, ptr);
             }
             ast::Pat::WildcardPat(_) => Pat::Wild,
             ast::Pat::RecordPat(p) => {
@@ -3275,7 +3322,7 @@ impl<'db> ExprCollector<'db> {
                 };
                 let record_pat_field_list =
                     &p.record_pat_field_list().expect("every struct should have a field list");
-                let args = record_pat_field_list
+                let args: SmallVec<[RecordFieldPat; 4]> = record_pat_field_list
                     .fields()
                     .filter_map(|f| {
                         if !self.check_cfg(&f) {
@@ -3292,24 +3339,25 @@ impl<'db> ExprCollector<'db> {
 
                 let ellipsis = record_pat_field_list.rest_pat().is_some();
 
-                Pat::Record { path, args, ellipsis }
+                return self.alloc_pat(Pat::Record { path: &path, args: &args, ellipsis }, ptr);
             }
             ast::Pat::SlicePat(p) => {
                 let SlicePatComponents { prefix, slice, suffix } = p.components();
 
-                Pat::Slice {
-                    prefix: prefix.into_iter().map(|p| self.collect_pat(p, binding_list)).collect(),
-                    slice: slice.map(|p| self.collect_pat(p, binding_list)),
-                    suffix: suffix.into_iter().map(|p| self.collect_pat(p, binding_list)).collect(),
-                }
+                let prefix: PatList =
+                    prefix.into_iter().map(|p| self.collect_pat(p, binding_list)).collect();
+                let slice = slice.map(|p| self.collect_pat(p, binding_list));
+                let suffix: PatList =
+                    suffix.into_iter().map(|p| self.collect_pat(p, binding_list)).collect();
+                return self
+                    .alloc_pat(Pat::Slice { prefix: &prefix, slice, suffix: &suffix }, ptr);
             }
             ast::Pat::LiteralPat(lit) => 'b: {
                 let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else {
                     break 'b Pat::Missing;
                 };
-                let expr = Expr::Literal(hir_lit);
                 let expr_ptr = AstPtr::new(&ast::Expr::Literal(ast_lit));
-                let expr_id = self.alloc_expr(expr, expr_ptr);
+                let expr_id = self.alloc_expr(Expr::Literal(&hir_lit), expr_ptr);
                 Pat::Lit(expr_id)
             }
             ast::Pat::RestPat(_) => Pat::Rest,
@@ -3324,8 +3372,8 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::NotNull(_) => Pat::NotNull,
             ast::Pat::ConstBlockPat(_) => Pat::Missing,
             ast::Pat::CfgPredPat(p) => {
-                let enabled = Expr::Literal(Literal::Bool(self.check_cfg_pred(p.cfg_predicate())));
-                let expr_id = self.alloc_expr_from_pat(enabled, AstPtr::new(&pat));
+                let enabled = Literal::Bool(self.check_cfg_pred(p.cfg_predicate()));
+                let expr_id = self.alloc_expr_from_pat(Expr::Literal(&enabled), ptr);
                 Pat::Lit(expr_id)
             }
             ast::Pat::MacroPat(mac) => {
@@ -3338,21 +3386,21 @@ impl<'db> ExprCollector<'db> {
                     p.and_then(|it| {
                         let ptr = PatPtr::new(&it);
                         match &it {
-                            ast::Pat::LiteralPat(it) => Some(self.alloc_expr_from_pat(
-                                Expr::Literal(pat_literal_to_hir(it)?.0),
-                                ptr,
-                            )),
+                            ast::Pat::LiteralPat(it) => {
+                                let (literal, _) = pat_literal_to_hir(it)?;
+                                Some(self.alloc_expr_from_pat(Expr::Literal(&literal), ptr))
+                            }
                             ast::Pat::IdentPat(ident) if ident.is_simple_ident() => ident
                                 .name()
                                 .map(|name| name.as_name())
                                 .map(Path::from)
-                                .map(|path| self.alloc_expr_from_pat(Expr::Path(path), ptr)),
+                                .map(|path| self.alloc_expr_from_pat(Expr::Path(&path), ptr)),
                             ast::Pat::PathPat(p) => p
                                 .path()
                                 .and_then(|path| {
                                     self.lower_path(path, &mut Self::impl_trait_error_allocator)
                                 })
-                                .map(|parsed| self.alloc_expr_from_pat(Expr::Path(parsed), ptr)),
+                                .map(|parsed| self.alloc_expr_from_pat(Expr::Path(&parsed), ptr)),
                             // We only need to handle literal, ident (if bare) and path patterns here,
                             // as any other pattern as a range pattern operand is semantically invalid.
                             _ => None,
@@ -3367,7 +3415,6 @@ impl<'db> ExprCollector<'db> {
                 }
             }
         };
-        let ptr = AstPtr::new(&pat);
         self.alloc_pat(pattern, ptr)
     }
 
@@ -3405,21 +3452,22 @@ impl<'db> ExprCollector<'db> {
         args: AstChildren<ast::Pat>,
         has_leading_comma: bool,
         binding_list: &mut BindingList,
-    ) -> (Box<[PatId]>, Option<u32>) {
-        let args: Vec<_> = args.map(|p| self.collect_pat_possibly_rest(p, binding_list)).collect();
+    ) -> (PatList, Option<u32>) {
+        let args: SmallVec<[Either<PatId, ()>; 8]> =
+            args.map(|p| self.collect_pat_possibly_rest(p, binding_list)).collect();
         // Find the location of the `..`, if there is one. Note that we do not
         // consider the possibility of there being multiple `..` here.
         let ellipsis = args.iter().position(|p| p.is_right()).map(|it| it as u32);
 
         // We want to skip the `..` pattern here, since we account for it above.
-        let mut args: Vec<_> = args.into_iter().filter_map(Either::left).collect();
+        let mut args: PatList = args.into_iter().filter_map(Either::left).collect();
         // if there is a leading comma, the user is most likely to type out a leading pattern
         // so we insert a missing pattern at the beginning for IDE features
         if has_leading_comma {
             args.insert(0, self.missing_pat());
         }
 
-        (args.into_boxed_slice(), ellipsis)
+        (args, ellipsis)
     }
 
     // `collect_pat` rejects `ast::Pat::RestPat`, but it should be handled in some cases that
@@ -3469,8 +3517,8 @@ impl<'db> ExprCollector<'db> {
         match pat {
             ast::Pat::NotNull(_) => self.alloc_pat(Pat::NotNull, ptr),
             ast::Pat::OrPat(pat) => {
-                let pat = pat.pats().map(|pat| self.collect_ty_pat(pat)).collect();
-                self.alloc_pat(Pat::Or(pat), ptr)
+                let pats: PatList = pat.pats().map(|pat| self.collect_ty_pat(pat)).collect();
+                self.alloc_pat(Pat::Or(&pats), ptr)
             }
             ast::Pat::RangePat(range_pat) => {
                 let start = range_pat
@@ -3511,17 +3559,17 @@ impl<'db> ExprCollector<'db> {
         match &pat {
             ast::Pat::LiteralPat(it) => {
                 let Some((literal, _)) = pat_literal_to_hir(it) else { return self.missing_expr() };
-                self.alloc_expr_from_pat(Expr::Literal(literal), ptr)
+                self.alloc_expr_from_pat(Expr::Literal(&literal), ptr)
             }
             ast::Pat::PathPat(it) => {
                 let path = it
                     .path()
                     .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
-                self.alloc_expr_from_pat(path.map(Expr::Path).unwrap_or(Expr::Missing), ptr)
+                self.alloc_expr_from_pat(path.as_ref().map_or(Expr::Missing, Expr::Path), ptr)
             }
             ast::Pat::IdentPat(it) if it.is_simple_ident() => {
                 let name = it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
-                self.alloc_expr_from_pat(Expr::Path(name.into()), ptr)
+                self.alloc_expr_from_pat(Expr::Path(&Path::from(name)), ptr)
             }
             _ => self.missing_expr(), // FIXME: Emit an error.
         }
@@ -3532,9 +3580,8 @@ impl<'db> ExprCollector<'db> {
     /// This way the type system does not have to handle the lack of a start/end.
     fn lower_ty_pat_range_end(&mut self, lang_item: Option<ConstId>) -> ExprId {
         self.with_fresh_binding_expr_root(|this| {
-            this.alloc_expr_desugared(
-                this.lang_path(lang_item).map(Expr::Path).unwrap_or(Expr::Missing),
-            )
+            let path = this.lang_path(lang_item);
+            this.alloc_expr_desugared(path.as_ref().map_or(Expr::Missing, Expr::Path))
         })
     }
 
@@ -3543,13 +3590,10 @@ impl<'db> ExprCollector<'db> {
     fn lower_excluded_range_end(&mut self, pat: ast::Pat) -> ExprId {
         self.with_fresh_binding_expr_root(|this| {
             let excluded_end = this.lower_ty_pat_range_side(pat);
-            let range_sub_path =
-                this.lang_path(this.lang_items().RangeSub).map(Expr::Path).unwrap_or(Expr::Missing);
-            let range_sub_path = this.alloc_expr_desugared(range_sub_path);
-            this.alloc_expr_desugared(Expr::Call {
-                callee: range_sub_path,
-                args: Box::new([excluded_end]),
-            })
+            let range_sub_path = this.lang_path(this.lang_items().RangeSub);
+            let range_sub_path = this
+                .alloc_expr_desugared(range_sub_path.as_ref().map_or(Expr::Missing, Expr::Path));
+            this.alloc_expr_desugared(Expr::Call { callee: range_sub_path, args: &[excluded_end] })
         })
     }
 
@@ -3727,24 +3771,12 @@ impl<'db> ExprCollector<'db> {
         Some(Path::LangItem(lang?.into(), None))
     }
 
-    fn lang_path_expr(&self, lang: Option<impl Into<LangItemTarget>>) -> Expr {
-        self.lang_path(lang).map_or(Expr::Missing, Expr::Path)
-    }
-
     fn ty_rel_lang_path(
         &self,
         lang: Option<impl Into<LangItemTarget>>,
         relative_name: Symbol,
     ) -> Option<Path> {
         Some(Path::LangItem(lang?.into(), Some(Name::new_symbol_root(relative_name))))
-    }
-
-    fn ty_rel_lang_path_expr(
-        &self,
-        lang: Option<impl Into<LangItemTarget>>,
-        relative_name: Symbol,
-    ) -> Expr {
-        self.ty_rel_lang_path(lang, relative_name).map_or(Expr::Missing, Expr::Path)
     }
 }
 
@@ -3774,34 +3806,34 @@ impl<'db> ExprCollector<'db> {
         if let Some(inference_roots) = &mut self.store.inference_roots {
             inference_roots.push(ExprRoot {
                 root,
-                exprs_end: end(&self.store.exprs),
-                pats_end: end(&self.store.pats),
-                bindings_end: end(&self.store.bindings),
+                exprs_end: end(self.store.expr_count()),
+                pats_end: end(self.store.pat_count()),
+                bindings_end: end(self.store.bindings.len()),
             });
         }
 
         return root;
 
-        fn end<T>(arena: &la_arena::Arena<T>) -> la_arena::Idx<T> {
-            la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(arena.len() as u32))
+        fn end<T>(len: usize) -> la_arena::Idx<T> {
+            la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(len as u32))
         }
     }
 
-    fn alloc_expr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
+    fn alloc_expr(&mut self, expr: Expr<'_>, ptr: ExprPtr) -> ExprId {
         let src = self.expander.in_file(ptr);
-        let id = self.store.exprs.alloc(expr);
+        let id = self.store.alloc_expr(expr);
         self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
         self.store.expr_map.insert(src, id.into());
         id
     }
     // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed.
     // Migrate to alloc_expr_desugared_with_ptr and then rename back
-    fn alloc_expr_desugared(&mut self, expr: Expr) -> ExprId {
-        self.store.exprs.alloc(expr)
+    fn alloc_expr_desugared(&mut self, expr: Expr<'_>) -> ExprId {
+        self.store.alloc_expr(expr)
     }
-    fn alloc_expr_desugared_with_ptr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
+    fn alloc_expr_desugared_with_ptr(&mut self, expr: Expr<'_>, ptr: ExprPtr) -> ExprId {
         let src = self.expander.in_file(ptr);
-        let id = self.store.exprs.alloc(expr);
+        let id = self.store.alloc_expr(expr);
         self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
         // We intentionally don't fill this as it could overwrite a non-desugared entry
         // self.store.expr_map.insert(src, id);
@@ -3822,35 +3854,35 @@ impl<'db> ExprCollector<'db> {
         binding
     }
 
-    fn alloc_pat_from_expr(&mut self, pat: Pat, ptr: ExprPtr) -> PatId {
+    fn alloc_pat_from_expr(&mut self, pat: Pat<'_>, ptr: ExprPtr) -> PatId {
         let src = self.expander.in_file(ptr);
-        let id = self.store.pats.alloc(pat);
+        let id = self.store.alloc_pat(pat);
         self.store.expr_map.insert(src, id.into());
         self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_left));
         id
     }
 
-    fn alloc_expr_from_pat(&mut self, expr: Expr, ptr: PatPtr) -> ExprId {
+    fn alloc_expr_from_pat(&mut self, expr: Expr<'_>, ptr: PatPtr) -> ExprId {
         let src = self.expander.in_file(ptr);
-        let id = self.store.exprs.alloc(expr);
+        let id = self.store.alloc_expr(expr);
         self.store.pat_map.insert(src, id.into());
         self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_right));
         id
     }
 
-    fn alloc_pat(&mut self, pat: Pat, ptr: PatPtr) -> PatId {
+    fn alloc_pat(&mut self, pat: Pat<'_>, ptr: PatPtr) -> PatId {
         let src = self.expander.in_file(ptr);
-        let id = self.store.pats.alloc(pat);
+        let id = self.store.alloc_pat(pat);
         self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_right));
         self.store.pat_map.insert(src, id.into());
         id
     }
     // FIXME: desugared pats don't have ptr, that's wrong and should be fixed somehow.
-    fn alloc_pat_desugared(&mut self, pat: Pat) -> PatId {
-        self.store.pats.alloc(pat)
+    fn alloc_pat_desugared(&mut self, pat: Pat<'_>) -> PatId {
+        self.store.alloc_pat(pat)
     }
     fn missing_pat(&mut self) -> PatId {
-        self.store.pats.alloc(Pat::Missing)
+        self.store.alloc_pat(Pat::Missing)
     }
 
     fn alloc_label(&mut self, label: Label, ptr: AstPtr<ast::Label>) -> LabelId {

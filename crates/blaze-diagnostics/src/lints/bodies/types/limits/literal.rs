@@ -317,7 +317,7 @@ fn report_bin_hex_error(
 /// The cast `expr` is the operand of, if it is one's (rustc's `parent_hir_node` an
 /// `ExprKind::Cast`).
 fn parent_cast(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ExprId> {
-    b.exprs().iter().copied().find(|&it| matches!(&b.store()[it], Expr::Cast { expr: inner, .. } if *inner == expr))
+    b.exprs().iter().copied().find(|&it| matches!(b.store().expr(it), Expr::Cast { expr: inner, .. } if inner == expr))
 }
 
 /// rustc's `lint_overflowing_range_endpoint`: the end of an exclusive range (`0..256` of `u8`,
@@ -339,18 +339,18 @@ fn lint_overflowing_range_endpoint(
         },
         None => (lit.expr, lit.span.clone()),
     };
-    let range = b.exprs().iter().copied().find(|&it| match &b.store()[it] {
+    let range = b.exprs().iter().copied().find(|&it| match b.store().expr(it) {
         Expr::RecordLit { fields, .. } => fields.iter().any(|field| field.expr == id),
         _ => false,
     });
     let Some(range) = range else { return false };
-    let Expr::RecordLit { fields, .. } = &b.store()[range] else { return false };
+    let Expr::RecordLit { fields, .. } = b.store().expr(range) else { return false };
     let Some(node) = util::syntax(b, range) else { return false };
     if !ast::RangeExpr::can_cast(node.value.kind()) {
         return false;
     }
     let Some(range_span) = util::span(b, range) else { return false };
-    let [start, end] = &fields[..] else { return false };
+    let [start, end] = fields else { return false };
     if !(end.expr == id && value - 1 == max) {
         return false;
     }

@@ -31,6 +31,9 @@ mod tbd;
 mod tests;
 mod unwind;
 
+use std::cmp::Ordering;
+use std::sync::Mutex;
+
 use blaze_codegen::Arch;
 use object::macho;
 
@@ -68,7 +71,8 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
              which OS and SDK it is for, and dyld refuses an image without it",
         ));
     };
-    Ok(Box::new(MachO { output: output.clone(), cpu, subtype, page, platform }))
+    let cache = output.incremental.then(Mutex::default);
+    Ok(Box::new(MachO { output: output.clone(), cpu, subtype, page, platform, cache }))
 }
 
 struct MachO {
@@ -77,6 +81,10 @@ struct MachO {
     subtype: u32,
     page: u64,
     platform: Platform,
+    /// The last signature's pages, for an image linked again in place. Locked only by
+    /// [`Writer::file`], which the core calls once per link of the image, so never contended
+    /// and never held across a call out of the writer.
+    cache: Option<Mutex<sign::Cache>>,
 }
 
 /// The name the core knows a Mach-O symbol by: without its leading underscore, or with a
@@ -91,11 +99,32 @@ pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
 }
 
 /// The Mach-O name of a symbol the core names `name`.
+#[cfg(test)]
 pub(super) fn macho_name(name: &str) -> String {
+    let (prefix, rest) = spelled(name);
+    let mut out = String::with_capacity(prefix.len() + rest.len());
+    out.push_str(prefix);
+    out.push_str(rest);
+    out
+}
+
+/// [`macho_name`] in its two parts, built without allocating: the underscore it gains (or
+/// none), and the rest.
+fn spelled(name: &str) -> (&'static str, &str) {
     match name.strip_prefix('\x01') {
-        Some(rest) => rest.to_owned(),
-        None => format!("_{name}"),
+        Some(rest) => ("", rest),
+        None => ("_", name),
     }
+}
+
+/// Two core names in the order of their Mach-O names' bytes, as the symbol table and the
+/// trie sort them.
+fn macho_order(a: &str, b: &str) -> Ordering {
+    let ((a_prefix, a), (b_prefix, b)) = (spelled(a), spelled(b));
+    if a_prefix == b_prefix {
+        return a.as_bytes().cmp(b.as_bytes());
+    }
+    (a_prefix.bytes().chain(a.bytes())).cmp(b_prefix.bytes().chain(b.bytes()))
 }
 
 /// The class the C objects' `__compact_unwind` sections are placed in: relocated as data,
@@ -667,6 +696,11 @@ struct Symbols {
     undefined: u32,
     indirect: Vec<u8>,
     indirect_count: u32,
+    /// Each import's Mach-O name in `strings` (offset, length), by import.
+    import_names: Vec<(u32, u32)>,
+    /// What the export trie holds: the defined symbols in name order, each its name in
+    /// `strings`, its `EXPORT_SYMBOL_FLAGS_*` and its offset from the image's start.
+    exports: Vec<((u32, u32), u64, u64)>,
 }
 
 impl MachO {
@@ -887,32 +921,34 @@ impl MachO {
             })
             .collect();
         let rebase = linkedit::rebases(placed.rebase, &spans).map_err(error)?;
-        let mut binds = Vec::new();
+
+        // The symbol table first: its strings are the names the binds and the trie use.
+        let mut sections: Vec<&mut SectionOut> =
+            segments.iter_mut().flat_map(|it| it.sections.iter_mut()).collect();
+        let symbols = self.symbols(placed, &mut sections, &ordinals)?;
+        let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
+
+        let mut binds = Vec::with_capacity(placed.binds.len() + placed.got.len());
         for bind in placed.binds {
-            let ordinal = ordinal(bind.import)?;
-            let import = &placed.imports[bind.import as usize];
+            let import = placed.imports.get(bind.import as usize);
             binds.push(linkedit::Bind {
                 addr: bind.addr,
-                ordinal,
-                name: macho_name(&import.name).into_bytes(),
-                weak: import.weak,
+                ordinal: ordinal(bind.import)?,
+                name: name_at(symbols.import_names[bind.import as usize]),
+                weak: import.is_some_and(|it| it.weak),
                 addend: bind.addend,
             });
         }
         for cell in placed.got {
             match &cell.holds {
                 Holds::Local(_) => {}
-                &Holds::Import(import) => {
-                    let ordinal = ordinal(import)?;
-                    let import = &placed.imports[import as usize];
-                    binds.push(linkedit::Bind {
-                        addr: cell.addr,
-                        ordinal,
-                        name: macho_name(&import.name).into_bytes(),
-                        weak: import.weak,
-                        addend: 0,
-                    });
-                }
+                &Holds::Import(import) => binds.push(linkedit::Bind {
+                    addr: cell.addr,
+                    ordinal: ordinal(import)?,
+                    name: name_at(symbols.import_names[import as usize]),
+                    weak: placed.imports[import as usize].weak,
+                    addend: 0,
+                }),
                 other => {
                     return Err(error(format!(
                         "a GOT cell at {:#x} holding {other:?}, which is ELF's and not Mach-O's",
@@ -923,35 +959,21 @@ impl MachO {
         }
         let bind = linkedit::binds(&mut binds, &spans).map_err(error)?;
 
-        // What the image gives other images.
-        let mut exports = Vec::new();
-        if !shared {
-            exports.push((b"__mh_execute_header".to_vec(), 0, 0));
-        }
-        for export in placed.exports {
-            let flags = match export.kind {
-                crate::model::SymbolKind::Tls => {
-                    u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL)
-                }
-                _ => u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR),
-            };
-            let offset = export.addr.checked_sub(base).ok_or_else(|| {
-                error(format!("the export {} at {:#x} is before the image", export.name, export.addr))
-            })?;
-            exports.push((macho_name(&export.name).into_bytes(), flags, offset));
-        }
+        // What the image gives other images: what the symbol table defines, in its order.
+        let mut exports: Vec<(&[u8], u64, u64)> = (symbols.exports.iter())
+            .map(|&(name, flags, offset)| (name_at(name), flags, offset))
+            .collect();
         let trie = linkedit::trie(&mut exports).map_err(error)?;
 
         let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
         let function_starts = linkedit::function_starts(base, &starts);
 
-        let mut sections: Vec<&mut SectionOut> =
-            segments.iter_mut().flat_map(|it| it.sections.iter_mut()).collect();
-        let symbols = self.symbols(placed, &mut sections, &ordinals)?;
-
         // `__LINKEDIT`, laid out as ld64 does: the signature last, at 16 bytes.
         let linkedit_at = file_next;
-        let mut linkedit = Out::default();
+        let tables = [&rebase, &bind, &trie, &function_starts, &symbols.nlist, &symbols.indirect];
+        let mut linkedit = Out(Vec::with_capacity(
+            tables.iter().map(|it| it.len()).sum::<usize>() + symbols.strings.len() + 64,
+        ));
         let table = |bytes: &[u8], linkedit: &mut Out| -> Result<(u32, u32), LinkError> {
             if bytes.is_empty() {
                 return Ok((0, 0));
@@ -1144,36 +1166,55 @@ impl MachO {
         headers.u32(0);
         headers.0.extend_from_slice(&commands.0);
 
-        // The file as the loader reads it, for the hashes of its pages.
-        let mut file = vec![0u8; code_limit as usize];
-        file[..headers.0.len()].copy_from_slice(&headers.0);
+        // The file as the loader reads it, hashed where its bytes are.
+        let dwarf_at = segments.iter().find(|it| it.name == "__DWARF").map(|it| it.fileoff);
+        let mut pieces: Vec<(u64, &[u8])> = Vec::with_capacity(placed.regions.len() + 3);
+        pieces.push((0, &headers.0[..]));
         for (index, region) in placed.regions.iter().enumerate() {
             if let Some(at) = self.offset(placed, region) {
-                let bytes = placed.bytes(index);
-                file[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+                pieces.push((at, placed.bytes(index)));
             }
         }
-        let dwarf_at = segments.iter().find(|it| it.name == "__DWARF").map(|it| it.fileoff);
         if let Some(at) = dwarf_at {
-            file[at as usize..at as usize + dwarf.len()].copy_from_slice(&dwarf);
+            pieces.push((at, &dwarf[..]));
         }
-        file[linkedit_at as usize..].copy_from_slice(&linkedit.0);
+        pieces.push((linkedit_at, &linkedit.0[..]));
+        let file = sign::View::new(code_limit, pieces).map_err(error)?;
         let text = &segments[usize::from(!shared)];
-        let signature =
-            sign::signature(&file, identifier, text.fileoff, text.filesize, !shared);
+        let mut signature = Vec::with_capacity(signature_len as usize);
+        {
+            let mut cache = self.cache.as_ref().map(|it| match it.lock() {
+                Ok(cache) => cache,
+                // A panic while signing may have left a page without its hash: start over.
+                Err(poisoned) => {
+                    let mut cache = poisoned.into_inner();
+                    *cache = sign::Cache::default();
+                    cache
+                }
+            });
+            let (at, len) = (text.fileoff, text.filesize);
+            sign::signature(&file, identifier, at, len, !shared, cache.as_deref_mut(), &mut signature);
+        }
         if signature.len() as u64 != signature_len {
             return Err(error(format!(
                 "a code signature of {} bytes where {signature_len} were kept for it",
                 signature.len()
             )));
         }
-        linkedit.0.extend_from_slice(&signature);
 
-        let mut parts = vec![(0, headers.0)];
+        // The signature in pieces of a page of the file, so an incremental link, which
+        // changes few of its hashes, writes few of them.
+        let mut parts = Vec::with_capacity(3 + signature.len().div_ceil(sign::PAGE));
+        parts.push((0, headers.0));
         if let Some(at) = dwarf_at {
             parts.push((at, dwarf));
         }
         parts.push((linkedit_at, linkedit.0));
+        let mut at = code_limit;
+        for piece in signature.chunks(sign::PAGE) {
+            parts.push((at, piece.to_vec()));
+            at += piece.len() as u64;
+        }
         Ok(File { len: linkedit_at + linkedit_size, parts })
     }
 
@@ -1203,60 +1244,98 @@ impl MachO {
                 .ok_or_else(|| error(format!("the symbol {what} at {addr:#x} is in no section")))
         };
 
-        let mut strings = Out::default();
-        strings.0.extend_from_slice(b" \0");
-        let mut nlist = Out::default();
-        let mut entry = |name: &str, kind: u8, sect: u8, desc: u16, value: u64| {
-            nlist.u32(strings.0.len() as u32);
-            strings.0.extend_from_slice(name.as_bytes());
-            strings.u8(0);
-            nlist.u8(kind);
-            nlist.u8(sect);
-            nlist.u16(desc);
-            nlist.u64(value);
-        };
-
         let exported: rustc_hash::FxHashSet<&str> =
             placed.exports.iter().map(|it| it.name.as_str()).collect();
         let mut locals: Vec<(u64, &str)> = (placed.functions.iter())
             .filter_map(|it| Some((it.addr, it.name.as_deref()?)))
             .filter(|it| !exported.contains(it.1))
             .collect();
-        locals.sort_unstable();
-        for &(addr, name) in &locals {
-            entry(&macho_name(name), macho::N_SECT, section_at(addr, name)?, 0, addr);
+        if !locals.is_sorted() {
+            locals.sort_unstable();
         }
 
-        let mut defined: Vec<(String, u64, u16)> = (placed.exports.iter())
-            .map(|it| (macho_name(&it.name), it.addr, 0))
-            .collect();
+        // The defined: what the image exports and, in an executable, its header.
+        let mut defined: Vec<(&str, u64, u16, u64)> = Vec::with_capacity(placed.exports.len() + 1);
+        for export in placed.exports {
+            let flags = match export.kind {
+                crate::model::SymbolKind::Tls => {
+                    u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL)
+                }
+                _ => u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR),
+            };
+            if export.addr < base {
+                return Err(error(format!(
+                    "the export {} at {:#x} is before the image",
+                    export.name, export.addr
+                )));
+            }
+            defined.push((export.name.as_str(), export.addr, 0, flags));
+        }
         if !self.shared() {
-            defined.push(("__mh_execute_header".to_owned(), base, macho::REFERENCED_DYNAMICALLY));
+            let flags = u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
+            defined.push(("_mh_execute_header", base, macho::REFERENCED_DYNAMICALLY, flags));
         }
-        defined.sort_unstable();
-        for (name, addr, desc) in &defined {
-            let sect = section_at(*addr, name)?;
-            entry(name, macho::N_SECT | macho::N_EXT, sect, *desc, *addr);
-        }
+        defined.sort_unstable_by(|a, b| {
+            macho_order(a.0, b.0).then_with(|| (a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
+        });
 
-        let mut undefined: Vec<(String, u32)> = (placed.imports.iter().enumerate())
-            .map(|(nth, it)| (macho_name(&it.name), nth as u32))
-            .collect();
-        undefined.sort_unstable();
+        let mut undefined: Vec<(&str, u32)> =
+            (placed.imports.iter().enumerate()).map(|(nth, it)| (it.name.as_str(), nth as u32)).collect();
+        undefined.sort_unstable_by(|a, b| macho_order(a.0, b.0).then(a.1.cmp(&b.1)));
+
+        // Every name once, as Mach-O spells it: the binds and the trie take theirs from here.
+        let count = locals.len() + defined.len() + undefined.len();
+        let names = (locals.iter().map(|it| it.1))
+            .chain(defined.iter().map(|it| it.0))
+            .chain(undefined.iter().map(|it| it.0))
+            .map(|it| it.len() + 2)
+            .sum::<usize>();
+        let mut strings = Out(Vec::with_capacity(names + 16));
+        strings.0.extend_from_slice(b" \0");
+        let mut nlist = Out(Vec::with_capacity(count * NLIST));
+        let mut entry = |name: &str, kind: u8, sect: u8, desc: u16, value: u64| -> (u32, u32) {
+            let at = strings.0.len() as u32;
+            let (prefix, rest) = spelled(name);
+            nlist.u32(at);
+            strings.0.extend_from_slice(prefix.as_bytes());
+            strings.0.extend_from_slice(rest.as_bytes());
+            strings.u8(0);
+            nlist.u8(kind);
+            nlist.u8(sect);
+            nlist.u16(desc);
+            nlist.u64(value);
+            (at, (prefix.len() + rest.len()) as u32)
+        };
+
+        for &(addr, name) in &locals {
+            entry(name, macho::N_SECT, section_at(addr, name)?, 0, addr);
+        }
+        let mut exports = Vec::with_capacity(defined.len());
+        for &(name, addr, desc, flags) in &defined {
+            let sect = section_at(addr, name)?;
+            let at = entry(name, macho::N_SECT | macho::N_EXT, sect, desc, addr);
+            exports.push((at, flags, addr - base));
+        }
         let first_undefined = (locals.len() + defined.len()) as u32;
         let mut index_of = vec![0u32; placed.imports.len()];
-        for (nth, (name, index)) in undefined.iter().enumerate() {
-            let import = &placed.imports[*index as usize];
+        let mut import_names = vec![(0u32, 0u32); placed.imports.len()];
+        for (nth, &(name, index)) in undefined.iter().enumerate() {
+            let import = &placed.imports[index as usize];
             let library = match import.library {
                 Some(library) => ordinals[library as usize] as u16,
                 None => u16::from(macho::DYNAMIC_LOOKUP_ORDINAL),
             };
             let weak = if import.weak { macho::N_WEAK_REF } else { 0 };
-            entry(name, macho::N_UNDF | macho::N_EXT, 0, library << 8 | weak, 0);
-            index_of[*index as usize] = first_undefined + nth as u32;
+            import_names[index as usize] = entry(name, macho::N_UNDF | macho::N_EXT, 0, library << 8 | weak, 0);
+            index_of[index as usize] = first_undefined + nth as u32;
         }
         strings.align(8);
 
+        // The GOT's cells by address, walked alongside each `__got` section's cells.
+        let mut got: Vec<(u64, &Holds)> = placed.got.iter().map(|it| (it.addr, &it.holds)).collect();
+        if !got.is_sorted_by_key(|it| it.0) {
+            got.sort_unstable_by_key(|it| it.0);
+        }
         let mut indirect = Out::default();
         let mut indirect_count = 0u32;
         for section in sections.iter_mut() {
@@ -1270,10 +1349,15 @@ impl MachO {
                 )));
             }
             section.indirect = indirect_count;
+            indirect.0.reserve(section.size as usize / 2);
+            let mut next = got.partition_point(|it| it.0 < section.addr);
             for nth in 0..section.size / 8 {
                 let addr = section.addr + nth * 8;
-                let cell = placed.got.iter().find(|it| it.addr == addr);
-                indirect.u32(match cell.map(|it| &it.holds) {
+                while got.get(next).is_some_and(|it| it.0 < addr) {
+                    next += 1;
+                }
+                let cell = got.get(next).filter(|it| it.0 == addr).map(|it| it.1);
+                indirect.u32(match cell {
                     Some(&Holds::Import(import)) => index_of[import as usize],
                     Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL,
                     _ => macho::INDIRECT_SYMBOL_ABS,
@@ -1283,7 +1367,7 @@ impl MachO {
         }
 
         Ok(Symbols {
-            count: (locals.len() + defined.len() + undefined.len()) as u32,
+            count: count as u32,
             locals: locals.len() as u32,
             defined: defined.len() as u32,
             undefined: undefined.len() as u32,
@@ -1291,6 +1375,8 @@ impl MachO {
             strings: strings.0,
             indirect: indirect.0,
             indirect_count,
+            import_names,
+            exports,
         })
     }
 }

@@ -9,6 +9,8 @@
 //! The target's facts come from blaze's own table ([`target`]), never `rustc --print`
 //! (docs/no-rustc.md, step F).
 
+#![forbid(unsafe_code)]
+
 pub mod target;
 #[cfg(test)]
 mod tests;

@@ -23,10 +23,7 @@ use syntax::{
     ast::{self, AstNode, HasGenericArgs},
 };
 
-use crate::{
-    expr_store::path::{GenericArg, GenericArgs, Path},
-    type_ref::TypeRef,
-};
+use crate::expr_store::path::{GenericArg, GenericArgs, Path};
 
 #[cfg(test)]
 thread_local! {
@@ -40,13 +37,30 @@ thread_local! {
 // also needs an update.
 pub(super) fn lower_path(
     collector: &mut ExprCollector<'_>,
+    path: ast::Path,
+    impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+) -> Option<Path> {
+    let segments_base = collector.path_segments.len();
+    let args_base = collector.path_generic_args.len();
+    let lowered =
+        lower_path_on_stacks(collector, path, impl_trait_lower_fn, segments_base, args_base);
+    collector.path_segments.truncate(segments_base);
+    collector.path_generic_args.truncate(args_base);
+    lowered
+}
+
+/// `lower_path` with the segments (last first while walking up the qualifiers) and the
+/// segments' generic args on the collector's stacks above `s0` and `g0`. A path lowered inside
+/// this one (in a generic arg or a `<T as Trait>`) pushes and pops above them.
+fn lower_path_on_stacks(
+    collector: &mut ExprCollector<'_>,
     mut path: ast::Path,
     impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+    s0: usize,
+    g0: usize,
 ) -> Option<Path> {
     let mut kind = PathKind::Plain;
     let mut type_anchor = None;
-    let mut segments = Vec::new();
-    let mut generic_args = Vec::new();
     #[cfg(test)]
     let mut ast_segments = Vec::new();
     #[cfg(test)]
@@ -66,7 +80,7 @@ pub(super) fn lower_path(
 
     loop {
         let Some(segment) = path.segment() else {
-            segments.push(Name::missing());
+            collector.path_segments.push(Name::missing());
             // We can end up here if for `path::`
             match qualifier(&path) {
                 Some(it) => {
@@ -111,13 +125,18 @@ pub(super) fn lower_path(
                         segment.return_type_syntax().map(|_| GenericArgs::return_type_notation())
                     });
                 if args.is_some() {
-                    generic_args.resize(segments.len(), None);
-                    generic_args.push(args);
+                    let segments = collector.path_segments.len() - s0;
+                    collector.path_generic_args.resize(g0 + segments, None);
+                    collector.path_generic_args.push(args);
                 }
-                push_segment(&segment, &mut segments, name);
+                push_segment(&segment, &mut collector.path_segments, name);
             }
             ast::PathSegmentKind::SelfTypeKw => {
-                push_segment(&segment, &mut segments, Name::new_symbol_root(sym::Self_));
+                push_segment(
+                    &segment,
+                    &mut collector.path_segments,
+                    Name::new_symbol_root(sym::Self_),
+                );
             }
             ast::PathSegmentKind::Type { type_ref, trait_ref } => {
                 debug_assert!(path.qualifier().is_none()); // this can only occur at the first segment
@@ -138,32 +157,35 @@ pub(super) fn lower_path(
                         let path = collector.for_path_type_projection(|collector| {
                             collector.lower_path(trait_ref.path()?, impl_trait_lower_fn)
                         })?;
-                        // FIXME: Unnecessary clone
-                        collector.alloc_type_ref(
-                            TypeRef::Path(path.clone()),
-                            AstPtr::new(&trait_ref).upcast(),
-                        );
-                        let mod_path = path.mod_path()?;
-                        let path_generic_args = path.generic_args();
+                        let ptr = AstPtr::new(&trait_ref).upcast();
+                        let Some(mod_path) = path.mod_path() else {
+                            collector.alloc_path(path, ptr);
+                            return None;
+                        };
                         let num_segments = mod_path.segments().len();
                         kind = mod_path.kind;
 
-                        segments.extend(mod_path.segments().iter().cloned().rev());
+                        collector.path_segments.extend(mod_path.segments().iter().cloned().rev());
                         #[cfg(test)]
                         {
                             ast_segments_offset = mod_path.segments().len();
                         }
-                        if let Some(path_generic_args) = path_generic_args {
-                            generic_args.resize(segments.len() - num_segments, None);
-                            generic_args.extend(Vec::from(path_generic_args).into_iter().rev());
+                        let segments = collector.path_segments.len() - s0;
+                        if let Some(path_generic_args) = path.generic_args() {
+                            collector.path_generic_args.resize(g0 + segments - num_segments, None);
+                            collector
+                                .path_generic_args
+                                .extend(path_generic_args.iter().rev().cloned());
                         } else {
-                            generic_args.resize(segments.len(), None);
+                            collector.path_generic_args.resize(g0 + segments, None);
                         }
+                        collector.alloc_path(path, ptr);
 
                         let self_type = GenericArg::Type(self_type);
 
                         // Insert the type reference (T in the above example) as Self parameter for the trait
-                        let last_segment = generic_args.get_mut(segments.len() - num_segments)?;
+                        let last_segment =
+                            collector.path_generic_args.get_mut(g0 + segments - num_segments)?;
                         *last_segment = Some(match last_segment.take() {
                             Some(it) => GenericArgs {
                                 args: iter::once(self_type)
@@ -196,7 +218,7 @@ pub(super) fn lower_path(
                 }
                 // don't break out if `self` is the last segment of a path, this mean we got a
                 // use tree like `foo::{self}` which we want to resolve as `foo`
-                if !segments.is_empty() {
+                if collector.path_segments.len() > s0 {
                     kind = PathKind::SELF;
                     break;
                 }
@@ -211,13 +233,14 @@ pub(super) fn lower_path(
             None => break,
         };
     }
-    segments.reverse();
-    if !generic_args.is_empty() || type_anchor.is_some() {
-        generic_args.resize(segments.len(), None);
-        generic_args.reverse();
+    collector.path_segments[s0..].reverse();
+    let segment_count = collector.path_segments.len() - s0;
+    if collector.path_generic_args.len() > g0 || type_anchor.is_some() {
+        collector.path_generic_args.resize(g0 + segment_count, None);
+        collector.path_generic_args[g0..].reverse();
     }
 
-    if segments.is_empty() && kind == PathKind::Plain && type_anchor.is_none() {
+    if segment_count == 0 && kind == PathKind::Plain && type_anchor.is_none() {
         // plain empty paths don't exist, this means we got a single `self` segment as our path
         kind = PathKind::SELF;
     }
@@ -226,7 +249,7 @@ pub(super) fn lower_path(
     // Basically, even in rustc it is quite hacky:
     // https://github.com/rust-lang/rust/blob/614f273e9388ddd7804d5cbc80b8865068a3744e/src/librustc_resolve/macros.rs#L456
     // We follow what it did anyway :)
-    if segments.len() == 1
+    if segment_count == 1
         && kind == PathKind::Plain
         && let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast)
     {
@@ -249,14 +272,17 @@ pub(super) fn lower_path(
     }
 
     if let Some(last_segment_args @ Some(GenericArgs { has_self_type: true, .. })) =
-        generic_args.last_mut()
+        collector.path_generic_args[g0..].last_mut()
     {
         // Well-formed code cannot have `<T as Trait>` without an associated item after,
         // and this causes panics in hir-ty lowering.
         *last_segment_args = None;
     }
 
-    let mod_path = Interned::new(ModPath::from_segments(kind, segments));
+    let generic_args: Box<[Option<GenericArgs>]> =
+        collector.path_generic_args.drain(g0..).collect();
+    let mod_path =
+        Interned::new(ModPath::from_segments(kind, collector.path_segments.drain(s0..)));
 
     if let Some(old_lifetimes_constrained_by_input) = old_lifetimes_constrained_by_input {
         let type_alias_constrained_lifetimes = collector.get_constrained_lifetimes_if_type_alias(
@@ -283,26 +309,20 @@ pub(super) fn lower_path(
     if type_anchor.is_none() && generic_args.is_empty() {
         return Some(Path::BarePath(mod_path));
     } else {
-        return Some(Path::Normal(Box::new(NormalPath {
-            type_anchor,
-            mod_path,
-            generic_args: generic_args.into_boxed_slice(),
-        })));
+        return Some(Path::Normal(Box::new(NormalPath { type_anchor, mod_path, generic_args })));
     }
+}
 
-    fn qualifier(path: &ast::Path) -> Option<ast::Path> {
-        if let Some(q) = path.qualifier() {
-            return Some(q);
-        }
-        // FIXME: this bottom up traversal is not too precise.
-        // Should we handle do a top-down analysis, recording results?
-        let use_tree_list = path
-            .syntax()
-            .ancestor_where(ast::UseTreeList::can_cast)
-            .and_then(ast::UseTreeList::cast)?;
-        let use_tree = use_tree_list.parent_use_tree();
-        use_tree.path()
+fn qualifier(path: &ast::Path) -> Option<ast::Path> {
+    if let Some(q) = path.qualifier() {
+        return Some(q);
     }
+    // FIXME: this bottom up traversal is not too precise.
+    // Should we handle do a top-down analysis, recording results?
+    let use_tree_list =
+        path.syntax().ancestor_where(ast::UseTreeList::can_cast).and_then(ast::UseTreeList::cast)?;
+    let use_tree = use_tree_list.parent_use_tree();
+    use_tree.path()
 }
 
 /// This function finds the AST segment that corresponds to the HIR segment

@@ -167,7 +167,6 @@ fn main() {
             "WillCheckCancellation",
             "WillCheckCancellation",
             "DidFinalizeCycle { database_key: cost_to_start(Id(83)), iteration: 1 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: create_graph(Id(0)) }",
             "WillDiscardStaleOutput { execute_key: create_graph(Id(0)), output_key: Node(Id(83)) }",
@@ -289,7 +288,6 @@ fn test_cycle_with_fixpoint_structs() {
     // We should see the third struct (iter_2) being discarded.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: create_tracked_in_cycle(Id(0)) }",
             "WillCheckCancellation",

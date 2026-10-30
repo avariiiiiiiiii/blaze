@@ -105,7 +105,7 @@ impl Visitor<'_, '_, '_> {
         if self.is_op(b.source_map.expr_syntax(expr).ok()) || is_unsafe_call(b, expr) {
             self.requires_unsafe();
         }
-        match &store[expr] {
+        match store.expr(expr) {
             Expr::Block { unsafe_: Unsafe::Yes, .. } => {
                 let context = match Block::is_explicit(b, expr) {
                     true => Context::Block { block: expr, used: false, nested_used: Vec::new() },
@@ -141,18 +141,18 @@ impl Visitor<'_, '_, '_> {
     fn children(&mut self, expr: ExprId) {
         let store = self.b.store();
         let mut pats = Vec::new();
-        match &store[expr] {
+        match store.expr(expr) {
             Expr::Block { statements, .. } => {
-                for statement in statements.iter() {
+                for statement in statements {
                     if let Statement::Let { pat, .. } = statement {
                         pats.push(*pat);
                     }
                 }
             }
             Expr::Match { arms, .. } => pats.extend(arms.iter().map(|it| it.pat)),
-            Expr::Let { pat, .. } => pats.push(*pat),
+            Expr::Let { pat, .. } => pats.push(pat),
             Expr::Closure { args, .. } => pats.extend(args.iter().copied()),
-            Expr::Assignment { target, .. } => pats.push(*target),
+            Expr::Assignment { target, .. } => pats.push(target),
             _ => {}
         }
         for pat in pats {
@@ -170,14 +170,14 @@ impl Visitor<'_, '_, '_> {
         if self.is_op(b.source_map.pat_syntax(pat).ok()) {
             self.requires_unsafe();
         }
-        match &b.store()[pat] {
-            Pat::Expr(expr) | Pat::Lit(expr) => self.expr(*expr),
+        match b.store().pat(pat) {
+            Pat::Expr(expr) | Pat::Lit(expr) => self.expr(expr),
             Pat::Range { start, end, .. } => {
                 if let Some(it) = start {
-                    self.expr(*it);
+                    self.expr(it);
                 }
                 if let Some(it) = end {
-                    self.expr(*it);
+                    self.expr(it);
                 }
             }
             _ => {
@@ -202,8 +202,8 @@ fn operations(b: &BodyCx<'_, '_>) -> FxHashSet<ExprOrPatSource> {
 /// uses the block it is in all the same.
 fn is_unsafe_call(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
     let db = b.db();
-    let callee = match &b.store()[expr] {
-        Expr::Call { callee, .. } => match b.infer.expr_ty(*callee).kind() {
+    let callee = match b.store().expr(expr) {
+        Expr::Call { callee, .. } => match b.infer.expr_ty(callee).kind() {
             TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(it)), _) => it,
             _ => return false,
         },

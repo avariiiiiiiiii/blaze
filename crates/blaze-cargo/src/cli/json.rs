@@ -1,222 +1,250 @@
 //! cargo's JSON messages (`util/machine_message.rs`) and the rustc diagnostic each
 //! `compiler-message` carries (`rustc_errors/src/json.rs`), byte for byte: fields in the order
 //! cargo and rustc write them, `null` where they write `null`, strings escaped as serde_json
-//! escapes them. Built as an ordered tree, never through a map whose order a feature of
-//! serde_json could change.
+//! escapes them. Each message is written straight into the caller's buffer, which it reuses:
+//! no tree, no copy of a field, no allocation per message once the buffer has grown.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use blaze_api::{Artifact, BuildScriptRan, Diagnostic, Level, Span, UnitOf, UnitTarget};
+use rustc_hash::FxHashMap;
 
-use super::say;
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// A JSON value with its object fields in the order they are written.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum J {
-    Null,
-    Bool(bool),
-    Num(u64),
-    Str(String),
-    Arr(Vec<J>),
-    Obj(Vec<(&'static str, J)>),
+/// serde_json's escape table: 0 for a byte written as it is, else the letter after the `\`
+/// (`u` for `\u00XX`). ESC is among the escaped, which is where cargo's stripping of colors
+/// joins the escape.
+const ESCAPE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut byte = 0;
+    while byte < 0x20 {
+        table[byte] = b'u';
+        byte += 1;
+    }
+    table[0x08] = b'b';
+    table[0x09] = b't';
+    table[0x0a] = b'n';
+    table[0x0c] = b'f';
+    table[0x0d] = b'r';
+    table[b'"' as usize] = b'"';
+    table[b'\\' as usize] = b'\\';
+    table
+};
+
+/// `text` as serde_json writes a string: runs of bytes that need no escape are copied whole.
+pub fn quote(out: &mut String, text: &str) {
+    quote_with(out, text, false);
 }
 
-impl J {
-    pub fn str(text: &str) -> J {
-        J::Str(text.to_owned())
-    }
-
-    fn strs(texts: &[String]) -> J {
-        J::Arr(texts.iter().map(|it| J::str(it)).collect())
-    }
-
-    fn opt(text: Option<&str>) -> J {
-        text.map_or(J::Null, J::str)
-    }
-
-    /// As one line, without a newline.
-    pub fn line(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out);
-        out
-    }
-
-    fn write(&self, out: &mut String) {
-        match self {
-            J::Null => out.push_str("null"),
-            J::Bool(it) => out.push_str(if *it { "true" } else { "false" }),
-            J::Num(it) => out.push_str(&it.to_string()),
-            J::Str(it) => quote(it, out),
-            J::Arr(items) => {
-                out.push('[');
-                for (at, item) in items.iter().enumerate() {
-                    if at > 0 {
-                        out.push(',');
-                    }
-                    item.write(out);
-                }
-                out.push(']');
-            }
-            J::Obj(fields) => {
-                out.push('{');
-                for (at, (key, value)) in fields.iter().enumerate() {
-                    if at > 0 {
-                        out.push(',');
-                    }
-                    quote(key, out);
-                    out.push(':');
-                    value.write(out);
-                }
-                out.push('}');
-            }
-        }
-    }
-
-    /// Every object's fields sorted by key, as a `serde_json::Value` without
-    /// `preserve_order` holds them.
-    fn sorted(self) -> J {
-        match self {
-            J::Arr(items) => J::Arr(items.into_iter().map(J::sorted).collect()),
-            J::Obj(fields) => {
-                let mut fields: Vec<(&'static str, J)> =
-                    fields.into_iter().map(|(key, value)| (key, value.sorted())).collect();
-                fields.sort_by(|a, b| a.0.cmp(b.0));
-                J::Obj(fields)
-            }
-            other => other,
-        }
-    }
-}
-
-/// `text` as serde_json writes a string.
-fn quote(text: &str, out: &mut String) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+/// [`quote`], with the escapes that color a terminal taken out when `strip`, as
+/// `anstream::adapter::strip_str` takes them out ([`super::say::strip_ansi`]): CSI sequences to
+/// their final byte, OSC sequences to BEL or ST, any other escape with the character after it.
+fn quote_with(out: &mut String, text: &str, strip: bool) {
+    let bytes = text.as_bytes();
+    out.reserve(bytes.len() + 2);
     out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let byte = c as u8;
-                out.push_str("\\u00");
-                out.push(HEX[usize::from(byte >> 4)] as char);
-                out.push(HEX[usize::from(byte & 0xf)] as char);
-            }
-            c => out.push(c),
+    let (mut run, mut at) = (0, 0);
+    while at < bytes.len() {
+        let escape = ESCAPE[usize::from(bytes[at])];
+        if escape == 0 {
+            at += 1;
+            continue;
         }
+        out.push_str(&text[run..at]);
+        if strip && bytes[at] == 0x1b {
+            at = after_escape(text, at);
+        } else {
+            match escape {
+                b'u' => {
+                    out.push_str("\\u00");
+                    out.push(char::from(HEX[usize::from(bytes[at] >> 4)]));
+                    out.push(char::from(HEX[usize::from(bytes[at] & 0xf)]));
+                }
+                letter => {
+                    out.push('\\');
+                    out.push(char::from(letter));
+                }
+            }
+            at += 1;
+        }
+        run = at;
     }
+    out.push_str(&text[run..]);
     out.push('"');
 }
 
-/// cargo's `Message::to_json_string`: the reason first, then the message's fields.
-fn message(reason: &str, mut fields: Vec<(&'static str, J)>) -> String {
-    fields.insert(0, ("reason", J::str(reason)));
-    J::Obj(fields).line()
+/// Where the terminal escape at `at` ends; always on a character boundary, since every byte
+/// that ends one is ASCII.
+fn after_escape(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    match bytes.get(at + 1) {
+        Some(b'[') => bytes[at + 2..]
+            .iter()
+            .position(|it| (0x40..=0x7e).contains(it))
+            .map_or(bytes.len(), |end| at + 2 + end + 1),
+        Some(b']') => {
+            let mut next = at + 2;
+            while next < bytes.len() {
+                match bytes[next] {
+                    0x07 => return next + 1,
+                    0x1b if bytes.get(next + 1) == Some(&b'\\') => return next + 2,
+                    _ => next += 1,
+                }
+            }
+            bytes.len()
+        }
+        Some(_) => at + 1 + text[at + 1..].chars().next().map_or(0, char::len_utf8),
+        None => bytes.len(),
+    }
+}
+
+fn num(out: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend(digits[at..].iter().map(|&it| char::from(it)));
+}
+
+fn boolean(out: &mut String, value: bool) {
+    out.push_str(if value { "true" } else { "false" });
+}
+
+fn opt(out: &mut String, text: Option<&str>) {
+    match text {
+        Some(text) => quote(out, text),
+        None => out.push_str("null"),
+    }
+}
+
+fn strs(out: &mut String, texts: &[String]) {
+    out.push('[');
+    for (at, text) in texts.iter().enumerate() {
+        if at > 0 {
+            out.push(',');
+        }
+        quote(out, text);
+    }
+    out.push(']');
 }
 
 /// A target as cargo's `SerializedTarget` writes it. `required-features` is written only for a
 /// target that has some, which [`UnitTarget`] does not say.
-pub fn target(target: &UnitTarget) -> J {
-    J::Obj(vec![
-        ("kind", J::strs(&target.kind)),
-        ("crate_types", J::strs(&target.crate_types)),
-        ("name", J::str(&target.name)),
-        ("src_path", J::str(&target.src_path)),
-        ("edition", J::str(&target.edition)),
-        ("doc", J::Bool(target.doc)),
-        ("doctest", J::Bool(target.doctest)),
-        ("test", J::Bool(target.test)),
-    ])
+pub fn target(out: &mut String, target: &UnitTarget) {
+    out.push_str(r#"{"kind":"#);
+    strs(out, &target.kind);
+    out.push_str(r#","crate_types":"#);
+    strs(out, &target.crate_types);
+    out.push_str(r#","name":"#);
+    quote(out, &target.name);
+    out.push_str(r#","src_path":"#);
+    quote(out, &target.src_path);
+    out.push_str(r#","edition":"#);
+    quote(out, &target.edition);
+    out.push_str(r#","doc":"#);
+    boolean(out, target.doc);
+    out.push_str(r#","doctest":"#);
+    boolean(out, target.doctest);
+    out.push_str(r#","test":"#);
+    boolean(out, target.test);
+    out.push('}');
 }
 
-/// `compiler-artifact`.
-pub fn artifact(artifact: &Artifact) -> String {
+/// `compiler-artifact`, without its newline.
+pub fn artifact(out: &mut String, artifact: &Artifact) {
     let profile = &artifact.profile;
-    message("compiler-artifact", vec![
-        ("package_id", J::str(&artifact.package)),
-        ("manifest_path", J::str(&artifact.manifest_path)),
-        ("target", target(&artifact.target)),
-        (
-            "profile",
-            J::Obj(vec![
-                ("opt_level", J::str(&profile.opt_level)),
-                ("debuginfo", J::Num(u64::from(profile.debuginfo))),
-                ("debug_assertions", J::Bool(profile.debug_assertions)),
-                ("overflow_checks", J::Bool(profile.overflow_checks)),
-                ("test", J::Bool(profile.test)),
-            ]),
-        ),
-        ("features", J::strs(&artifact.features)),
-        ("filenames", J::strs(&artifact.filenames)),
-        ("executable", J::opt(artifact.executable.as_deref())),
-        ("fresh", J::Bool(artifact.fresh)),
-    ])
+    out.push_str(r#"{"reason":"compiler-artifact","package_id":"#);
+    quote(out, &artifact.package);
+    out.push_str(r#","manifest_path":"#);
+    quote(out, &artifact.manifest_path);
+    out.push_str(r#","target":"#);
+    target(out, &artifact.target);
+    out.push_str(r#","profile":{"opt_level":"#);
+    quote(out, &profile.opt_level);
+    out.push_str(r#","debuginfo":"#);
+    num(out, u64::from(profile.debuginfo));
+    out.push_str(r#","debug_assertions":"#);
+    boolean(out, profile.debug_assertions);
+    out.push_str(r#","overflow_checks":"#);
+    boolean(out, profile.overflow_checks);
+    out.push_str(r#","test":"#);
+    boolean(out, profile.test);
+    out.push_str(r#"},"features":"#);
+    strs(out, &artifact.features);
+    out.push_str(r#","filenames":"#);
+    strs(out, &artifact.filenames);
+    out.push_str(r#","executable":"#);
+    opt(out, artifact.executable.as_deref());
+    out.push_str(r#","fresh":"#);
+    boolean(out, artifact.fresh);
+    out.push('}');
 }
 
-/// `build-script-executed`.
-pub fn build_script(ran: &BuildScriptRan) -> String {
-    let env = ran.env.iter().map(|(name, value)| J::Arr(vec![J::str(name), J::str(value)]));
-    message("build-script-executed", vec![
-        ("package_id", J::str(&ran.package_id)),
-        ("linked_libs", J::strs(&ran.linked_libs)),
-        ("linked_paths", J::strs(&ran.linked_paths)),
-        ("cfgs", J::strs(&ran.cfgs)),
-        ("env", J::Arr(env.collect())),
-        ("out_dir", J::str(&ran.out_dir)),
-    ])
-}
-
-/// `build-finished`.
-pub fn build_finished(success: bool) -> String {
-    message("build-finished", vec![("success", J::Bool(success))])
-}
-
-/// `compiler-message` of `unit`. With `ansi` (`json-diagnostic-rendered-ansi`) rustc's message
-/// passes as rustc wrote it; without, cargo takes the colors out of `rendered` and writes the
-/// message again: `rendered` first, then every other field sorted, at every depth.
-pub fn compiler_message(unit: &UnitOf, diagnostic: &Diagnostic, ansi: bool, sources: &mut Sources) -> String {
-    let rustc = rustc_diagnostic(diagnostic, true, sources, Path::new(&unit.manifest_path));
-    let message = match ansi {
-        true => rustc,
-        false => recolored(rustc),
-    };
-    message_of(unit, message)
-}
-
-fn message_of(unit: &UnitOf, message: J) -> String {
-    message("compiler-message", vec![
-        ("package_id", J::str(&unit.package_id)),
-        ("manifest_path", J::str(&unit.manifest_path)),
-        ("target", target(&unit.target)),
-        ("message", message),
-    ])
-}
-
-/// cargo's `CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap<_, Value> }`.
-fn recolored(rustc: J) -> J {
-    let J::Obj(fields) = rustc else { return rustc };
-    let mut rendered = J::Null;
-    let mut other = Vec::with_capacity(fields.len());
-    for (key, value) in fields {
-        match (key, value) {
-            ("rendered", J::Str(text)) => rendered = J::Str(say::strip_ansi(&text)),
-            ("rendered", value) => rendered = value,
-            (key, value) => other.push((key, value)),
+/// `build-script-executed`, without its newline.
+pub fn build_script(out: &mut String, ran: &BuildScriptRan) {
+    out.push_str(r#"{"reason":"build-script-executed","package_id":"#);
+    quote(out, &ran.package_id);
+    out.push_str(r#","linked_libs":"#);
+    strs(out, &ran.linked_libs);
+    out.push_str(r#","linked_paths":"#);
+    strs(out, &ran.linked_paths);
+    out.push_str(r#","cfgs":"#);
+    strs(out, &ran.cfgs);
+    out.push_str(r#","env":["#);
+    for (at, (name, value)) in ran.env.iter().enumerate() {
+        if at > 0 {
+            out.push(',');
         }
+        out.push('[');
+        quote(out, name);
+        out.push(',');
+        quote(out, value);
+        out.push(']');
     }
-    let mut fields: Vec<(&'static str, J)> =
-        other.into_iter().map(|(key, value)| (key, value.sorted())).collect();
-    fields.sort_by(|a, b| a.0.cmp(b.0));
-    fields.insert(0, ("rendered", rendered));
-    J::Obj(fields)
+    out.push_str(r#"],"out_dir":"#);
+    quote(out, &ran.out_dir);
+    out.push('}');
+}
+
+/// `build-finished`, without its newline.
+pub fn build_finished(out: &mut String, success: bool) {
+    out.push_str(r#"{"reason":"build-finished","success":"#);
+    boolean(out, success);
+    out.push('}');
+}
+
+/// `compiler-message` of `unit`, without its newline. With `ansi`
+/// (`json-diagnostic-rendered-ansi`) rustc's message passes as rustc wrote it; without, cargo
+/// takes the colors out of `rendered` and writes the message again through a
+/// `serde_json::Value` (`CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap }`):
+/// `rendered` first, then every other field sorted by key, at every depth.
+pub fn compiler_message(out: &mut String, unit: &UnitOf, diagnostic: &Diagnostic, ansi: bool, sources: &mut Sources) {
+    let dir = unit.manifest_path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
+    out.push_str(r#"{"reason":"compiler-message","package_id":"#);
+    quote(out, &unit.package_id);
+    out.push_str(r#","manifest_path":"#);
+    quote(out, &unit.manifest_path);
+    out.push_str(r#","target":"#);
+    target(out, &unit.target);
+    out.push_str(r#","message":"#);
+    let order = if ansi { Order::Rustc } else { Order::Sorted };
+    diagnostic_json(out, diagnostic, true, order, sources, dir);
+    out.push('}');
+}
+
+/// The field order a diagnostic is written in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// rustc's, as its `Serialize` impls declare the fields.
+    Rustc,
+    /// serde_json's `Map` without `preserve_order`: by key.
+    Sorted,
 }
 
 fn level(level: Level) -> &'static str {
@@ -229,112 +257,284 @@ fn level(level: Level) -> &'static str {
     }
 }
 
-/// rustc's `Diagnostic`: `$message_type` on the outermost only, `rendered` `null` on children.
-fn rustc_diagnostic(diagnostic: &Diagnostic, outermost: bool, sources: &mut Sources, manifest: &Path) -> J {
-    let mut fields = Vec::with_capacity(7);
-    if outermost {
-        fields.push(("$message_type", J::str("diagnostic")));
+fn code(out: &mut String, code: Option<&str>) {
+    match code {
+        Some(code) => {
+            out.push_str(r#"{"code":"#);
+            quote(out, code);
+            out.push_str(r#","explanation":null}"#);
+        }
+        None => out.push_str("null"),
     }
-    fields.push(("message", J::str(&diagnostic.message)));
-    let code = diagnostic
-        .code
-        .as_deref()
-        .map_or(J::Null, |code| J::Obj(vec![("code", J::str(code)), ("explanation", J::Null)]));
-    fields.push(("code", code));
-    fields.push(("level", J::str(level(diagnostic.level))));
-    let spans = diagnostic.spans.iter().map(|span| rustc_span(span, sources, manifest));
-    fields.push(("spans", J::Arr(spans.collect())));
-    let children = diagnostic.children.iter().map(|it| rustc_diagnostic(it, false, sources, manifest));
-    fields.push(("children", J::Arr(children.collect())));
-    let rendered = match outermost {
-        true => J::str(&diagnostic.rendered),
-        false => J::Null,
+}
+
+/// rustc's `Diagnostic`: `$message_type` on the outermost only, `rendered` `null` on children.
+fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, order: Order, sources: &mut Sources, dir: &str) {
+    let spans = |out: &mut String, sources: &mut Sources| {
+        out.push('[');
+        for (at, span) in diagnostic.spans.iter().enumerate() {
+            if at > 0 {
+                out.push(',');
+            }
+            span_json(out, span, order, sources, dir);
+        }
+        out.push(']');
     };
-    fields.push(("rendered", rendered));
-    J::Obj(fields)
+    let children = |out: &mut String, sources: &mut Sources| {
+        out.push('[');
+        for (at, child) in diagnostic.children.iter().enumerate() {
+            if at > 0 {
+                out.push(',');
+            }
+            diagnostic_json(out, child, false, order, sources, dir);
+        }
+        out.push(']');
+    };
+    match (order, outermost) {
+        (Order::Rustc, _) => {
+            out.push('{');
+            if outermost {
+                out.push_str(r#""$message_type":"diagnostic","#);
+            }
+            out.push_str(r#""message":"#);
+            quote(out, &diagnostic.message);
+            out.push_str(r#","code":"#);
+            code(out, diagnostic.code.as_deref());
+            out.push_str(r#","level":""#);
+            out.push_str(level(diagnostic.level));
+            out.push_str(r#"","spans":"#);
+            spans(out, sources);
+            out.push_str(r#","children":"#);
+            children(out, sources);
+            out.push_str(r#","rendered":"#);
+            match outermost {
+                true => quote(out, &diagnostic.rendered),
+                false => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        (Order::Sorted, true) => {
+            out.push_str(r#"{"rendered":"#);
+            quote_with(out, &diagnostic.rendered, true);
+            out.push_str(r#","$message_type":"diagnostic","children":"#);
+            children(out, sources);
+            out.push_str(r#","code":"#);
+            code(out, diagnostic.code.as_deref());
+            out.push_str(r#","level":""#);
+            out.push_str(level(diagnostic.level));
+            out.push_str(r#"","message":"#);
+            quote(out, &diagnostic.message);
+            out.push_str(r#","spans":"#);
+            spans(out, sources);
+            out.push('}');
+        }
+        (Order::Sorted, false) => {
+            out.push_str(r#"{"children":"#);
+            children(out, sources);
+            out.push_str(r#","code":"#);
+            code(out, diagnostic.code.as_deref());
+            out.push_str(r#","level":""#);
+            out.push_str(level(diagnostic.level));
+            out.push_str(r#"","message":"#);
+            quote(out, &diagnostic.message);
+            out.push_str(r#","rendered":null,"spans":"#);
+            spans(out, sources);
+            out.push('}');
+        }
+    }
 }
 
 /// rustc's `DiagnosticSpan`. `expansion` is `null`: [`Span`] carries no macro backtrace.
-fn rustc_span(span: &Span, sources: &mut Sources, manifest: &Path) -> J {
-    let text = sources.lines(&span.file, manifest).map_or_else(Vec::new, |lines| span_text(span, lines));
-    J::Obj(vec![
-        ("file_name", J::str(&span.file)),
-        ("byte_start", J::Num(u64::from(span.byte_start))),
-        ("byte_end", J::Num(u64::from(span.byte_end))),
-        ("line_start", J::Num(u64::from(span.line))),
-        ("line_end", J::Num(u64::from(span.end_line))),
-        ("column_start", J::Num(u64::from(span.column))),
-        ("column_end", J::Num(u64::from(span.end_column))),
-        ("is_primary", J::Bool(span.primary)),
-        ("text", J::Arr(text)),
-        ("label", J::opt(span.label.as_deref())),
-        ("suggested_replacement", J::opt(span.replacement.as_deref())),
-        ("suggestion_applicability", J::opt(span.applicability.as_deref())),
-        ("expansion", J::Null),
-    ])
+fn span_json(out: &mut String, span: &Span, order: Order, sources: &mut Sources, dir: &str) {
+    let file = sources.file(&span.file, dir);
+    match order {
+        Order::Rustc => {
+            out.push_str(r#"{"file_name":"#);
+            quote(out, &span.file);
+            out.push_str(r#","byte_start":"#);
+            num(out, u64::from(span.byte_start));
+            out.push_str(r#","byte_end":"#);
+            num(out, u64::from(span.byte_end));
+            out.push_str(r#","line_start":"#);
+            num(out, u64::from(span.line));
+            out.push_str(r#","line_end":"#);
+            num(out, u64::from(span.end_line));
+            out.push_str(r#","column_start":"#);
+            num(out, u64::from(span.column));
+            out.push_str(r#","column_end":"#);
+            num(out, u64::from(span.end_column));
+            out.push_str(r#","is_primary":"#);
+            boolean(out, span.primary);
+            out.push_str(r#","text":"#);
+            span_text(out, span, order, sources, file);
+            out.push_str(r#","label":"#);
+            opt(out, span.label.as_deref());
+            out.push_str(r#","suggested_replacement":"#);
+            opt(out, span.replacement.as_deref());
+            out.push_str(r#","suggestion_applicability":"#);
+            opt(out, span.applicability.as_deref());
+            out.push_str(r#","expansion":null}"#);
+        }
+        Order::Sorted => {
+            out.push_str(r#"{"byte_end":"#);
+            num(out, u64::from(span.byte_end));
+            out.push_str(r#","byte_start":"#);
+            num(out, u64::from(span.byte_start));
+            out.push_str(r#","column_end":"#);
+            num(out, u64::from(span.end_column));
+            out.push_str(r#","column_start":"#);
+            num(out, u64::from(span.column));
+            out.push_str(r#","expansion":null,"file_name":"#);
+            quote(out, &span.file);
+            out.push_str(r#","is_primary":"#);
+            boolean(out, span.primary);
+            out.push_str(r#","label":"#);
+            opt(out, span.label.as_deref());
+            out.push_str(r#","line_end":"#);
+            num(out, u64::from(span.end_line));
+            out.push_str(r#","line_start":"#);
+            num(out, u64::from(span.line));
+            out.push_str(r#","suggested_replacement":"#);
+            opt(out, span.replacement.as_deref());
+            out.push_str(r#","suggestion_applicability":"#);
+            opt(out, span.applicability.as_deref());
+            out.push_str(r#","text":"#);
+            span_text(out, span, order, sources, file);
+            out.push('}');
+        }
+    }
 }
 
 /// rustc's `DiagnosticSpanLine`s of `span` (`SourceMap::span_to_lines`): each line it covers,
 /// highlighted from its start column on the first and to its end column on the last, in
-/// 1-based columns of characters. None when the span is outside the file as it is on disk.
-fn span_text(span: &Span, lines: &[String]) -> Vec<J> {
+/// 1-based columns of characters. `[]` when the span is outside the file as it is on disk.
+fn span_text(out: &mut String, span: &Span, order: Order, sources: &Sources, file: Option<u32>) {
     let (first, last) = (span.line as usize, span.end_line as usize);
-    if first == 0 || last < first || last > lines.len() {
-        return Vec::new();
-    }
-    (first..=last)
-        .map(|number| {
-            let text = &lines[number - 1];
+    let lines = file.map_or(0, |file| sources.line_count(file));
+    out.push('[');
+    if let Some(file) = file
+        && first != 0
+        && last >= first
+        && last <= lines
+    {
+        for number in first..=last {
+            let text = sources.line(file, number);
             let start = if number == first { u64::from(span.column) } else { 1 };
             let end = match number == last {
                 true => u64::from(span.end_column),
                 false => text.chars().count() as u64 + 1,
             };
-            J::Obj(vec![
-                ("text", J::str(text)),
-                ("highlight_start", J::Num(start)),
-                ("highlight_end", J::Num(end)),
-            ])
-        })
-        .collect()
+            if number > first {
+                out.push(',');
+            }
+            match order {
+                Order::Rustc => {
+                    out.push_str(r#"{"text":"#);
+                    quote(out, text);
+                    out.push_str(r#","highlight_start":"#);
+                    num(out, start);
+                    out.push_str(r#","highlight_end":"#);
+                    num(out, end);
+                }
+                Order::Sorted => {
+                    out.push_str(r#"{"highlight_end":"#);
+                    num(out, end);
+                    out.push_str(r#","highlight_start":"#);
+                    num(out, start);
+                    out.push_str(r#","text":"#);
+                    quote(out, text);
+                }
+            }
+            out.push('}');
+        }
+    }
+    out.push(']');
+}
+
+/// One source file as on disk, read once: its text and where each line starts. Lines as rustc
+/// keeps them: no BOM, no `\r` before a newline. 4 bytes per line beside the text.
+struct Source {
+    text: String,
+    /// The byte offset of each line's start; as many as `split('\n')` has lines.
+    starts: Vec<u32>,
+}
+
+impl Source {
+    fn new(bytes: Vec<u8>) -> Source {
+        let text = String::from_utf8(bytes).unwrap_or_else(|it| String::from_utf8_lossy(it.as_bytes()).into_owned());
+        let begin = if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+        let mut starts = Vec::with_capacity(text.len() / 32 + 1);
+        starts.push(begin as u32);
+        starts.extend(text[begin..].match_indices('\n').map(|(at, _)| (begin + at + 1) as u32));
+        Source { text, starts }
+    }
+
+    fn line(&self, number: usize) -> &str {
+        let start = self.starts[number - 1] as usize;
+        let end = self.starts.get(number).map_or(self.text.len(), |next| *next as usize - 1);
+        let line = &self.text[start..end];
+        line.strip_suffix('\r').unwrap_or(line)
+    }
 }
 
 /// The source files spans point into, as on disk, each read once: rustc's JSON carries the
-/// text of the lines a span covers.
+/// text of the lines a span covers. A name is looked up by the directory of its unit's manifest
+/// and the name as the span has it, both `&str`: two Fx lookups and no allocation once seen.
 pub struct Sources {
     root: PathBuf,
-    read: HashMap<PathBuf, Option<Vec<String>>>,
+    /// Each name's file, by manifest directory; `None` for a name that is no file.
+    named: FxHashMap<Box<str>, FxHashMap<Box<str>, Option<u32>>>,
+    /// Each file read, by path, so that two names of one file read it once.
+    at: FxHashMap<PathBuf, u32>,
+    files: Vec<Source>,
 }
 
 impl Sources {
     /// `root` is the checkout's: a relative file name is looked for no higher.
     pub fn new(root: &Path) -> Sources {
-        Sources { root: root.to_owned(), read: HashMap::new() }
+        Sources { root: root.to_owned(), named: FxHashMap::default(), at: FxHashMap::default(), files: Vec::new() }
     }
 
-    /// The lines of `file` as rustc names it: absolute, or relative to the directory rustc ran
-    /// in, which is the workspace root, an ancestor of the unit's `manifest` directory: the
-    /// nearest one that has it. Lines as rustc keeps them: no BOM, no `\r` before a newline.
-    pub fn lines(&mut self, file: &str, manifest: &Path) -> Option<&[String]> {
-        let path = self.find(Path::new(file), manifest)?;
-        let lines = self.read.entry(path.clone()).or_insert_with(|| {
-            let bytes = std::fs::read(&path).ok()?;
-            let text = String::from_utf8_lossy(&bytes);
-            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-            Some(text.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned()).collect())
-        });
-        lines.as_deref()
+    /// The file `name` is, as rustc names it: absolute, or relative to the directory rustc ran
+    /// in, which is the workspace root, an ancestor of the unit's manifest directory `dir`: the
+    /// nearest one that has it.
+    pub fn file(&mut self, name: &str, dir: &str) -> Option<u32> {
+        if let Some(&found) = self.named.get(dir).and_then(|it| it.get(name)) {
+            return found;
+        }
+        let found = self.find(Path::new(name), Path::new(dir)).and_then(|path| self.read(path));
+        self.named.entry(dir.into()).or_default().insert(name.into(), found);
+        found
     }
 
-    fn find(&self, file: &Path, manifest: &Path) -> Option<PathBuf> {
+    fn read(&mut self, path: PathBuf) -> Option<u32> {
+        if let Some(&at) = self.at.get(&path) {
+            return Some(at);
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let at = self.files.len() as u32;
+        self.files.push(Source::new(bytes));
+        self.at.insert(path, at);
+        Some(at)
+    }
+
+    fn find(&self, file: &Path, dir: &Path) -> Option<PathBuf> {
         if file.is_absolute() {
             return Some(file.to_owned());
         }
-        let dir = manifest.parent()?;
         dir.ancestors()
             .take_while(|it| it.starts_with(&self.root))
             .map(|it| it.join(file))
             .find(|it| std::fs::metadata(it).is_ok_and(|it| it.is_file()))
+    }
+
+    pub fn line_count(&self, file: u32) -> usize {
+        self.files[file as usize].starts.len()
+    }
+
+    /// Line `number` (1-based, at most [`Sources::line_count`]) of `file`.
+    pub fn line(&self, file: u32, number: usize) -> &str {
+        self.files[file as usize].line(number)
     }
 }
 

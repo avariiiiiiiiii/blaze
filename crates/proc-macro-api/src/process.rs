@@ -1,15 +1,13 @@
 //! Handle process life-time and message passing for proc-macro client
 
 use std::{
+    cell::RefCell,
     ffi::OsString,
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Write},
     panic::AssertUnwindSafe,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use paths::AbsPath;
@@ -31,16 +29,51 @@ use crate::{
 
 /// Represents a process handling proc-macro communication.
 pub(crate) struct ProcMacroServerProcess {
-    /// The state of the proc-macro server process, the protocol is currently strictly sequential
-    /// hence the lock on the state.
-    state: Mutex<ProcessSrvState>,
+    /// The connection's state while no request runs on it. Its protocol is one request at a
+    /// time, so a request takes the state for itself ([`ProcMacroServerProcess::claim`]) and
+    /// no lock is held while it runs: a sub-request it answers from the database may expand
+    /// another macro, which takes another connection ([`crate::pool`]).
+    state: Parked<ProcessSrvState>,
     version: u32,
     protocol: Protocol,
     /// Populated when the server exits.
     exited: OnceLock<AssertUnwindSafe<ServerError>>,
-    active: AtomicU32,
     /// Of a warm server: what the shell passes through, sent with each expansion.
     environment: Option<Arc<Environment>>,
+}
+
+/// A value its takers use one at a time, held by none of them while they use it: the lock is
+/// held only to move the value out or back, never across a call, so it is never waited on for
+/// longer than a move and a thread can't wait on itself.
+struct Parked<T>(Mutex<Option<T>>);
+
+impl<T> Parked<T> {
+    fn new(value: T) -> Parked<T> {
+        Parked(Mutex::new(Some(value)))
+    }
+
+    fn take(&self) -> Option<T> {
+        self.0.lock().unwrap_or_else(|it| it.into_inner()).take()
+    }
+
+    fn give_back(&self, value: T) {
+        *self.0.lock().unwrap_or_else(|it| it.into_inner()) = Some(value);
+    }
+}
+
+/// A server's connection, the caller's for its requests until dropped, when it is given back.
+/// Not `Sync`: it is the one caller's.
+pub(crate) struct Claimed<'a> {
+    process: &'a ProcMacroServerProcess,
+    state: RefCell<Option<ProcessSrvState>>,
+}
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.get_mut().take() {
+            self.process.state.give_back(state);
+        }
+    }
 }
 
 impl std::fmt::Debug for ProcMacroServerProcess {
@@ -275,14 +308,16 @@ impl ProcMacroServerProcess {
     ) -> io::Result<ProcMacroServerProcess> {
         let format = ProtocolFormat::BidirectionalPostcardPrototype;
         let mut srv = ProcMacroServerProcess {
-            state: Mutex::new(state),
+            state: Parked::new(state),
             version: 0,
             protocol: Protocol::from(format),
             exited: OnceLock::new(),
-            active: AtomicU32::new(0),
             environment,
         };
-        let v = srv.version_check(Some(&reject_subrequests)).map_err(|e| {
+        fn claim(srv: &ProcMacroServerProcess) -> Claimed<'_> {
+            srv.claim().expect("a connection no one else has yet is free")
+        }
+        let v = claim(&srv).version_check(Some(&reject_subrequests)).map_err(|e| {
             io::Error::other(format!("proc-macro server version check failed: {e}"))
         })?;
         if v > version::CURRENT_API_VERSION {
@@ -306,7 +341,7 @@ impl ProcMacroServerProcess {
             )));
         }
         srv.version = v;
-        let new_mode = srv
+        let new_mode = claim(&srv)
             .enable_rust_analyzer_spans(Some(&reject_subrequests))
             .map_err(|e| io::Error::other(format!("proc-macro source-span setup failed: {e}")))?;
         if new_mode != SpanMode::RustAnalyzer {
@@ -321,24 +356,11 @@ impl ProcMacroServerProcess {
         Ok(srv)
     }
 
-    /// Finds proc-macros in a given dynamic library.
-    pub(crate) fn find_proc_macros(
-        &self,
-        dylib_path: &AbsPath,
-    ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
-        match self.protocol {
-            Protocol::LegacyJson { .. } => legacy_protocol::find_proc_macros(self, dylib_path),
-
-            Protocol::BidirectionalPostcardPrototype { .. } => {
-                bidirectional_protocol::find_proc_macros(self, dylib_path, &|_| {
-                    Ok(SubResponse::Cancel {
-                        reason: String::from(
-                            "Server should not do a sub request when loading proc-macros",
-                        ),
-                    })
-                })
-            }
-        }
+    /// The connection, the caller's until the claim is dropped: `None` while another request
+    /// runs on it.
+    pub(crate) fn claim(&self) -> Option<Claimed<'_>> {
+        let state = self.state.take()?;
+        Some(Claimed { process: self, state: RefCell::new(Some(state)) })
     }
 
     /// Returns the server error if the process has exited.
@@ -359,10 +381,44 @@ impl ProcMacroServerProcess {
             }
         }
     }
+}
+
+impl Claimed<'_> {
+    pub(crate) fn exited(&self) -> Option<&ServerError> {
+        self.process.exited()
+    }
+
+    pub(crate) fn version(&self) -> u32 {
+        self.process.version()
+    }
+
+    pub(crate) fn rust_analyzer_spans(&self) -> bool {
+        self.process.rust_analyzer_spans()
+    }
+
+    /// Finds proc-macros in a given dynamic library.
+    pub(crate) fn find_proc_macros(
+        &self,
+        dylib_path: &AbsPath,
+    ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
+        match self.process.protocol {
+            Protocol::LegacyJson { .. } => legacy_protocol::find_proc_macros(self, dylib_path),
+
+            Protocol::BidirectionalPostcardPrototype { .. } => {
+                bidirectional_protocol::find_proc_macros(self, dylib_path, &|_| {
+                    Ok(SubResponse::Cancel {
+                        reason: String::from(
+                            "Server should not do a sub request when loading proc-macros",
+                        ),
+                    })
+                })
+            }
+        }
+    }
 
     /// Checks the API version of the running proc-macro server.
     fn version_check(&self, callback: Option<SubCallback<'_>>) -> Result<u32, ServerError> {
-        match self.protocol {
+        match self.process.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::version_check(self),
             Protocol::BidirectionalPostcardPrototype { .. } => {
                 let cb = callback.expect("callback required for bidirectional protocol");
@@ -376,7 +432,7 @@ impl ProcMacroServerProcess {
         &self,
         callback: Option<SubCallback<'_>>,
     ) -> Result<SpanMode, ServerError> {
-        match self.protocol {
+        match self.process.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::enable_rust_analyzer_spans(self),
             Protocol::BidirectionalPostcardPrototype { .. } => {
                 let cb = callback.expect("callback required for bidirectional protocol");
@@ -398,16 +454,16 @@ impl ProcMacroServerProcess {
         callback: Option<SubCallback<'_>>,
     ) -> Result<Result<tt::TopSubtree, String>, ServerError> {
         warm::set_traced(None);
-        self.active.fetch_add(1, Ordering::AcqRel);
-        let (env, seen) = match &self.environment {
+        let (env, seen) = match &self.process.environment {
             Some(environment) => {
                 let passed = environment.passed();
-                let seen = Environment::seen(&passed, &env);
-                (Environment::sent(&passed, env), Some(seen))
+                let call = env.iter().map(|(name, value)| (name.as_str(), value.as_str()));
+                let seen = Environment::seen(passed, call);
+                (Environment::sent(passed, env), Some(seen))
             }
             None => (env, None),
         };
-        let result = match self.protocol {
+        match self.process.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::expand(
                 proc_macro,
                 self,
@@ -432,10 +488,7 @@ impl ProcMacroServerProcess {
                 callback.expect("callback required for bidirectional protocol"),
                 seen,
             ),
-        };
-
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        result
+        }
     }
 
     pub(crate) fn send_task_legacy<Request, Response>(
@@ -448,7 +501,7 @@ impl ProcMacroServerProcess {
         ) -> Result<Option<Response>, ServerError>,
         req: Request,
     ) -> Result<Response, ServerError> {
-        self.with_locked_io(String::new(), |writer, reader, buf| {
+        self.with_io(String::new(), |writer, reader, buf| {
             send(writer, reader, req, buf).and_then(|res| {
                 res.ok_or_else(|| {
                     let message = "proc-macro server did not respond with data".to_owned();
@@ -464,27 +517,21 @@ impl ProcMacroServerProcess {
         })
     }
 
-    fn with_locked_io<R, B>(
-        &self,
-        buf: B,
-        f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
-    ) -> Result<R, ServerError> {
-        let state = &mut *self.state.lock().unwrap();
-        self.with_io(state, buf, f)
-    }
-
+    /// Runs `f` on the connection's pipes. The state is borrowed from the claim alone, so the
+    /// sub-requests `f` answers lock nothing.
     fn with_io<R, B>(
         &self,
-        state: &mut ProcessSrvState,
         mut buf: B,
         f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
     ) -> Result<R, ServerError> {
+        let mut state = self.state.borrow_mut();
+        let state = state.as_mut().expect("a claim holds its connection's state until dropped");
         f(&mut state.stdin, &mut state.stdout, &mut buf).map_err(|e| {
             if e.io.as_ref().map(|it| it.kind()) == Some(io::ErrorKind::BrokenPipe) {
                 match state.process.exit_err() {
                     None => e,
                     Some(server_error) => {
-                        self.exited.get_or_init(|| AssertUnwindSafe(server_error)).0.clone()
+                        self.process.exited.get_or_init(|| AssertUnwindSafe(server_error)).0.clone()
                     }
                 }
             } else {
@@ -498,7 +545,7 @@ impl ProcMacroServerProcess {
         initial: BidirectionalMessage,
         callback: SubCallback<'_>,
     ) -> Result<BidirectionalMessage, ServerError> {
-        self.with_locked_io(Vec::new(), |writer, reader, buf| {
+        self.with_io(Vec::new(), |writer, reader, buf| {
             bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
         })
     }
@@ -512,21 +559,17 @@ impl ProcMacroServerProcess {
         callback: SubCallback<'_>,
         seen: Option<Vec<(OsString, OsString)>>,
     ) -> Result<BidirectionalMessage, ServerError> {
-        let state = &mut *self.state.lock().unwrap();
-        let scope = state.tracer.as_mut().map(Tracer::scope);
-        let answered = self.with_io(state, Vec::new(), |writer, reader, buf| {
+        let scope = self.state.borrow_mut().as_mut().and_then(|it| it.tracer.as_mut().map(Tracer::scope));
+        let answered = self.with_io(Vec::new(), |writer, reader, buf| {
             bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
         });
         if answered.is_ok()
-            && let (Some(scope), Some(tracer)) = (scope, state.tracer.as_mut())
+            && let Some(scope) = scope
+            && let Some(tracer) = self.state.borrow_mut().as_mut().and_then(|it| it.tracer.as_mut())
         {
             warm::set_traced(Some(tracer.traced(&scope, seen.unwrap_or_default())));
         }
         answered
-    }
-
-    pub(crate) fn number_of_active_req(&self) -> u32 {
-        self.active.load(Ordering::Acquire)
     }
 }
 

@@ -13,7 +13,7 @@ use thin_vec::ThinVec;
 use crate::{
     GenericDefId, TypeOrConstParamId, TypeParamId,
     expr_store::{
-        TypePtr,
+        ListMark, TypePtr,
         lower::{ExprCollector, LifetimeBoundScope, NamedLifetimeStore},
     },
     hir::generics::{
@@ -23,11 +23,10 @@ use crate::{
     type_ref::{LifetimeRef, LifetimeRefId, TypeBound, TypeRef, TypeRefId},
 };
 
-pub(crate) type ImplTraitLowerFn<'l> = &'l mut dyn for<'ec, 'db> FnMut(
-    &'ec mut ExprCollector<'db>,
-    TypePtr,
-    ThinVec<TypeBound>,
-) -> TypeRefId;
+/// Lowers an `impl Trait` type whose bounds are on the builder's bound stack above the mark.
+/// It consumes them: the stack is back at the mark when it returns.
+pub(crate) type ImplTraitLowerFn<'l> =
+    &'l mut dyn for<'ec, 'db> FnMut(&'ec mut ExprCollector<'db>, TypePtr, ListMark) -> TypeRefId;
 
 pub(crate) struct GenericParamsCollector {
     type_or_consts: Arena<TypeOrConstParamData>,
@@ -243,8 +242,7 @@ impl GenericParamsCollector {
         type_or_consts: &mut Arena<TypeOrConstParamData>,
         where_predicates: &mut Vec<WherePredicate>,
         parent: GenericDefId,
-    ) -> impl for<'ec, 'db> FnMut(&'ec mut ExprCollector<'db>, TypePtr, ThinVec<TypeBound>) -> TypeRefId
-    {
+    ) -> impl for<'ec, 'db> FnMut(&'ec mut ExprCollector<'db>, TypePtr, ListMark) -> TypeRefId {
         move |ec, ptr, impl_trait_bounds| {
             let param = TypeParamData {
                 name: None,
@@ -256,13 +254,9 @@ impl GenericParamsCollector {
                 local_id: type_or_consts.alloc(param.into()),
             }));
             let type_ref = ec.alloc_type_ref(param_id, ptr);
-            for bound in impl_trait_bounds {
-                where_predicates.push(WherePredicate::TypeBound {
-                    lifetimes: None,
-                    target: type_ref,
-                    bound: bound.clone(),
-                });
-            }
+            where_predicates.extend(ec.store.drain_bounds(impl_trait_bounds).map(|bound| {
+                WherePredicate::TypeBound { lifetimes: None, target: type_ref, bound }
+            }));
             type_ref
         }
     }

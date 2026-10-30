@@ -176,6 +176,10 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
 
 > forwarded to db: `crates/hir-def/Cargo.toml` is lane db's and names neither yet.
 
+Status: done by speed-hir-defs: `blaze-format.workspace = true` added. Not `blaze-ids`: nothing in
+hir-def names `blaze_ids` (`rg blaze_ids crates/hir-def` is empty), so it would be an unused
+dependency; add it with the first use.
+
 2. **Inner attributes of a lazy body, for every caller** — `crates/syntax/src/ast/traits.rs`,
    `HasAttrs::inner_attributes_node` (format-parse). Today the `ast::Fn` arm
    (`it.body()?.stmt_list()?`) enters the body, so every `attrs_including_inner` /
@@ -283,6 +287,7 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    compares the outline with the full parse, which is what it is for (`SyntaxNode` stays
    imported: the test's `in_full` closure uses it). Why: without this, `syntax-bridge`'s
    tests don't build.
+   Status: done by speed-span-tt
 2. **`expand_lazy` returns its errors** — `crates/syntax/src/parsing.rs` (format-parse).
    format-parse's request 3 has landed in `syntax-tree`: `Expand` is now
    `fn(SyntaxKind, &str, u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`, and
@@ -296,6 +301,8 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    in the file and not an offset, is format-parse's call, as in `body_parser_errors`. Then
    `errors_of` can read `tree.part_errors(at)` (parsing the part if needed) in place of
    `body_parser_errors`.
+
+> forwarded to format: `crates/syntax-bridge/` and `crates/syntax/` are lane format's, between its children.
 
 ## From concurrency: lock audit (2026-10-29)
 
@@ -327,6 +334,8 @@ Lookups in both interners take no lock, which is right. The findings are on the 
 
 Judged off the hot path: `syntax-tree/src/flat.rs:1167` (`PARTS`, tests only). The format files
 in `hir-def` (`expr_store*`, `hir*`, `item_tree*`) and `syntax`, `span`, `tt` and `mbe` hold no locks.
+
+> forwarded to format: every finding is in lane format's own crates (`intern`, `blaze-ids`, `syntax-tree`, `span`); lane format is still running.
 
 ## format-hir: expressions and patterns become columns (to lanes db, items, codegen)
 
@@ -380,6 +389,8 @@ Owners: lane db (`hir-ty`, `hir-ty-borrowck`, and hir-def's `resolver.rs`/`upvar
 items (`hir`), lane codegen (`hir-ty-mir`, `hir-ty-codegen`). These land together with the
 format-hir change. The item tree's own migration follows under "## format-hir-tree".
 
+> forwarded to db and codegen: `hir-ty`, `hir-ty-borrowck`, `hir-def`'s `resolver.rs`/`upvars.rs` and `hir` are lane db's (crates.md gives `crates/hir/` to db, not items); `hir-ty-mir` and `hir-ty-codegen` are codegen's. Lane items is DONE, so its part is `requests`': items' `hir-ty` files have no `store[e]` site; `blaze-items`' four `exprs()` loops (`key.rs:887`, `tests/{form,hashes,facts}.rs`) drop `*closure_kind` for `closure_kind` once `ExpressionStore::exprs` yields `Expr<'_>` (it still yields `&Expr` from the arena).
+
 ## speed-types: `ContentId::of_many` and a context key per domain (`crates/blaze-ids/src/lib.rs`)
 
 From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
@@ -413,3 +424,120 @@ From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
      per fact, component and name). Each costs two to four compressions today, and the
      derive-key one is 25 to 50% of the total. A test: `Hasher::new(d)` equals
      `blake3::Hasher::new_derive_key(d)` over several domains.
+
+> forwarded to format: `crates/blaze-ids/src/lib.rs` is lane format's; lane format is still running. `blaze-items` (key.rs, index.rs, form.rs) does not build until `of_many` lands.
+
+## speed-syntax (speed pass of `crates/parser`, `crates/syntax`)
+
+From `speed-syntax`, for format-tree (`crates/syntax-tree/` is live as format-edit). Notes:
+`docs/v2/plan/lanes/format/speed-syntax.md`.
+
+Already wired in `crates/syntax` (format-parse is done, its files are speed-syntax's now):
+format-tree's request 2 (`expand_lazy` returns its parser errors; `Parse::errors_of` reads
+`FlatTree::part_errors` through `parsing::body_errors`, so each body is parsed once and
+`body_parser_errors` is gone) and the follow-up of format-parse's request 4 (`Edit::token` calls
+`FlatTree::replace_token`).
+
+1. **A sourced token is checked by address, not by its bytes** — `crates/syntax-tree/src/flat.rs`,
+   `FlatTreeBuilder::token`. Today a sourced builder compares every token's bytes with the
+   source (`source.as_bytes().get(self.next..end) == Some(text.as_bytes())`): a second pass over
+   every byte of every file parsed, and the check `parsing::build_tree` can never fail, since its
+   tokens are slices of the source it gives the builder. Exact change: accept at once when
+   `text.as_ptr() == source.as_ptr().wrapping_add(self.next) && end <= source.len()`, and compare
+   the bytes only otherwise (a token copied from another text, as a test builder does); keep the
+   panic message. The check is as strong (same address and length is the same bytes) and costs
+   two compares per token. Same for `FlatTree::expand`'s check of the part
+   (`part.source.get(..) == Some(text)`): with 2 below it is `Arc::ptr_eq(&part.source,
+   &self.source) && root == range`, no compare of the body's text.
+2. **A part built over the file's own text** — `flat.rs`. Today `expand_lazy` must build each
+   body over `Arc::from(text)`: one allocation and a copy of the body per body parsed, then
+   `moved()` and the compare above. Exact change: `pub type Expand = fn(kind: SyntaxKind,
+   source: &Arc<str>, range: TextRange, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`,
+   errors absolute; `FlatTreeBuilder::sourced_range(source: Arc<str>, range: TextRange)`, a
+   sourced builder whose tokens start at `range.start()` (`next = start`, the first mark
+   `start`) and whose `finish` checks `next == range.end()` (today `== source.len()`); `expand`
+   then calls `(lazy.expand)(kind, &self.source, range, lazy.data)` and keeps the tree as it is,
+   with no `moved`. Tell speed-syntax (window `speed-syntax`) when it lands: `expand_lazy`
+   moves to `sourced_range` with `LexedStr::new(edition, &source[range])` and absolute errors,
+   and the reparse's block, item and body candidates (`reparsing.rs`, `Arc::from(text)` three
+   times) build over `new_source` the same way, which removes one copy of the edited node per
+   candidate tried.
+
+> applied (format-tree, 2026-10-29): both, as written.
+> - 1: a token at the source's next address with `end <= ` the builder's end is accepted
+>   without a compare; the message is kept.
+> - 2: `Expand` is `fn(SyntaxKind, &Arc<str>, TextRange, u32) -> (FlatTree, Vec<(TextRange,
+>   Box<str>)>)`, its errors absolute and checked to lie in the range.
+>   `FlatTreeBuilder::sourced_range(source, range)` checks the range is on char boundaries,
+>   keeps tokens and lazy nodes inside it, and `finish` checks `next == range.end()`.
+>   `sourced` is now `sourced_range` over the whole source. `expand` checks
+>   `Arc::ptr_eq(&part.source, &self.source) && root == range` and keeps the part as built,
+>   with no `moved`.
+> - `syntax` doesn't build until `expand_lazy` takes the new signature (`source[range]` for
+>   the lexer, `sourced_range` for the builder). speed-syntax is told.
+
+The lock audit's only note on these files (`flat.rs` `PARTS`) is in tests: nothing to apply.
+
+## speed-hir-expand: span lookups per token, span-map layout, the dropper thread (`crates/span/src/map.rs`, `crates/syntax-bridge/src/lib.rs`)
+
+To `speed-span-ast` (`span`) and `speed-span-tt` (`syntax-bridge`). hir-expand is the caller of all
+of these (`crates/hir-expand/src/span_map.rs`, `lib.rs`); I fit my side to whatever you pick, tell
+me (`tmux send-keys -t blaze-v2:speed-hir-expand`).
+
+1. **A cursor for in-order lookups.** `syntax_node_to_token_tree*` asks `SpanMapper::span_for` for
+   every token of every macro input, in increasing offset order. Both maps answer with a binary
+   search per token (`SpanMap::span_at` :123, `RealSpanMap::span_for_range` :359 via `index_at`
+   :332, plus `end()` and an `assert!` per call). Wanted, giving exactly the same `Span`s:
+   `SpanMap::span_at_from(&self, offset: TextSize, hint: &mut u32) -> Span` and
+   `RealSpanMap::span_for_range_from(&self, range: TextRange, hint: &mut u32) -> Span`, which
+   start from the entry `hint` names, step forward while the next entry still covers the offset
+   (galloping 1, 2, 4, ... then a binary search in the last step, so a jump back or far ahead is
+   still `O(log n)`), and store the entry they found in `hint`. Amortized `O(1)` per token
+   instead of `O(log n)`, and the entries read are adjacent (one cache line per few tokens instead
+   of `log n` scattered ones). Keep `span_at` / `span_for_range` as they are for random lookups.
+   hir-expand will then hold a `Cell<u32>` in its mappers (`SpanMap<'_>`, `MacroRulesArgs`), one per
+   conversion, so `SpanMapper::span_for(&self, ..)` can stay `&self`; or make it `&mut self` if
+   you prefer, and say so.
+2. **`SpanMap` as two columns.** Today `spans: Vec<(TextSize, Span)>` (24 bytes an entry: 4 for
+   the offset, 20 for the span, with padding). As `ends: Vec<TextSize>` beside `spans: Vec<Span>`, the
+   search reads 4-byte offsets only (16 per cache line instead of 2 or 3). `Hash` (salsa
+   fingerprints `parse_macro_expansion`'s output, lru = 512, so it is hashed on every execution)
+   becomes two slice hashes instead of a derived `Hash` per tuple. Also `with_capacity(tokens)`
+   from `token_tree_to_syntax_node`, which knows the token count, instead of growing by `push`.
+3. **The dropper thread** (`impl Drop for SpanMap`, :217): each dropped map sends its `Vec`
+   through one process-wide `mpsc` channel (a lock per drop) to an OS thread that sleeps 100 ms in
+   a loop. Under v2 eviction and quiescent reclamation free memos (concurrency.md, "Memory"), so
+   drop the `Drop` impl and the thread; a dropped map frees its columns where it drops.
+4. **Down-mapping index.** `ranges_with_span_exact` / `ranges_with_span` (:90, :106) scan every
+   entry; `hir`'s `Semantics` descend calls them per token it maps down
+   (`crates/hir/src/semantics.rs:1010,1265` through `ExpansionInfo::map_range_down*`). A sorted
+   permutation `by_anchor: Vec<u32>` (entry indices ordered by `(anchor, range.start)`) built in
+   `finish()` makes each a binary search plus the matching run. Lower priority than 1-3.
+
+## format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)
+
+From format-hir-encode, for the lead (`crates/blaze-format/`) and format-span (`crates/span/`).
+
+HIR buffers (`expr_store/persist.rs`, `item_tree/persist.rs`, `hir/persist.rs`) store
+`SyntaxContext`s as their `into_u32` value and rebuild them with `unsafe
+SyntaxContext::from_u32`. That function's precondition is "a valid `SyntaxContext`": a root, or
+a salsa index this database interned. Bounds checks can't prove that. Today the `// SAFETY:`
+comment rests on "the database that wrote the buffer is the one reading it". A corrupted or
+foreign buffer breaks that, and `SyntaxContext::id` then builds a `SyntaxContextImpl` from an
+index salsa never made (span/src/hygiene.rs:92). unsafe.md says untrusted bytes are verified
+before any view is made of them. Two ways to close it; either is enough:
+
+1. **The lead, `blaze-format`:** make hash verification part of opening a buffer. Add
+   `pub fn open_verified<R: Record>(buffer: &[u8], schema: SchemaHash, key: ContentId) ->
+   Result<&R, FormatError>`, which checks `ContentId::of(.., buffer) == key` before `open_as`, and
+   a `FormatError::Hash` variant. `Persist::read` documents that its caller verified the bytes;
+   the daemon image and the store only call `read` on verified bytes. Then the HIR `SAFETY:`
+   comments can name that check as where the invariant is upheld.
+2. **format-span, `span`:** a safe, checked constructor, `pub fn
+   SyntaxContext::from_u32_in(db: &dyn salsa::Database, raw: u32) -> Option<SyntaxContext>`.
+   It returns `None` unless `raw` is a root id or an index the interned `SyntaxContextImpl`
+   table holds. Then the decoders take the database and need no `unsafe` at all.
+
+Until one lands, the only `unsafe` left for this is the single function
+`hir::persist::syntax_context` (format-hir's file; edit given in
+/tmp/blaze-lanes/v2-format-hir-encode.md).

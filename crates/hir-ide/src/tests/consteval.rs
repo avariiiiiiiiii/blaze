@@ -60,7 +60,14 @@ fn check_fail(
 
 #[track_caller]
 fn check_number(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: i128) {
-    check_answer(ra_fixture, |b, _| {
+    let (db, file_ids) = TestDB::with_many_files(ra_fixture);
+    check_number_in(&db, *file_ids.last().unwrap(), answer);
+}
+
+/// [`check_number`] of the goal in `file_id` of a database the caller set up.
+#[track_caller]
+fn check_number_in(db: &TestDB, file_id: EditionedFileId, answer: i128) {
+    check_answer_in(db, file_id, |b, _| {
         assert_eq!(
             b,
             &answer.to_le_bytes()[0..b.len()],
@@ -93,12 +100,20 @@ fn check_answer(
     check: impl FnOnce(&[u8], &MemoryMap<'_>),
 ) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    crate::attach_db(&db, || {
-        let file_id = *file_ids.last().unwrap();
-        let r = match eval_goal(&db, file_id) {
+    check_answer_in(&db, *file_ids.last().unwrap(), check);
+}
+
+#[track_caller]
+fn check_answer_in(
+    db: &TestDB,
+    file_id: EditionedFileId,
+    check: impl FnOnce(&[u8], &MemoryMap<'_>),
+) {
+    crate::attach_db(db, || {
+        let r = match eval_goal(db, file_id) {
             Ok(t) => t,
             Err(e) => {
-                let err = pretty_print_err(e, &db);
+                let err = pretty_print_err(e, db);
                 panic!("Error in evaluating goal: {err}");
             }
         };

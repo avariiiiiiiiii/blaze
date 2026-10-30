@@ -324,9 +324,9 @@ impl Bump {
         Ok(unsafe { std::str::from_utf8_unchecked_mut(bytes) })
     }
 
-    /// Frees every value, and every chunk but the last (the biggest), which the next values
-    /// reuse, so an arena reset between tasks calls the allocator only when a task needs more
-    /// than any before it; what it held at most is kept.
+    /// Frees every value, and every chunk but the last, which the next values reuse, so an
+    /// arena reset between tasks calls the allocator only when a task needs more than that
+    /// chunk; what it held at most is kept.
     pub fn reset(&mut self) {
         let chunks = self.chunks.get_mut();
         let last = chunks.pop();

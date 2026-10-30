@@ -1,21 +1,18 @@
 //! Const traits (`const_trait_impl`), const closures (`const_closures`) and fn pointers in
 //! const. Expected values are what rustc nightly-2026-10-27 computes for the same program.
 
-use super::check_number;
+use test_fixture::WithFixture;
+
+use super::{check_number, check_number_in};
+use crate::test_db::TestDB;
 
 /// [`check_number`] with builtin derives expanded, as a build has them: the fast path that only
 /// records them leaves the derived methods without bodies to evaluate.
 #[track_caller]
 fn check_number_derived(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: i128) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            hir_def::nameres::EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD.set(false);
-        }
-    }
-    hir_def::nameres::EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD.set(true);
-    let _reset = Reset;
-    check_number(ra_fixture, answer);
+    let (mut db, file_ids) = TestDB::with_many_files(ra_fixture);
+    hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    check_number_in(&db, *file_ids.last().unwrap(), answer);
 }
 
 #[test]

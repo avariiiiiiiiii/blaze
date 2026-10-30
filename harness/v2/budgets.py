@@ -16,7 +16,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     projects        whose rows run, of nushell, ripgrep, ruff and blaze (this checkout); all
     budgets         which budgets run (the names below); all
     runs            how many times an edit, a no-op build or a warm start is timed: the median
-                    is the number (5)
+                    is the number, with its 95% interval from 6 runs on (10, hyperfine's least)
     runtime_runs    how many times each program runs for the code-speed budgets, after two runs
                     that warm the page cache (10)
     slack           the signature budget: at most `slack` functions compiled per place the edit
@@ -156,7 +156,7 @@ class Input:
     work: str = ""
     projects: tuple[Project, ...] = get_args(Project)
     budgets: tuple[Budget, ...] = get_args(Budget)
-    runs: int = 5
+    runs: int = 10
     runtime_runs: int = 10
     slack: float = 4.0
     noise: float = 0.05
@@ -257,6 +257,8 @@ class Measured:
     limit: float | None = None
     detail: str = ""
     numbers: dict[str, report.Number] = field(default_factory=dict[str, report.Number])
+    # Where `value`, a median of samples, lies with 95% confidence (`median_interval`).
+    interval: tuple[float, float] | None = None
 
 
 def verdict(value: float, limit: float, at_most: bool) -> report.Verdict:
@@ -269,6 +271,55 @@ def describe(value: float, limit: float, at_most: bool, unit: str) -> str:
 
 def samples(xs: Iterable[float]) -> str:
     return " ".join(f"{x:.4g}" for x in xs)
+
+
+def median_interval(xs: Sequence[float], level: float = 0.95) -> tuple[float, float] | None:
+    """The distribution-free interval of the median of `xs` at `level`: the k-th smallest and
+    k-th largest sample, k the largest with P(B < k) <= (1 - level) / 2 for B ~ Binomial(n, 1/2)
+    (no assumption of normal timings, which builds are not). None when there are too few
+    samples for any (5 or fewer at 95%)."""
+    n, ordered = len(xs), sorted(xs)
+    tail, below, k = (1 - level) / 2, 0.0, 0
+    for j in range(n + 1):
+        below += math.comb(n, j) / 2**n
+        if below > tail:
+            break
+        k = j + 1
+    return (ordered[k - 1], ordered[n - k]) if k else None
+
+
+def outliers(xs: Sequence[float]) -> int:
+    """How many of `xs` are outliers by the modified Z-score (Iglewicz and Hoaglin: |0.6745 (x -
+    median) / MAD| > 3.5), as hyperfine warns of them; with a MAD of 0, every sample off the
+    median."""
+    if not xs:
+        return 0
+    middle = statistics.median(xs)
+    mad = statistics.median(abs(x - middle) for x in xs)
+    if mad == 0:
+        return sum(x != middle for x in xs)
+    return sum(abs(0.6745 * (x - middle) / mad) > 3.5 for x in xs)
+
+
+def spread(xs: Sequence[float], unit: str, prefix: str = "") -> dict[str, report.Number]:
+    """hyperfine's summary of samples: mean, standard deviation, range, the outliers, and the
+    95% interval of the median where there are samples enough for one."""
+    out: dict[str, report.Number] = {
+        f"{prefix}mean_{unit}": round(statistics.fmean(xs), 4),
+        f"{prefix}stdev_{unit}": round(statistics.stdev(xs), 4) if len(xs) > 1 else 0.0,
+        f"{prefix}min_{unit}": round(min(xs), 4),
+        f"{prefix}max_{unit}": round(max(xs), 4),
+        f"{prefix}outliers": outliers(xs),
+    }
+    if (interval := median_interval(xs)) is not None:
+        out[f"{prefix}median_low_{unit}"], out[f"{prefix}median_high_{unit}"] = (round(v, 4) for v in interval)
+    return out
+
+
+def timed(xs: Sequence[float], unit: str, **numbers: report.Number) -> Measured:
+    """The median of `xs` with its samples, their spread and its interval."""
+    return Measured(statistics.median(xs), numbers=dict(numbers, **{f"samples_{unit}": samples(xs)}, **spread(xs, unit)),
+                    interval=median_interval(xs))
 
 
 def judge(rep: report.Report, row: Row, measure: Callable[[], Measured]) -> None:
@@ -285,8 +336,15 @@ def judge(rep: report.Report, row: Row, measure: Callable[[], Measured]) -> None
             return
         limit = row.limit if got.limit is None else got.limit
         detail = f"{describe(got.value, limit, row.at_most, row.unit)}; today {row.today}"
+        numbers = dict(got.numbers)
+        if got.interval is not None:
+            low, high = got.interval
+            numbers["settled"] = not low <= limit <= high
+            if not numbers["settled"]:
+                detail += (f"; the 95% interval of the median, {low:.4g} to {high:.4g} {row.unit}, takes in the "
+                           "budget: more runs would settle it")
         rep.add(row.name, verdict(got.value, limit, row.at_most), detail + (f"; {got.detail}" if got.detail else ""),
-                measured=round(got.value, 4), budget=round(limit, 4), unit=row.unit, today=row.today, **got.numbers)
+                measured=round(got.value, 4), budget=round(limit, 4), unit=row.unit, today=row.today, **numbers)
 
     rep.guarded(row.name, go)
 
@@ -645,7 +703,10 @@ class Edits:
     def numbers(self) -> dict[str, report.Number]:
         ms = [s * 1000 for s in self.seconds]
         return dict(median_ms=round(statistics.median(ms), 3), samples_ms=samples(ms), places=self.places,
-                    compiled_each=" ".join(map(str, self.compiled)) or None)
+                    compiled_each=" ".join(map(str, self.compiled)) or None, **spread(ms, "ms"))
+
+    def interval_ms(self) -> tuple[float, float] | None:
+        return median_interval([s * 1000 for s in self.seconds])
 
 
 @dataclass(frozen=True)
@@ -784,7 +845,7 @@ class Lane:
 
     def timed_edit(self, step: str) -> Measured:
         e = self.edits(step, *self.bench_edit("body"), False)
-        return Measured(statistics.median(e.seconds) * 1000, numbers=e.numbers())
+        return Measured(statistics.median(e.seconds) * 1000, numbers=e.numbers(), interval=e.interval_ms())
 
     def nothing_compiled(self, step: str, make: Callable[[str, int], str]) -> Measured:
         file, _ = self.anchor()
@@ -797,8 +858,9 @@ class Lane:
                         dict(e.numbers(), slack=self.args.slack))
 
     def noop(self) -> Measured:
+        self.build("the no-op build that warms up", False)
         ms = [self.build(f"no-op build {n + 1}", False)[0] * 1000 for n in range(self.args.runs)]
-        return Measured(statistics.median(ms), numbers=dict(samples_ms=samples(ms)))
+        return timed(ms, "ms")
 
     def warm_start(self) -> Measured:
         ms: list[float] = []
@@ -810,7 +872,7 @@ class Lane:
             ms.append((time.monotonic() - began) * 1000)
         if bad := self.wrong("after a warm start"):
             raise Wrong(bad)
-        return Measured(statistics.median(ms), numbers=dict(samples_ms=samples(ms)))
+        return timed(ms, "ms")
 
     def speed(self, profile: Literal["debug", "release"]) -> Measured:
         """bench.py's `runtime` workload, blaze's program against cargo's of `profile`, in turns."""
@@ -839,7 +901,8 @@ class Lane:
         ours, cargos = statistics.median(times["blaze"]), statistics.median(times["cargo"])
         return Measured(ours / cargos, 1.0 + self.args.noise,
                         numbers=dict(blaze_median_s=round(ours, 4), cargo_median_s=round(cargos, 4),
-                                     blaze_samples_s=samples(times["blaze"]), cargo_samples_s=samples(times["cargo"])))
+                                     blaze_samples_s=samples(times["blaze"]), cargo_samples_s=samples(times["cargo"]),
+                                     **spread(times["blaze"], "s", "blaze_"), **spread(times["cargo"], "s", "cargo_")))
 
     def layout(self, key: str) -> Measured:
         name = TABLES[key]
@@ -1070,8 +1133,7 @@ def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str]) -> Measur
         finally:
             write_edit(str(ws), varied(changes, n), True)
         served(eng, f"the CI edit {n + 1} taken back", eng.build(f"the CI edit {n + 1} taken back", ws, env))
-    return Measured(statistics.median(seconds), numbers=dict(samples_s=samples(seconds), tests_run=ran_tests,
-                                                             edited=edit.file))
+    return timed(seconds, "s", tests_run=ran_tests, edited=edit.file)
 
 
 def main(args: Input) -> None:
@@ -1214,6 +1276,20 @@ def selftest() -> None:
         expect(False, "a counter the machine lacks is refused")
     except engine.Failed:
         pass
+    expect(median_interval([1.0, 2, 3, 4, 5]) is None, "5 samples are too few for a 95% interval")
+    expect(median_interval([6.0, 1, 5, 2, 4, 3]) == (1, 6), "6 samples: the interval is their range (96.9%)")
+    tens = [float(x) for x in (9, 2, 7, 4, 1, 10, 3, 8, 5, 6)]
+    expect(median_interval(tens) == (2, 9), f"10 samples: the 2nd to the 9th (97.9%), not {median_interval(tens)}")
+    expect(median_interval([float(x) for x in range(1, 21)]) == (6, 15), "20 samples: the 6th to the 15th (95.9%)")
+    expect(outliers([10.0, 10.2, 9.9, 10.1, 10.0, 30.0]) == 1, "one slow run among steady ones is an outlier")
+    expect(outliers([10.0, 11, 12, 13, 14]) == 0 and outliers([5.0, 5, 5, 6]) == 1 and outliers([]) == 0,
+           "no outlier in an even spread; with a MAD of 0, every sample off the median")
+    got = timed(tens, "ms", places=3)
+    expect(got.value == 5.5 and got.interval == (2, 9) and got.numbers["places"] == 3
+           and got.numbers["median_low_ms"] == 2 and got.numbers["median_high_ms"] == 9
+           and got.numbers["min_ms"] == 1 and got.numbers["max_ms"] == 10 and got.numbers["outliers"] == 0,
+           f"timed: {got}")
+    expect("median_low_ms" not in timed([1.0, 2, 3], "ms").numbers, "no interval is reported from 3 runs")
     expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
                                     "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
     print(f"{SCRIPT} selftest: ok")

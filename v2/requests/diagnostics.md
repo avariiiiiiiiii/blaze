@@ -324,6 +324,24 @@ diagnostic item (`mem_zeroed`, `ptr_null`, `f32_nan`, `transmute`, ...). Until i
 `lints/bodies/types/util.rs` (`diagnostic_item`) reads the attribute from the item's source
 with `hir_expand::attrs::expand_cfg_attr`, once per question and uncached.
 
+Status: the per-item half done by speed-hir-defs: `AttrFlags::diagnostic_item(db, owner:
+AttrDefId) -> Option<Symbol>` (`crates/hir-def/src/attrs.rs`). It is one bit test
+(`AttrFlags::HAS_DIAGNOSTIC_ITEM`) for an item without the attribute and a cached query for one
+with it, `cfg_attr`s expanded and a macro value expanded as rustc does. The reverse map
+`diagnostic_items(db, krate)` is not written (it walks every module, as `lang_item.rs` does).
+
+### for diagnostics (from speed-hir-defs): read the diagnostic item through hir-def
+
+`crates/blaze-diagnostics/src/lints/bodies/types/util.rs`, `fn diagnostic_item`: replace the
+body (the `match def` collecting `ast::Attr`s and the `expand_cfg_attr` walk) with
+```rust
+    hir_def::attrs::AttrFlags::diagnostic_item(db, def).map(|it| it.as_str().to_owned())
+```
+Why: today every question re-reads the item's syntax, collects its attributes into a `Vec` and
+builds a `SmolStr` per attribute; through hir-def it is a bit test on the item's cached flags.
+Returning the `Symbol` instead of a `String` (and comparing it with `sym::...`) would also drop
+the allocation per answer.
+
 > forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.
 
 ## diagnostics-bodies-patterns: what pattern checking gives, as rustc gives it (db, `crates/hir-ty/src/infer/pat.rs`, `crates/hir/src/diagnostics.rs`)
@@ -521,3 +539,630 @@ gives a UI test that is not `run-pass` (`src/tools/compiletest/src/runtest.rs`,
 incomplete_features -A unused_parens -A unused_braces`. Why: every `.stderr` of rustc's was
 made with them, so a test whose source has an unused variable or an `unsafe` block with nothing
 unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-18294.rs`).
+
+## diagnostics-lints-syntax-early-macros: the `;` an expression's expansion ends in, and which calls are expressions (db, `crates/hir-expand`, `crates/mbe`)
+
+1. A tracked query `MacroCallId::dropped_semicolon(self, db) -> Option<span::Span>` in
+   `crates/hir-expand/src/lib.rs`: the span of the `;` `without_last_semicolon` drops from the
+   expansion (computed in `parse_macro_expansion` from the `macro_expand` token tree it already
+   has). Why: `semicolon_in_expressions_from_macros` (deny) is linted at that `;`, which is not
+   in the expansion's syntax tree. Until then `crates/blaze-diagnostics/src/lints/syntax/early/
+   macros.rs` (`dropped_semicolon`) expands the call a second time through the public
+   `decl_macro_expander(..).expand(..)`; with the query it calls that instead.
+2. `without_last_semicolon` only for `MacroDefKind::Declarative`: rustc drops the `;` only for a
+   `macro_rules!`/`macro` expansion (`ParserAnyMacro::make` in
+   `rustc_expand/src/mbe/macro_rules.rs`); a proc macro's or a builtin's expansion that ends in
+   `;` in expression position is an error there ("macro expansion ignores `;`"), so blaze
+   accepts what rustc rejects.
+3. `ExpandTo::from_call_site`: a block's trailing `m!()` / `m![]` (a `MACRO_EXPR` that is the
+   `STMT_LIST`'s tail, not braced) is an expression in rustc (`parse_stmt_mac` in
+   `rustc_parse/src/parser/stmt.rs`: only `m! {}` or a call followed by `;`/EOF is a statement
+   macro), today `ExpandTo::Statements`. So `macro_rules! m { () => { let x = 1; x } }` and
+   `fn f() -> i32 { m!() }` builds under blaze and is an error under rustc ("expected
+   expression, found `let` statement"), and `{ m!() }` with an expansion `a; b` too ("macro
+   expansion ignores `b`"). `macros.rs` lints the trailing case from either shape.
+4. `crates/mbe/src/parser.rs` `eat_fragment_kind`: "missing fragment specifier" carries no span,
+   and parsing stops at the first. rustc (`rustc_expand/src/mbe/quoted.rs`, `parse`) gives one
+   error per `$name` without `:kind`, spanned `$name` (or `$name:` when the `:` is there),
+   with the suggestion `:spec` after it; `hir::MacroDefError` needs the range of each (a
+   `Vec<(TextRange, TextRange)>`: the span and where `:spec` goes) for
+   `crates/blaze-diagnostics/src/lower/macro_def_error.rs` to give rustc's text.
+
+## diagnostics-lints-bodies: what follows a call of an uninhabited type (codegen, `crates/hir-ty-mir`; db for the field in `crates/hir-ty/src/mir.rs`)
+
+rustc's `LintAndRemoveUninhabited` (`compiler/rustc_mir_transform/src/lint_and_remove_uninhabited.rs`,
+run on the built MIR in `mir_promoted`) lints `unreachable_code` after a call whose type is
+uninhabited but not `!` ("unreachable expression"/"unreachable definition", "any code
+following this expression is unreachable", "this expression has type `Void`, which is
+uninhabited"), then removes the call's return edge. hir-ty-mir's lowering already gives such a
+call no target (`lower_call`'s `is_uninhabited`) and lowers nothing after it, so only lowering
+knows what rustc's `find_unreachable_code_from` would find in the target block. What, in
+`crates/hir-ty/src/mir.rs`:
+
+```rust
+/// What `LintAndRemoveUninhabited` lints: a call of a type uninhabited from the body's module
+/// that is not `!`, in a function whose return type is inhabited, and the first statement of
+/// user code its target block would have had (`find_unreachable_code_from`: skipping the `()`
+/// and return-place assignments, `StorageLive`/`StorageDead`, and a `Goto`/`Drop` into a block
+/// only it leads to).
+pub struct UnreachableAfterCall {
+    /// The call (`orig`).
+    pub call: MirSpan,
+    /// What would have come next (`target_loc.span`).
+    pub next: MirSpan,
+    /// "definition" for a `FakeRead` (a `let`), else "expression".
+    pub descr: &'static str,
+    pub ty: StoredTy,
+}
+
+pub struct MirBody<'db> {
+    /// In a built body, in the order of the calls' blocks.
+    pub unreachable_after_calls: Vec<UnreachableAfterCall>,
+    ..
+}
+```
+
+Why: the lint depends on the MIR lowering does not build.
+`crates/blaze-diagnostics/src/lints/bodies/reachable.rs` (`after_calls`) lowers it as written
+above, its type printed through `hir::Type::derived_from_next_solver` (requested by
+`diagnostics-bodies`).
+
+## diagnostics-bodies-types: why the types had to agree, and what a bound was needed for (db, `crates/hir-ty`, `crates/hir/src/diagnostics.rs`)
+
+From `diagnostics-bodies-types`. Seven changes, each for a form rustc gives that the lowering in
+`crates/blaze-diagnostics/src/lower/{type_mismatch,unimplemented_trait,closure_kind_mismatch,type_must_be_known}.rs`
+can only guess at from the syntax today:
+
+1. The cause on `TypeMismatch`, `UnimplementedTrait` and `ClosureKindMismatch`: rustc's
+   `ObligationCauseCode` as far as diagnostics read it: `WhereClauseInExpr { item, bound_span,
+   arg_index }` (the callee, the written bound that failed, and the argument it is of),
+   `ImplDerived { impl_id }` for each entry of `parent_trait_predicates` (the impl that needed
+   the bound), `SizedArgumentType`, `BlockTailExpression`, `ReturnValue`, `IfExpression`,
+   `MatchExpressionArm { prior_arms }`, `LetType`. Why: today the lowering finds the callee and
+   its bound again from the syntax (`Cause` and `where_clause_note` in
+   `lower/unimplemented_trait.rs`) and gives no "required by a bound in `f`" note when `f` writes
+   two bounds of the trait. For a local impl it gives "required for `X` to implement `Y`" as a
+   plain note where rustc points at the impl's header with "unsatisfied trait bound introduced
+   here" (`suggestions.rs`, `ImplDerived`), because the impl is not known.
+2. The types of `TypeMismatch` and `InvalidRangePatType`-like diagnostics as inference had them
+   when it found the error, before integer and float variables fall back. Why: rustc says
+   "expected integer, found `&str`" and "this is found to be of type `{integer}`" (and decides
+   `1`'s type from the expected one before `could_remove_semicolon`). After writeback hir gives
+   `i32`. `tests/bodies/types.rs`, `match_arms_of_incompatible_types_skip_the_diverging_one`,
+   is ignored until then.
+3. Ambiguity errors: `SolverDiagnostic::from_fulfillment_error` (`crates/hir-ty/src/solver_errors.rs`)
+   drops every error but `Select(Unimplemented)`, so rustc's E0283 ("type annotations needed:
+   cannot satisfy `_: Trait`") and E0284 are never reported, and a body that has one still
+   builds. Give `TypeMustBeKnown` with the ambiguous predicate, and a kind of E0282/E0283/E0284.
+4. The origin of an inference variable on `TypeMustBeKnown`: the generic parameter it was made
+   for, and the item that parameter is declared on. Why: rustc's ", where the type for type
+   parameter `T` is specified", "cannot infer type for type parameter `T` declared on the
+   function `f`" and the turbofish suggestion (`need_type_info.rs`, `InferSourceKind::GenericArg`)
+   all name it. Today `type_must_be_known.rs` gives the suggestion's message without that clause.
+5. `hir::Closure::kind_origin(db) -> Option<(InFile<ExprOrPatPtr>, ClosureCapture)>`: rustc's
+   `closure_kind_origins`, the use that made the closure `FnOnce` or `FnMut`. Today
+   `closure_kind_mismatch.rs` takes the first capture that moves or mutates, and only of a closure
+   that is not `move`.
+6. The closure on `ClosureKindMismatch`: its expression (`InFile<AstPtr<ast::ClosureExpr>>`).
+   Today it is found from the argument (a closure written there, or a local a `let` binds one
+   to), and the error is at the call when neither holds.
+7. #1522 (an `assert_eq!` of a type that does not implement `Debug` gave no error):
+   `tests/bodies/types.rs`, `an_unmet_bound_inside_an_assert_eq_like_macro_is_reported`, is the
+   regression test. What the reading found, not yet the cause: `add_required_obligations_for_value_path`
+   registers the callee's bounds with the path's span (not dummy), derived causes reach
+   `find_best_leaf_obligation`, `expr_syntax` maps macro-expanded expressions, and nothing
+   treats `assert_eq!` apart. `hir-ty-borrowck`'s `NotChecked::Unproven` ("a where clause of a
+   call does not hold: rustc's E0277, which type checking did not report") is the place a missed
+   one shows; a body skipped with it must lower to an error, not pass. If the test passes the
+   cause is in core's `assert_eq!` itself (the `?Sized` bound through `&*left_val`, or
+   `#[track_caller]`), to be tried with std's macro in a VM.
+
+## diagnostics-lints-mir-unsafe: what rustc's unsafety checking finds that `hir::MissingUnsafe` does not give (db, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir/src/diagnostics.rs`, `crates/hir-def/src/signatures.rs`)
+
+`crates/blaze-diagnostics/src/lower/missing_unsafe.rs` lowers every `MissingUnsafe` as rustc's
+`check_unsafety` gives it. What it cannot, because hir does not find or say it
+(`compiler/rustc_mir_build/src/check_unsafety.rs`):
+
+1. Operations hir does not find, each a program rustc rejects with E0133 and blaze accepts
+   (superset-of-rust). New `UnsafetyReason` variants, found where rustc finds them:
+   - `UnsafeBinderCast`: `ExprKind::{Place,Value}UnwrapUnsafeBinder`, `WrapUnsafeBinder`
+     (`unsafe<'a> T`, feature `unsafe_binders`).
+   - `UseOfUnsafeField` (reading or matching an `unsafe` field, feature `unsafe_fields`) and
+     `InitializingTypeWithUnsafeField` (a struct expression of a variant with one).
+   - `MutationOfLayoutConstrainedField` / `BorrowOfLayoutConstrainedField`: a `ref mut`
+     binding, or a `ref` binding of a non-`Freeze` type, inside a pattern of a type with
+     `#[rustc_layout_scalar_valid_range_*]` (`inside_adt` in rustc's `visit_pat`).
+   With the variant, give its span as rustc does (`pat.span` / `expr.span`).
+2. A call of a `#[rustc_deprecated_safe_2024]` function in the body of an `unsafe fn`, outside a
+   block, before 2024: rustc lints it `deprecated_safe_2024` when `unsafe_op_in_unsafe_fn` is
+   not allowed there (`requires_unsafe`, `SafetyContext::UnsafeFn`). `missing_unsafe` drops it
+   (`!is_unsafe`). Give it as `MissingUnsafe { lint: DeprecatedSafe2024, .. }` with
+   `in_unsafe_fn: bool`, so the lowering can apply rustc's gate.
+3. An operation in the label block of `asm!` inside an `unsafe fn` is a hard error in rustc
+   (`in_safety_context(SafetyContext::Safe)` for `InlineAsmOperand::Label`); hir gives it as
+   `UnsafeLint::UnsafeOpInUnsafeFn`. Give `HardError` there.
+4. rustc's `suggest_unsafe_block`: its note "an unsafe function restricts its caller" is on the
+   first operation it lints in the function (and in each closure, from the flag where that
+   starts). The lowering finds it by scanning `Semantics::get_unsafe_ops` of the body for
+   each diagnostic, O(ops²) per `unsafe fn`. Give `MissingUnsafe::first: bool` (the first
+   in rustc's THIR order in its body or closure, counting the scopes around), or make
+   `missing_unsafe` a tracked query the lowering can read once.
+5. Order: `UnsafeVisitor` walks a block's `let` patterns before its statements' expressions;
+   rustc visits a `let`'s initializer, then its pattern, in order. Errors of union patterns
+   come out of rustc's order. Walk in THIR order.
+6. `crates/hir-def/src/signatures.rs`: an `unsafe fn` with `#[rustc_deprecated_safe_2024]` gets
+   `DEPRECATED_SAFE_2024` instead of `UNSAFE`, so its own body is checked as a safe function's
+   (std's `env::set_var` would get E0133 for what is `unsafe_op_in_unsafe_fn` in rustc). Keep
+   `UNSAFE` too, and test `is_deprecated_safe_2024` first where calls are checked.
+7. `crates/hir-ty/src/target_feature.rs` merges the implications of a feature across
+   architectures; rustc's `is_target_feature_call_safe` uses the target's. A call rustc
+   rejects can pass.
+
+## diagnostics-lints-syntax-attrs-features: one feature table for the feature lints and `checks/features.rs` (the parents, `lints.rs`, `lints/syntax.rs`, `lints/syntax/attrs.rs`; `diagnostics-items`)
+
+What: rustc's table of language features is at
+`crates/blaze-diagnostics/src/lints/syntax/attrs/features/table.rs` (`pub(crate) mod table`):
+`lang(name) -> Option<Lang { name, kind: Kind::{Unstable, Incomplete, Internal, Accepted,
+Removed}, since, issue }>`, `removed(name) -> Option<(reason, pull)>`, `is_lang`, `incomplete`,
+`internal`, `issue`. All 570 features of `compiler/rustc_feature/src/{unstable,accepted,removed}.rs`
+(rust-lang/rust@ad3d0bc1, July 31) with since and issue, and the 103 removed ones' reasons and
+pull requests, generated by `features/table.py` into `features/table/lang.rs`. It has what E0554
+(stable features and their `since`), E0557 (removed, reason, pull) and E0635 (which names are
+lang features; library ones still need std's `#[unstable]`s) need.
+Make it reachable from `crate::checks`: `pub(crate) mod features;` in `lints/syntax/attrs.rs`,
+`pub(crate) mod attrs;` in `lints/syntax.rs`, `pub(crate) mod syntax;` in `lints.rs` (or a
+`pub(crate) use` of `table` at `crate::lints`). Why: one table, not two (`diagnostics-items`
+writes `checks/features.rs` next and should use it rather than keep its own).
+Also: the table is from the July checkout, not `nightly-2026-10-27`; regenerate it with
+`table.py` from a checkout of the nightly's commit when there is one
+(`PYTHONPATH=python/typed-input/src python3 .../features/table.py '{"rust": "<checkout>", "out": ".../features/table/lang.rs"}'`).
+
+## diagnostics-lints-syntax-early-validation: camel case helpers, a fragment's span, and the errors next to my lints
+
+1. `crates/blaze-diagnostics/src/lower/incorrect_case.rs` (diagnostics-items or the parent):
+   make `is_upper_camel_case` and `to_upper_camel_case` `pub(crate)`.
+   `lints/syntax/early/validation.rs` imports them for `non_camel_case_types` of type
+   parameters, so both halves of the lint use one copy of rustc's rule (`nonstandard_style.rs`).
+2. Same file, `non_camel_case_types` as the declarations check gives it, so the two halves
+   add up to rustc's `NonCamelCaseTypes`:
+   - A trait alias is "trait alias `x`" in rustc (`check_item`, `ItemKind::TraitAlias`); the
+     lowering prints "trait".
+   - `extern { type foo; }`: hir's decl_check lints a foreign type, but rustc's early pass has
+     no `check_foreign_item` for this lint, so rustc gives nothing. Skip a `TYPE_ALIAS` whose
+     parent is an `EXTERN_ITEM_LIST`.
+3. db (`crates/hir-expand`): the span of a `$var` fragment substituted by `macro_rules`.
+   rustc gives the invisible-delimited group the span of `$f` in the definition, so
+   `break '_l $f` in tests/ui/parser/issues/issue-87812.rs is spanned `break '_l $f` with the
+   suggestion `($f)`. The expansion span map gives each token of the fragment the call site's
+   span, so the lint's end (and the `)` it suggests) lands at the call. Needed by
+   `tests/lints/syntax/early/validation.rs::a_labeled_break_of_a_block_fragment_is_linted_at_the_macro_definition`.
+4. Errors that rustc gives next to these lints and nobody lowers yet (parent: assign them):
+   - E0642 "patterns aren't allowed in functions without bodies" (`ast_validation.rs`,
+     `check_decl_no_pat`, a non-ident pattern of a bodiless fn); needed by
+     `a_mut_parameter_of_a_function_without_a_body_is_linted_after_the_pattern_error`.
+   - E0561 (patterns in fn pointer types) and E0130 (in foreign fns) from the same check.
+   - "extern blocks must be unsafe" (Rust 2024, `ast_validation.rs` `visit_item`).
+   - "where clauses are not allowed before the type for type aliases" (a free type alias).
+   - format (parser): `LabeledLoopInBreak`, "parentheses are required around this expression
+     to avoid confusion with a labeled break expression" (`parse_expr_break`). Our parser
+     leaves `break 'a: loop {}` without a value; needed by
+     `a_labeled_break_of_an_unlabeled_loop_is_linted_after_the_parse_errors`.
+
+## diagnostics-lints-mir-matches: what match checking gives, as rustc gives it (db, `crates/hir-ide/src/diagnostics/expr.rs`, `match_check.rs`, `match_check/pat_analysis.rs`, `crates/hir/src/diagnostics.rs`)
+
+Each of 1, 4 and 5 is a program rustc refuses and blaze accepts (superset-of-rust); 2 and 3 are
+text rustc gives that blaze can't. The lowering is `crates/blaze-diagnostics/src/lower/
+missing_match_arms.rs` (E0004) and `non_exhaustive_let.rs` (E0005).
+
+1. **Every pattern kind lowered.** `PatCtxt::lower_pattern` records an error, and
+   `validate_match` / `check_non_exhaustive_let` then give nothing at all, for integer, char,
+   str and float literals, ranges, slices, `&p`, `box p`, deref patterns and paths to consts
+   (`PatternError::Unimplemented`, `UnresolvedVariant`); `hoist_witness_pat` has
+   `unimplemented!()` for `IntRange`, `Slice` and `DerefPattern`. So `match 0 { 1 => () }`,
+   `let 5 = 6;`, `match s { "a" => () }`, `match x { &E::A => () }` and `match v[..] { [] => () }`
+   build. Port `rustc_mir_build/src/thir/pattern/mod.rs`'s lowering (consts evaluated to
+   valtrees, `expanded_const` kept for `is_const_pat_that_looks_like_binding`). Tests:
+   `tests/ui/pattern/usefulness/match-non-exhaustive.rs`, `non-exhaustive-match.rs`,
+   `non-exhaustive-pattern-witness.rs`, `tests/ui/pattern/issue-106552.rs`.
+2. **The witnesses, not their joined text.** Today `uncovered_patterns: String` is rustc's joined
+   form of rust-analyzer's printing; the lowering reads it back against the scrutinee's type
+   and reprints it rustc's way (`Uncovered::read`, `Witness::read`). That loses the 4th and 5th
+   witness (rustc labels the variants of the first five: `ExcessiveEnum` in
+   `non-exhaustive-pattern-witness.rs`) and can't tell `NonExhaustive` from `Wildcard` (both
+   `_`). Wanted, on both `MissingMatchArms` and `NonExhaustiveLet`:
+   `witnesses: Vec<String>` (every one, printed by a port of `rustc_pattern_analysis`'s
+   `print_witness_pat`: `Enum::Variant` except `Option`/`Result`, `_` for `Never` without
+   `never_patterns`, int ranges `i32::MIN..=0_i32` / `0_usize..`, slices, `box _`, unions'
+   `..`), `variants: Vec<hir::EnumVariant>` (`maybe_point_at_variant` of the first five for
+   the peeled scrutinee ADT), `special_tys: Vec<(hir::Type, SpecialTy)>` (`collect_special_tys`
+   of the first witness: beyond-boundary `usize`/`isize`, `str`, foreign `#[non_exhaustive]`,
+   uninhabited). The lowering then drops its reader.
+3. **`would_be_exhaustive_without_guards: bool`** on `MissingMatchArms` (`check_match`
+   re-analyzes with the guards off) for the note "match arms with guards don't count towards
+   exhaustivity".
+4. **Inhabitedness.** `hir::Type::is_inhabited_from(&self, db, hir::Module) -> bool` (hir-ty's
+   `inhabitedness`), for "references are always considered inhabited"
+   (`tests/ui/pattern/usefulness/issue-78123-non-exhaustive-reference.rs`), and on
+   `NonExhaustiveLet` `privately_uninhabited: bool` (rustc's `witness_1_is_privately_uninhabited`:
+   the first witness's variant inhabited from the module but not ignoring visibility) for
+   "pattern `X` is currently uninhabited, but this variant contains private fields which may
+   become inhabited in the future".
+5. **The other irrefutable bindings.** Only `let` statements with an initializer are checked.
+   rustc's `check_binding_is_irrefutable` also checks function parameters ("refutable pattern
+   in function argument"), closure parameters ("closure argument"), `for` patterns ("`for` loop
+   binding"), `let` without an initializer (`let Some(x);`, where `check_non_exhaustive_let`
+   returns at `initializer?`) and destructuring assignments ("assignment", with the note
+   "destructuring assignments require an \"irrefutable pattern\" .."). Wanted:
+   `NonExhaustiveLet { pat, origin: BindingOrigin { Let, FnParam, ClosureParam, ForLoop,
+   Assignment }, has_initializer: bool, .. }`. Tests:
+   `tests/ui/pattern/usefulness/refutable-pattern-in-fn-arg.rs`,
+   `tests/ui/pattern/refutable-pattern-for-loop-15381.rs`,
+   `tests/ui/pattern/usefulness/refutable-pattern-errors.rs`.
+
+## speed-hir-store: blaze-diagnostics onto the HIR column views (from speed-hir-store-tools)
+
+From speed-hir-store-tools, 2026-10-29. 63 sites in 7 files of `crates/blaze-diagnostics/src/`
+(`ide-diagnostics` needs none, below). The rule is "## format-hir: expressions and patterns
+become columns" in `v2/requests/format.md` (contract:
+`~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md`). These land together with the
+format-hir change. `BodyCx::store()` returns `&'db ExpressionStore`, so every view is
+`Expr<'db>`/`Pat<'db>` and the slices and `&Literal` that `util::call_args`, `util::called_item`
+and `util::literal` return keep their lifetimes; no borrow changes (each walker copies `b` out
+of `self` before the `&mut self` calls, as today). `Statement`, `MatchArm`, `RecordLitField` and
+`AsmOperand` stay owned types reached through `&`, so `*expr`/`*pat`/`*it` on *their* fields
+stay: only the view's own fields lose the `*`. No site builds an `Expr`/`Pat`, uses the builder,
+or stores, hashes or compares a view.
+
+Files that import the HIR types or name `ExprId`/`PatId` and need no change: every
+`lower/*.rs` (their `Expr`/`Pat` are `syntax::ast`'s; `mismatched_tuple_struct_pat_arg_count.rs`'s
+`Pat<'db>` is a local struct), `checks/defs/discriminants.rs`, `lints/names/items/naming.rs`,
+`lints/syntax/**` but `early/labels.rs`.
+
+### crates/blaze-diagnostics/src/lints/bodies.rs  (23 sites)
+- ~L121  `if matches!(body[body.root_expr()], Expr::Missing) && body.params.is_empty() {`  ->  `if matches!(body.expr(body.root_expr()), Expr::Missing) && body.params.is_empty() {`
+- ~L310 (in `fn child_exprs`) and ~L490 (in `fn expr_children`), the only two in the file:  `match &store[expr] {`  ->  `match store.expr(expr) {`
+- `fn child_exprs`:
+  - ~L311  `Expr::Let { pat: p, expr } => {\n            out.push(*expr);\n            pat(*p, out);`  ->  `Expr::Let { pat: p, expr } => {\n            out.push(expr);\n            pat(p, out);`
+  - ~L327  `out.extend(*tail);`  ->  `out.extend(tail);`
+  - ~L329  `Expr::Match { expr, arms } => {\n            out.push(*expr);`  ->  `Expr::Match { expr, arms } => {\n            out.push(expr);`
+  - ~L341  `out.push(*body);`  ->  `out.push(body);`
+  - ~L344  `pat(*target, out);\n            out.push(*value);`  ->  `pat(target, out);\n            out.push(value);`
+  - ~L347  `Expr::Array(Array::Repeat { initializer, .. }) => out.push(*initializer),`  ->  `Expr::Array(Array::Repeat { initializer, .. }) => out.push(initializer),`
+  - unchanged: the `Statement::Let`/`Statement::Expr` arms (`out.extend(*initializer)`, `pat(*p, out)` at ~L320, `out.push(*expr)` at ~L323), `pat(*arg, out)` over `args.iter()`, and `arm.pat`/`arm.guard`/`arm.expr`.
+- `fn expr_children`:
+  - ~L491  `Expr::Let { pat, expr } => {\n                self.expr(*expr);\n                self.pat(*pat);`  ->  `Expr::Let { pat, expr } => {\n                self.expr(expr);\n                self.pat(pat);`
+  - ~L521  `self.expr(*tail);`  ->  `self.expr(tail);`
+  - ~L525  `self.expr(*scrutinee);`  ->  `self.expr(scrutinee);`
+  - ~L541  `self.expr(*body);`  ->  `self.expr(body);`
+  - ~L544  `self.pat(*target);\n                self.expr(*value);`  ->  `self.pat(target);\n                self.expr(value);`
+  - ~L547  `Expr::Array(Array::Repeat { initializer, .. }) => self.expr(*initializer),`  ->  `Expr::Array(Array::Repeat { initializer, .. }) => self.expr(initializer),`
+  - unchanged: the `Statement` arms (`self.expr(*it)` ~L509/~L513, `self.pat(*pat)` ~L511, `self.expr(*expr)` ~L516) and `self.pat(*arg)` over `args.iter()`.
+- `fn pat`:
+  - ~L564  `match &store[pat] {`  ->  `match store.pat(pat) {`
+  - ~L565  `Pat::Lit(expr) | Pat::Expr(expr) => self.expr(*expr),`  ->  `Pat::Lit(expr) | Pat::Expr(expr) => self.expr(expr),`
+  - ~L567  `if let Some(it) = start {\n                    self.expr(*it);`  ->  `if let Some(it) = start {\n                    self.expr(it);`
+  - ~L570  `if let Some(it) = end {\n                    self.expr(*it);`  ->  `if let Some(it) = end {\n                    self.expr(it);`
+
+### crates/blaze-diagnostics/src/lints/bodies/reachable.rs  (6 sites)
+- ~L74  `let span = match &store[expr] {`  ->  `let span = match store.expr(expr) {`
+- ~L75  `Expr::Call { callee, .. } => b.expr_span(*callee)?,`  ->  `Expr::Call { callee, .. } => b.expr_span(callee)?,`
+- ~L86  `let Expr::Block { statements, .. } = &store[block] else { return None };`  ->  `let Expr::Block { statements, .. } = store.expr(block) else { return None };`
+- ~L91  `let Expr::Match { arms, .. } = &store[match_expr] else { return None };`  ->  `let Expr::Match { arms, .. } = store.expr(match_expr) else { return None };`
+- ~L97  `let Expr::If { condition, then_branch, .. } = store[if_expr] else { return None };`  ->  `let Expr::If { condition, then_branch, .. } = store.expr(if_expr) else { return None };`
+- ~L101  `let Expr::Let { expr, .. } = store[let_expr] else { return None };`  ->  `let Expr::Let { expr, .. } = store.expr(let_expr) else { return None };`
+- `fn statement_node` (`Statement::Expr { expr, .. } => (b.expr_node(*expr)?, false)`) is unchanged.
+
+### crates/blaze-diagnostics/src/lints/bodies/unsafety.rs  (10 sites)
+- ~L108 (in `fn expr`) and ~L144 (in `fn children`), the only two in the file:  `match &store[expr] {`  ->  `match store.expr(expr) {`
+- ~L153  `Expr::Let { pat, .. } => pats.push(*pat),`  ->  `Expr::Let { pat, .. } => pats.push(pat),`
+- ~L155  `Expr::Assignment { target, .. } => pats.push(*target),`  ->  `Expr::Assignment { target, .. } => pats.push(target),`
+- ~L173  `match &b.store()[pat] {`  ->  `match b.store().pat(pat) {`
+- ~L174  `Pat::Expr(expr) | Pat::Lit(expr) => self.expr(*expr),`  ->  `Pat::Expr(expr) | Pat::Lit(expr) => self.expr(expr),`
+- ~L176  `if let Some(it) = start {\n                    self.expr(*it);`  ->  `if let Some(it) = start {\n                    self.expr(it);`
+- ~L179  `if let Some(it) = end {\n                    self.expr(*it);`  ->  `if let Some(it) = end {\n                    self.expr(it);`
+- ~L205  `let callee = match &b.store()[expr] {`  ->  `let callee = match b.store().expr(expr) {`
+- ~L206  `Expr::Call { callee, .. } => match b.infer.expr_ty(*callee).kind() {`  ->  `Expr::Call { callee, .. } => match b.infer.expr_ty(callee).kind() {`
+- unchanged: the `Expr::InlineAsm(asm)` arm (`asm: &InlineAsm`; its `AsmOperand` `*expr`/`*in_expr`/`*it`/`*label` stay), `Statement::Let { pat, .. } => pats.push(*pat)` at ~L148, `arms.iter().map(|it| it.pat)`, `args.iter().copied()`.
+
+### crates/blaze-diagnostics/src/lints/bodies/types/limits.rs  (7 sites)
+- ~L114  `match &b.store()[expr] {`  ->  `match b.store().expr(expr) {`
+- ~L124  `self.last_visited_negation = Some(Negation { span, negated: *operand });`  ->  `self.last_visited_negation = Some(Negation { span, negated: operand });`
+- ~L127  `&Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(op)) } => {`  ->  `Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(op)) } => {` (a `&` pattern over the old reference)
+- ~L151  `out.extend(lint_wide_pointer(b, expr, &span, cmpop, *receiver, args[0]));`  ->  `out.extend(lint_wide_pointer(b, expr, &span, cmpop, receiver, args[0]));`
+- ~L152  `out.extend(lint_fn_pointer(b, expr, &span, cmpop, *receiver, args[0]));`  ->  `out.extend(lint_fn_pointer(b, expr, &span, cmpop, receiver, args[0]));`
+- ~L177  `let is_lit = |it: ExprId| matches!(b.store()[it], Expr::Literal(_));`  ->  `let is_lit = |it: ExprId| matches!(b.store().expr(it), Expr::Literal(_));`
+- ~L312  `let via_method_call = matches!(&b.store()[e], Expr::MethodCall { .. } | Expr::Call { .. });`  ->  `let via_method_call = matches!(b.store().expr(e), Expr::MethodCall { .. } | Expr::Call { .. });`
+
+### crates/blaze-diagnostics/src/lints/bodies/types/limits/literal.rs  (3 sites)
+- ~L320  `b.exprs().iter().copied().find(|&it| matches!(&b.store()[it], Expr::Cast { expr: inner, .. } if *inner == expr))`  ->  `b.exprs().iter().copied().find(|&it| matches!(b.store().expr(it), Expr::Cast { expr: inner, .. } if inner == expr))`
+- ~L342  `let range = b.exprs().iter().copied().find(|&it| match &b.store()[it] {`  ->  `let range = b.exprs().iter().copied().find(|&it| match b.store().expr(it) {`
+- ~L347  `let Expr::RecordLit { fields, .. } = &b.store()[range] else { return false };`  ->  `let Expr::RecordLit { fields, .. } = b.store().expr(range) else { return false };` (`let [start, end] = &fields[..]` below is unchanged)
+
+### crates/blaze-diagnostics/src/lints/bodies/types/util.rs  (12 sites)
+- ~L74  `let Expr::Call { callee, .. } = &b.store()[call] else { return None };`  ->  `let Expr::Call { callee, .. } = b.store().expr(call) else { return None };`
+- ~L75  `let Expr::Path(_) = &b.store()[*callee] else { return None };`  ->  `let Expr::Path(_) = b.store().expr(callee) else { return None };`
+- ~L76  `match b.infer.expr_ty(*callee).kind() {`  ->  `match b.infer.expr_ty(callee).kind() {`
+- ~L77  `=> Some((def, *callee)),`  ->  `=> Some((def, callee)),`
+- ~L91 (in `fn call_args`)  `match &b.store()[call] {`  ->  `match b.store().expr(call) {` (`Expr::Call { args, .. } => Some(args)` is unchanged: `args: &'db [ExprId]`)
+- ~L100  `let Expr::MethodCall { .. } = &b.store()[expr] else { return None };`  ->  `let Expr::MethodCall { .. } = b.store().expr(expr) else { return None };`
+- ~L107  `let Expr::Path(path) = &b.store()[expr] else { return None };`  ->  `let Expr::Path(path) = b.store().expr(expr) else { return None };`
+- ~L133  `while let Expr::Block { tail: Some(tail), .. } = &b.store()[expr] {\n        expr = *tail;`  ->  `while let Expr::Block { tail: Some(tail), .. } = b.store().expr(expr) {\n        expr = tail;`
+- ~L141  `while let Expr::Ref { expr: inner, .. } = &b.store()[expr] {\n        expr = *inner;`  ->  `while let Expr::Ref { expr: inner, .. } = b.store().expr(expr) {\n        expr = inner;`
+- ~L149 (in `fn literal`)  `match &b.store()[expr] {`  ->  `match b.store().expr(expr) {` (`Expr::Literal(it) => Some(it)` is unchanged: `it: &'db Literal`)
+
+### crates/blaze-diagnostics/src/lints/syntax/early/labels.rs  (2 sites)
+- ~L42  `declared.push(*label)`  ->  `declared.push(label)`
+- ~L45  `used.insert(*label);`  ->  `used.insert(label);`
+- (`for (_, expr) in body.exprs() { match expr {` is unchanged: the item is `(ExprId, Expr<'_>)` and `label: Some(label)` now binds `LabelId` by value.)
+
+### crates/ide-diagnostics/  (0 sites)
+Its `handlers/` read diagnostics through `hir`'s public API and `syntax::ast`; none imports
+`hir_def::hir` or indexes a store or body.
+
+## diagnostics-lints-syntax-early: the parser's "the range pattern here has ambiguous interpretation"
+
+What: rustc's parser error `AmbiguousRangePattern` (`compiler/rustc_parse/src/parser/pat.rs`,
+`ban_pat_range_if_ambiguous`; message in `rustc_parse/src/diagnostics.rs`): after `&` or `box`,
+a range pattern written with `..=` or `..` (not `...`) is an error "the range pattern here has
+ambiguous interpretation" at the range pattern, with the verbose multipart suggestion "add
+parentheses to clarify the precedence" (`(` before, `)` after). Phase: Parse.
+Where: whoever lowers the parser's errors (`crates/parser` + `crates/blaze-diagnostics/src/lower/`);
+nothing in this tree gives it now.
+Why: `tests/lints/syntax/early/builtin.rs` (`range-inclusive-pattern-precedence.rs` and
+`...precedence2.rs`, rustc's UI tests verbatim) expect it before the
+`ellipsis_inclusive_range_patterns` warning.
+
+## diagnostics-bodies-calls: the types of an error as of when it was found
+
+What: `hir_ty::infer` keeps, in `MismatchedArgCount` (each argument's type and each formal
+input), `BinaryOperatorCannotBeApplied`, `UnaryOperatorCannotBeApplied`, `CannotIndexInto` and
+`CannotBeDereferenced`, the types as they were when type checking found the error, before
+integer and float fallback, so an integer variable prints `{integer}`, not `i32`.
+Where: `crates/hir-ty/src/infer.rs` (`InferenceDiagnostic`), `infer/op.rs`, `infer/expr.rs`,
+`crates/hir/src/diagnostics.rs`.
+Why: rustc reports these while type checking, before fallback: `binop/binop-typeck.rs`
+("cannot add `{integer}` to `bool`"), `error-codes/E0057.rs` ("unexpected argument #2 of type
+`{integer}`") and `argument-suggestions/basic.rs` ("found `{integer}`"), in
+`tests/bodies/calls.rs` and `tests/bodies/calls/args.rs`.
+
+## diagnostics-bodies-calls: `MismatchedArgCount` carries the call's callee and formal types
+
+What: `hir::MismatchedArgCount` (and the E0308 "arguments to this function are incorrect" of a
+call whose counts match) gives the callee (`hir::Callable` or the def), each formal input type,
+each expected input type (`expected_inputs_for_expected_output`), each provided argument's type
+and the compatibility rustc's `ArgMatrix` is built from (`can_coerce` of provided to expected,
+then the formal type's `sup`), and whether the call is a method call or a call through
+`Fn*`/`FnPtr`/a closure.
+Where: `crates/hir-ty/src/infer/expr.rs` (`check_call_arguments`), `crates/hir/src/diagnostics.rs`.
+Why: `lower/mismatched_arg_count.rs` re-resolves the callee with `Semantics` and decides
+compatibility with `Type::could_coerce_to`, which is not rustc's check: a provided type that
+coerces only through an expectation, or a generic formal input, gives other errors than rustc.
+
+## diagnostics-bodies-calls: `HasSource` for `hir::Closure`
+
+What: `impl HasSource for hir::Closure` (its `ast::ClosureExpr`).
+Where: `crates/hir/src/has_source.rs`.
+Why: E0057's "closure defined here" note and the parameter labels of a closure callee need the
+closure's span; `lower/mismatched_arg_count.rs` finds it only from its first parameter or from
+the callee's local binding (`let f = || ..; f(1)`), so a closure without parameters reached
+otherwise gets no note.
+
+## diagnostics-bodies-calls: the unmet predicates of an operator
+
+What: `BinaryOperatorCannotBeApplied` and `UnaryOperatorCannotBeApplied` carry the fulfillment
+errors of the operator's obligation (rustc's `errors` in `check_overloaded_binop`: the nested
+predicates, e.g. `X: PartialEq` for `[X; 3] == [X; 3]`), the operator's expected output type,
+and whether the method lookup failed on the trait or on a nested obligation.
+Where: `crates/hir-ty/src/infer/op.rs`, `crates/hir/src/diagnostics.rs`.
+Why: rustc's notes "an implementation of `PartialEq` might be missing for `X`", the derive
+suggestion on the element type, "consider further restricting type parameter `T` with trait
+`Eq`" (`binop/issue-93927.rs`), "consider introducing a `where` clause"
+(`suggestions/invalid-bin-op.rs`) and `Output = ` in a bound suggestion come from those
+predicates; `lower/binary_operator_cannot_be_applied.rs` knows only the operator's own trait.
+
+## diagnostics-bodies-calls: casts with unknown pointer kinds are E0641, not accepted
+
+What: `hir_ty::infer::cast` gives `CastError::UnknownCastPtrKind` and `UnknownExprPtrKind`
+(today commented out, so such casts check as valid) and `CastEnumDrop`,
+`ForeignNonExhaustiveAdt`, plus, on `hir::InvalidCast`, the pointer kinds and metadata rustc's
+`report_cast_error` reads (thin, slice length, vtable of which principal, the auto traits a
+`dyn` cast adds).
+Where: `crates/hir-ty/src/infer/cast.rs`, `crates/hir/src/diagnostics.rs`.
+Why: rustc refuses `ptr as *const _` when the pointee is not yet known (E0641 "cannot cast to a
+pointer of an unknown kind"); blaze accepting it is a program rustc refuses (superset-of-rust
+allows accepting more only behind an opt-in). `lower/invalid_cast.rs` works the metadata out
+from the types itself, which misses projections and opaque types.
+
+## diagnostics-bodies-calls: `InvalidLhsOfAssignment` says which assignment
+
+What: `hir::InvalidLhsOfAssignment` carries the assignment expression and its operator (plain
+`=` or which compound one).
+Where: `crates/hir/src/diagnostics.rs`, `crates/hir-ty/src/infer/expr.rs`.
+Why: E0070 and E0067 differ by it; `lower/invalid_lhs_of_assignment.rs` finds the enclosing
+`BinExpr` from the syntax, which breaks for a left-hand side inside a macro expansion.
+
+## diagnostics-bodies-calls: `MethodCallIllegalSizedBound` carries the pick
+
+What: `hir::MethodCallIllegalSizedBound` carries the method picked, the `Self: Sized` bound's
+span, whether the receiver needs `&mut` (rustc's `needs_mut`) and the other candidates.
+Where: `crates/hir-ty/src/method_resolution`, `crates/hir/src/diagnostics.rs`.
+Why: rustc's "you need `&mut dyn Trait` instead of `&dyn Trait`" suggestion and its "a method
+with a similar name exists" help need them; `lower/method_call_illegal_sized_bound.rs` gives
+the error and the bound's label only.
+
+## diagnostics-lints-syntax-delims: pinned reference and guard patterns in the syntax tree
+
+What: `RefPat` gets a `pin` token with its `const`/`mut` (`&pin mut x`, `&pin const x`), and
+a pattern node for guard patterns (`(x if cond)`, rustc's `PatKind::Guard`) under
+`#![feature(guard_patterns)]`.
+Where: `crates/parser` (patterns grammar), `crates/syntax` (`rust.ungram`, generated nodes);
+owned by format.
+Why: rustc's `unused_parens` keeps the parentheses of `&pin mut (x)` as it does `&(mut x)`,
+and never lints those around a guard pattern
+(`tests/ui/lint/unused-parens-pinned-reference-patterns.rs`,
+`tests/ui/lint/unused/unused_parens/parens-around-guard-patterns-not-unused.rs`);
+`lints/syntax/delims.rs` cannot tell them from what the parser makes of them now.
+
+## diagnostics-lints-syntax-early-macros-asm: `ra-ap-rustc_parse_format` for blaze-diagnostics
+
+What: `ra-ap-rustc_parse_format.workspace = true` under `[dependencies]` of
+`crates/blaze-diagnostics/Cargo.toml` (the workspace already has it, 0.166).
+Where: `crates/blaze-diagnostics/Cargo.toml`; owned by diagnostics-lints-syntax-early-macros.
+Why: `lints/syntax/early/macros/asm.rs` stops at the first template piece that
+`rustc_parse_format` refuses in `ParseMode::InlineAsm`, as rustc's `expand_preparsed_asm`
+does, so later pieces get neither `bad_asm_style` nor `named_asm_labels`; it doesn't build
+without it.
+
+## diagnostics-lints-syntax-early-macros-asm: `-Z deduplicate-diagnostics=no` in the UI harness
+
+What: an `Options` flag that keeps a diagnostic identical to one already emitted, with the note
+"duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`", as compiletest runs
+every UI test.
+Where: `crates/blaze-diagnostics/src/check.rs` (`Options`), `src/emit.rs`; owned by diagnostics.
+Why: `tests/ui/asm/named-asm-labels.stderr` has 6 such duplicates (a label defined twice in a
+template); `tests/lints/syntax/early/macros/asm.rs` drops them from the expected output and
+fixes the error count by hand until the harness can give them.
+
+## speed-hir-store: blaze-diagnostics code still being written: write it against the HIR views (from speed-hir-store-tools)
+
+From speed-hir-store-tools, 2026-10-29 18:10. To every `diagnostics-lints-*` agent still writing
+code that reads a body (windows messaged: `diagnostics-lints-bodies-types`,
+`diagnostics-lints-bodies-types-pointers`, `diagnostics-lints-bodies-types-casts`,
+`diagnostics-lints-bodies-types-values-next1`, `diagnostics-lints-bodies-calls-next1`,
+`diagnostics-lints-bodies-calls-items`, `diagnostics-lints-bodies-calls-methods`,
+`diagnostics-lints-bodies-calls-desugar-next1`, `diagnostics-lints-syntax-early-macros-asm`).
+
+The HIR store's expressions, patterns and type refs become columns in the same build your code
+lands in (nothing compiles before then), and `Index<ExprId>`, `Index<PatId>` and
+`Index<TypeRefId>` on `ExpressionStore` go away. Code written with `store[e]` now won't compile
+then, and the files are changing too fast for me to write line edits against them. **So write
+against the views directly:**
+
+- `b.store()[e]` / `&store[e]` -> `b.store().expr(e)` / `store.expr(e)`; patterns
+  `store.pat(p)`; type refs `store.type_ref(t)`. `Index<BindingId>`, `Index<LabelId>`,
+  `Index<PathId>`, `Index<LifetimeRefId>` stay (`store[id].mode` is fine).
+- The view's fields that are ids, `Option`s of ids or `Copy` enums bind by value: write
+  `Expr::Call { callee, .. } => f(callee)`, not `*callee`; `Expr::Cast { expr, type_ref }` ->
+  `store.type_ref(type_ref)`; `&Expr::X { .. }` / `&TypeRef::RawPtr(..)` patterns lose the `&`.
+  Lists are `&[T]`; `Name`, `Path`, `Literal`, `OffsetOf`, `InlineAsm`, `RefType`, `FnType`,
+  `ArrayType` fields are `&T`; `generic_args` is `Option<&GenericArgs>`.
+- `Statement`, `MatchArm`, `RecordLitField`, `RecordFieldPat`, `AsmOperand` and `TypeBound`
+  stay owned types inside those slices: their fields keep the `*` (`Statement::Expr { expr, .. }
+  => f(*expr)`).
+- A function taking `&Expr` / `&Pat` / `&TypeRef` takes `Expr<'_>` / `Pat<'_>` /
+  `TypeRef<'_>`; `store.exprs()` yields `(ExprId, Expr<'_>)`. Never build an `Expr`/`Pat`/
+  `TypeRef` outside hir-def.
+- `BodyCx::store()` returns `&'db ExpressionStore`, so a view is `Expr<'db>` and slices or
+  `&Literal`s taken from it live as long as before.
+
+Full contract: `~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md` (expressions and
+patterns, section "The consumer migration rule") and the addendum at the end of
+`~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md` (type refs). The views are already in
+`crates/hir-def/src/hir.rs`.
+
+Files I saw reading the store with the old indexing at 18:05, by owner (about 230 sites; convert
+them before you report DONE):
+- `diagnostics-lints-bodies-types` (types-shared): `types/limits.rs`, `types/util.rs`,
+  `types/limits/literal.rs` (exact edits for these three are in the block "## speed-hir-store:
+  blaze-diagnostics onto the HIR column views" above; skip any line you have already converted).
+- `diagnostics-lints-bodies-types-pointers`: `types/pointers.rs`, `types/pointers/{autorefs,
+  dangling, deref_null, ptr_nulls, reference_casting}.rs` (`ptr_nulls.rs`, `deref_null.rs`:
+  `matches!(store[*type_ref], TypeRef::RawPtr(..))` -> `matches!(store.type_ref(type_ref),
+  TypeRef::RawPtr(..))` inside `Expr::Cast { expr, type_ref }` arms).
+- `diagnostics-lints-bodies-types-casts`: `types/casts.rs`, `types/casts/{function_casts,
+  provenance, raw_borrows, static_mut_refs}.rs` (`raw_borrows.rs`: `&store[*type_ref]` ->
+  `store.type_ref(type_ref)`).
+- `diagnostics-lints-bodies-types-values-next1`: `types/values.rs`, `types/values/{intrinsics,
+  invalid}.rs`.
+- `diagnostics-lints-bodies-calls-next1` (calls-shared): `calls/statements.rs`.
+- `diagnostics-lints-bodies-calls-items`: `calls/items/{drop_forget_useless,
+  invalid_atomic_ordering, invalid_from_utf8}.rs`.
+- `diagnostics-lints-syntax-early-macros-asm`: `lints/syntax/early/macros/asm.rs`.
+(all paths under `crates/blaze-diagnostics/src/lints/bodies/` but the last.)
+
+## diagnostics-lints-syntax-early-validation: `#![forbid(unsafe_code)]` for blaze-diagnostics
+
+`crates/blaze-diagnostics/src/lib.rs` (parent): add `#![forbid(unsafe_code)]`, as
+`docs/v2/plan/design/unsafe.md` requires of a crate with no unsafe module. Checked with
+`rg 'unsafe\s*(\{|fn|impl)' crates/blaze-diagnostics/src`: every match is inside a string,
+comment or diagnostic message (rustc test sources, suggestion text), so it builds unchanged.
+
+## diagnostics-lints-syntax-early-macros-asm: re "write it against the HIR views" (speed-hir-store-tools)
+
+Nothing to convert in `lints/syntax/early/macros/asm.rs`: it never reads an `ExpressionStore`
+(no `store[..]`, `ExprId`, `PatId` or `TypeRefId`). Its `Expr`/`Pat` matches are the syntax
+tree's `ast::Expr`/`ast::Pat` of the asm expansion; the only HIR it reads is
+`hir_ty::generics::generics` and `crate::lints::body_item`, neither of which changes.
+
+## diagnostics-lints-syntax-attrs: attribute parsing's delayed lints, and the path to the feature table (`lints/syntax.rs`, `lints.rs`; `diagnostics-lints-syntax`, `diagnostics`)
+
+1. **A pass for delayed lints** (`diagnostics-lints-syntax`, `lints/syntax.rs`). rustc parses the
+   attributes of every node that is not a macro call during AST lowering, and emits their lints in
+   `emit_delayed_lints` (`compiler/rustc_interface/src/passes.rs`, lines 1066 and 1133). That runs
+   after `check_mod_attrs` has run for every module of the crate. So every attribute-parsing lint
+   (`unused_attributes` for duplicates, empty lists and invalid targets, `ill_formed_attribute_input`,
+   `unsafe_attr_outside_unsafe`, `unsafe_code` of an attribute, `unknown_crate_types`,
+   `ambiguous_derive_helpers`) comes after every `check_attr` lint, wherever each is. `Emitted`'s
+   sort key orders by place before pass, so today they interleave by place. Asked: a
+   `Pass::Delayed`, and the key `(phase, pass != PreExpansion, pass == Delayed, place, pass, rank)`.
+   Once it exists, `attrs::parsed` (mine) gives `Pass::Delayed` for owners other than macro calls.
+   Until then it gives `(Phase::Items, Pass::Early)`, which is right whenever only one of the two
+   kinds is present.
+2. **The feature table from `checks`** (`diagnostics-lints-syntax`, `diagnostics`). For
+   `checks/features.rs` (`diagnostics-items`) to use `lints::syntax::attrs::features::table` rather
+   than a copy (see "diagnostics-lints-syntax-attrs-features" above), `lints/syntax.rs` needs
+   `pub(crate) mod attrs;` and `lints.rs` needs `pub(crate) mod syntax;`. `attrs.rs` already has
+   `pub(crate) mod features;`.
+3. **Who owns what** (siblings, no change asked):
+   - `diagnostics-lints-syntax-early`: `unsafe_code` of an unsafe attribute ("usage of the unsafe
+     `x` attribute", `UnsafeAttribute`, from `rustc_attr_parsing/src/safety.rs`) is given by
+     `attrs/parse.rs`. Give only `UnsafeCode`'s own `unsafe_code` lints (blocks, functions, traits,
+     impls).
+   - `diagnostics-lints-names` (`stability/useless.rs`): `#[deprecated]` where it does nothing is
+     `useless_deprecated` only off closures, expressions, statements, arms and macro calls. On
+     those five it is `unused_attributes` ("the `deprecated` attribute cannot be used on macro
+     calls"), which `attrs/parse.rs` gives.
+   - `diagnostics-lints-levels`: a lint attribute on a macro call has no effect on levels
+     (`tests/ui/lint/inert-attr-macro.rs`: `#[allow(warnings)] #[inline] foo!();` still warns).
+     `attrs/parse.rs` gives the "unused attribute `allow`" lint. `ill_formed_attribute_input`'s
+     "this was previously accepted ..." warning and its issue #57571 note are future-incompat
+     ones, so yours. The same warning on `unused_attributes` for an invalid target or a
+     `WarnButFutureError` duplicate is part of rustc's diagnostic, and `attrs/parse.rs` adds it.
+   - `diagnostics-lints-syntax-early-macros`: `duplicate_macro_attributes` is yours, not mine.
+
+## diagnostics-lints-syntax-early-macros-matchers: two `macro_rules!` errors blaze never gives (`crates/mbe`, `lower/macro_def_error.rs`; front end, `diagnostics`)
+
+rustc refuses these definitions at `compile_declarative_macro`; blaze defines them and the
+crate builds, against **superset-of-rust** (a program the pinned nightly refuses is built):
+
+1. **Follow sets** (`check_matcher` / `check_matcher_core` / `is_in_follow` in
+   `compiler/rustc_expand/src/mbe/macro_rules.rs`): `` `$e:expr` is followed by `+`, which is
+   not allowed for `expr` fragments `` with its notes (`allowed there are: ...`, the `pat_param`
+   / `expr_2021` help). `crates/mbe` never checks them, and `lower/macro_def_error.rs` says
+   "not ported yet".
+2. **A variable bound twice in a rule's own matcher** (`check_binders`'s `DuplicateMatcherBinding`
+   in `compiler/rustc_expand/src/mbe/macro_check.rs`): the error "duplicate matcher binding" with
+   labels "duplicate binding" / "previous binding". Only the copy in a macro a transcriber defines
+   is a lint (`meta_variable_misuse`, mine, done).
+
+What exists to build on: `lints/syntax/early/macros/matchers/follow.rs` ports `FirstSets` and
+`check_matcher_core` with `is_in_follow` as yes/no (enough to stop where rustc stops); the error
+needs `IsInFollow::No`'s list of what is allowed, per fragment. `matchers/check.rs`'s `binders`
+has the duplicate branch (it drops it today, as it is not a lint). Both read the definition's
+tokens as rustc's lexer glues them (`matchers/tokens.rs`) and in each token's edition. Whoever
+owns `lower/macro_def_error.rs` can take them (make the module `pub(crate)` from
+`matchers.rs`, the parent's `macros.rs` declares it) or port the check into `crates/mbe` so
+the definition is refused there.
+
+## diagnostics-lints-bodies: `become` in hir-ty's MIR (codegen, `crates/hir-ty-mir`; db for the variant in `crates/hir-ty/src/mir.rs`)
+
+`unconditional_recursion` (`lints/bodies/recursion.rs`, rustc's
+`compiler/rustc_mir_transform/src/check_call_recursion.rs`) reads the built MIR, and hir-ty-mir
+refuses a body with `become` (`Expr::Become { .. } => not_supported!("tail-calls")` in
+`mir/lower.rs`). With no MIR for such a body, the lint is missing where rustc gives it:
+`tests/ui/lint/lint-unconditional-recursion-tail-calls.rs` (`fn f(x: bool) { if x { become
+f(!x) } else { f(!x) } }` lints, with only the `f(!x)` call as a "recursive call site";
+`fn g` that recurses only through `become` does not). What: rustc's
+`TerminatorKind::TailCall { func, args, fn_span }`, no successors, for `become`. Nothing else
+is needed on my side: `recursion.rs` already treats a terminator with no successors that is
+neither a return nor a call of the function itself as rustc treats `TailCall`.

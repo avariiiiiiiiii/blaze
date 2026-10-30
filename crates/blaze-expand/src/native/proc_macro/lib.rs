@@ -1463,12 +1463,6 @@ pub mod __native {
         wire::Reader::new(bytes).stream()
     }
 
-    fn give(output: TokenStream) -> Vec<u8> {
-        let mut out = Vec::new();
-        wire::write(&output, &mut out);
-        out
-    }
-
     /// What a panic's payload says, as the module's panic hook has it.
     fn message(payload: &(dyn Any + Send)) -> String {
         match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
@@ -1492,7 +1486,7 @@ pub mod __native {
         });
     }
 
-    fn caught(f: impl FnOnce() -> Vec<u8>) -> Result<Vec<u8>, String> {
+    fn caught(f: impl FnOnce()) -> Result<(), String> {
         hook();
         let was = EXPANDING.replace(true);
         let ran = std::panic::catch_unwind(AssertUnwindSafe(f));
@@ -1500,17 +1494,23 @@ pub mod __native {
         ran.map_err(|payload| message(&*payload))
     }
 
-    /// A derive or a function-like macro: its output, or what its panic said.
-    pub fn expand1(f: fn(TokenStream) -> TokenStream, input_: &[u8]) -> Result<Vec<u8>, String> {
-        caught(|| give(f(input(input_))))
+    /// A derive or a function-like macro: its output appended to `out`, or what its panic
+    /// said (and `out` holds part of an output).
+    pub fn expand1(
+        f: fn(TokenStream) -> TokenStream,
+        input_: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        caught(|| wire::write(&f(input(input_)), out))
     }
 
-    /// An attribute: its output, or what its panic said.
+    /// An attribute: its output appended to `out`, or what its panic said.
     pub fn expand2(
         f: fn(TokenStream, TokenStream) -> TokenStream,
         attr: &[u8],
         input_: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        caught(|| give(f(input(attr), input(input_))))
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        caught(|| wire::write(&f(input(attr), input(input_)), out))
     }
 }

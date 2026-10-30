@@ -188,6 +188,46 @@ pub struct GitHub {
     /// The token and when it expires, in Unix seconds.
     token: Option<(Token, u64)>,
     kept: Option<Kept>,
+    /// The next request's JSON body, then the whole request; both reused, so a check run's
+    /// update allocates no buffer once they have grown to its size.
+    body: Vec<u8>,
+    request: Vec<u8>,
+}
+
+/// What a request is to.
+#[derive(Clone, Copy)]
+enum Route {
+    /// `/app/installations/<installation>/access_tokens`
+    Mint,
+    /// `/repos/<repo>/check-runs`
+    CheckRuns,
+    /// `/repos/<repo>/check-runs/<id>`
+    CheckRun(u64),
+}
+
+/// A route's path, written where it goes with no string of its own.
+struct PathOf<'a> {
+    route: Route,
+    installation: u64,
+    repo: &'a str,
+}
+
+impl fmt::Display for PathOf<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.route {
+            Route::Mint => write!(f, "/app/installations/{}/access_tokens", self.installation),
+            Route::CheckRuns => write!(f, "/repos/{}/check-runs", self.repo),
+            Route::CheckRun(id) => write!(f, "/repos/{}/check-runs/{id}", self.repo),
+        }
+    }
+}
+
+/// How a request authenticates: as the App, with its JWT, or as the installation, with the
+/// token [`GitHub::fresh`] keeps.
+#[derive(Clone, Copy)]
+enum Auth<'a> {
+    Bearer(&'a str),
+    Installation,
 }
 
 /// The connection of the last answer, kept for the next request.
@@ -248,115 +288,140 @@ impl GitHub {
         {
             return Err(GitHubError::new(format!("{:?} is not a host name for GitHub's API", app.api)));
         }
-        Ok(GitHub { app, repo, tls: tls()?, token: None, kept: None })
+        let (body, request) = (Vec::new(), Vec::new());
+        Ok(GitHub { app, repo, tls: tls()?, token: None, kept: None, body, request })
     }
 
     /// The installation token, minted (and kept until five minutes before it expires).
     pub fn token(&mut self) -> Result<Token, GitHubError> {
-        let now = now()?;
-        if let Some((token, expires)) = &self.token
-            && now + RENEW_BEFORE < *expires
-        {
-            return Ok(token.clone());
-        }
-        self.token = None;
-        let jwt = self.app.key.jwt(self.app.id, now)?;
-        let path = format!("/app/installations/{}/access_tokens", self.app.installation);
-        let answer = self.call("POST", &path, &format!("Bearer {jwt}"), b"", true)?;
-        let minted: Minted = serde_json::from_slice(&answer.body).map_err(|_| {
-            GitHubError::new("GitHub's answer to minting a token is not a token and its expires_at")
-        })?;
-        let expires = unix_seconds(&minted.expires_at)?;
-        let token = Token(minted.token);
-        self.token = Some((token.clone(), expires));
-        Ok(token)
+        self.fresh().cloned()
     }
 
-    /// One request, on the kept connection when it is fresh; a non-2xx answer is an error with
-    /// GitHub's `message`. A kept connection the server closed while idle is replaced and the
-    /// request sent again only when `replayable`: sending it twice must change nothing.
+    /// The token kept, minted again first when it is within five minutes of expiring.
+    fn fresh(&mut self) -> Result<&Token, GitHubError> {
+        let now = now()?;
+        let valid = matches!(&self.token, Some((_, expires)) if now + RENEW_BEFORE < *expires);
+        if !valid {
+            self.token = None;
+            let jwt = self.app.key.jwt(self.app.id, now)?;
+            self.body.clear();
+            let answer = self.call("POST", Route::Mint, Auth::Bearer(&jwt), true)?;
+            let minted: Minted<'_> = serde_json::from_slice(&answer.body).map_err(|_| {
+                GitHubError::new("GitHub's answer to minting a token is not a token and its expires_at")
+            })?;
+            let expires = unix_seconds(&minted.expires_at)?;
+            self.token = Some((Token(minted.token), expires));
+        }
+        Ok(&self.token.as_ref().expect("a token, kept or just minted").0)
+    }
+
+    /// One request with the body in `self.body`, on the kept connection when it is fresh; a
+    /// non-2xx answer is an error with GitHub's `message`. A kept connection the server closed
+    /// while idle is replaced and the request sent again only when `replayable`: sending it
+    /// twice must change nothing. Nothing is allocated for the request itself: its bytes go into
+    /// `self.request`, and the error's text is made only for an error.
     fn call(
         &mut self,
         method: &str,
-        path: &str,
-        authorization: &str,
-        body: &[u8],
+        route: Route,
+        auth: Auth<'_>,
         replayable: bool,
     ) -> Result<HttpResponse, GitHubError> {
-        let what = format!("{method} https://{}{path}", self.app.api);
-        let mut headers = vec![
-            ("Authorization", authorization),
-            ("Accept", "application/vnd.github+json"),
-            ("X-GitHub-Api-Version", "2022-11-28"),
-            ("User-Agent", "blaze-ci"),
-        ];
-        if !body.is_empty() {
-            headers.push(("Content-Type", "application/json"));
-        }
-        let request = http::request(method, &self.app.api, path, &headers, body);
-        let connect = |github: &GitHub| {
-            github.connect().map_err(|error| GitHubError::new(format!("{what}: {error}")))
+        let GitHub { app, repo, tls, token, kept, body, request } = self;
+        let tls: &Arc<ClientConfig> = tls;
+        let path = PathOf { route, installation: app.installation, repo: repo.as_str() };
+        let api = app.api.as_str();
+        let what = || format!("{method} https://{api}{path}");
+        let authorization = match auth {
+            Auth::Bearer(jwt) => ("Bearer ", jwt),
+            Auth::Installation => match token {
+                Some((token, _)) => ("token ", token.expose()),
+                None => return Err(GitHubError::new(format!("{}: no installation token", what()))),
+            },
         };
-        let kept = self.kept.take().filter(|it| it.idle_since.elapsed() < KEEP_IDLE);
-        let reused = kept.is_some();
-        let mut stream = match kept {
-            Some(kept) => kept.stream,
-            None => connect(&*self)?,
+        write_request(request, method, api, &path, authorization, body);
+        let dial = || connect(api, tls).map_err(|error| GitHubError::new(format!("{}: {error}", what())));
+        let held = kept.take().filter(|it| it.idle_since.elapsed() < KEEP_IDLE);
+        let reused = held.is_some();
+        let mut stream = match held {
+            Some(held) => held.stream,
+            None => dial()?,
         };
-        let mut exchanged = exchange(&mut stream, &request);
+        let mut exchanged = exchange(&mut stream, request);
         if reused && replayable && matches!(exchanged, Err(Failed { stale: true, .. })) {
-            stream = connect(&*self)?;
-            exchanged = exchange(&mut stream, &request);
+            stream = dial()?;
+            exchanged = exchange(&mut stream, request);
         }
-        let answer = exchanged.map_err(|failed| GitHubError::new(format!("{what}: {}", failed.what)))?;
+        let answer = exchanged.map_err(|failed| GitHubError::new(format!("{}: {}", what(), failed.what)))?;
         let closes = answer
             .header("Connection")
             .is_some_and(|it| it.split(',').any(|token| token.trim().eq_ignore_ascii_case("close")));
         if !closes {
-            self.kept = Some(Kept { stream, idle_since: Instant::now() });
+            *kept = Some(Kept { stream, idle_since: Instant::now() });
         }
         if (200..300).contains(&answer.status) {
             return Ok(answer);
         }
         let message = serde_json::from_slice::<Message>(&answer.body)
             .map_or_else(|_| "no message".to_owned(), |it| it.message);
-        Err(GitHubError { what: format!("{what}: {message}"), status: Some(answer.status) })
+        Err(GitHubError { what: format!("{}: {message}", what()), status: Some(answer.status) })
     }
+}
 
-    fn connect(&self) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
-        let addresses = (self.app.api.as_str(), 443)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolving {}: {error}", self.app.api))?;
-        let mut last = format!("{} resolved to no address", self.app.api);
-        let mut connected = None;
-        for address in addresses {
-            match TcpStream::connect_timeout(&address, TIMEOUT) {
-                Ok(tcp) => {
-                    connected = Some(tcp);
-                    break;
-                }
-                Err(error) => last = format!("connecting to {address}: {error}"),
+/// A TLS connection to `api`'s port 443, with the timeouts set.
+fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+    let addresses = (api, 443).to_socket_addrs().map_err(|error| format!("resolving {api}: {error}"))?;
+    let mut last = format!("{api} resolved to no address");
+    let mut connected = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, TIMEOUT) {
+            Ok(tcp) => {
+                connected = Some(tcp);
+                break;
             }
+            Err(error) => last = format!("connecting to {address}: {error}"),
         }
-        let tcp = connected.ok_or(last)?;
-        tcp.set_read_timeout(Some(TIMEOUT))
-            .and_then(|()| tcp.set_write_timeout(Some(TIMEOUT)))
-            .map_err(|error| format!("setting timeouts: {error}"))?;
-        let name = ServerName::try_from(self.app.api.clone())
-            .map_err(|error| format!("{:?} as a TLS server name: {error}", self.app.api))?;
-        let tls = ClientConnection::new(Arc::clone(&self.tls), name)
-            .map_err(|error| format!("starting TLS: {error}"))?;
-        Ok(StreamOwned::new(tls, tcp))
     }
+    let tcp = connected.ok_or(last)?;
+    tcp.set_read_timeout(Some(TIMEOUT))
+        .and_then(|()| tcp.set_write_timeout(Some(TIMEOUT)))
+        .map_err(|error| format!("setting timeouts: {error}"))?;
+    let name =
+        ServerName::try_from(api.to_owned()).map_err(|error| format!("{api:?} as a TLS server name: {error}"))?;
+    let tls = ClientConnection::new(Arc::clone(tls), name).map_err(|error| format!("starting TLS: {error}"))?;
+    Ok(StreamOwned::new(tls, tcp))
+}
+
+/// The request's bytes into `out`, the same as [`http::request`] makes with these headers:
+/// `Host`, `Authorization`, `Accept`, `X-GitHub-Api-Version`, `User-Agent`, `Content-Type` when
+/// there is a body, `Content-Length`.
+fn write_request(
+    out: &mut Vec<u8>,
+    method: &str,
+    host: &str,
+    path: &impl fmt::Display,
+    authorization: (&str, &str),
+    body: &[u8],
+) {
+    out.clear();
+    let (scheme, credential) = authorization;
+    write!(out, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {scheme}{credential}\r\n")
+        .expect("a Vec takes every byte");
+    out.extend_from_slice(
+        b"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nUser-Agent: blaze-ci\r\n",
+    );
+    if !body.is_empty() {
+        out.extend_from_slice(b"Content-Type: application/json\r\n");
+    }
+    write!(out, "Content-Length: {}\r\n\r\n", body.len()).expect("a Vec takes every byte");
+    out.extend_from_slice(body);
 }
 
 impl Checks for GitHub {
     fn create(&mut self, run: &CheckRun) -> Result<u64, GitHubError> {
-        let token = self.token()?;
-        let body = check_run(run, true).to_string();
-        let path = format!("/repos/{}/check-runs", self.repo);
-        let answer =
-            self.call("POST", &path, &format!("token {}", token.expose()), body.as_bytes(), false)?;
+        self.fresh()?;
+        check_run(&mut self.body, run, true);
+        let answer = self.call("POST", Route::CheckRuns, Auth::Installation, false)?;
         let created: Created = serde_json::from_slice(&answer.body).map_err(|error| {
             GitHubError::new(format!("GitHub's answer to creating check run {}: {error}", run.name))
         })?;
@@ -364,16 +429,17 @@ impl Checks for GitHub {
     }
 
     fn update(&mut self, id: u64, run: &CheckRun) -> Result<(), GitHubError> {
-        let token = self.token()?;
-        let body = check_run(run, false).to_string();
-        let path = format!("/repos/{}/check-runs/{id}", self.repo);
-        self.call("PATCH", &path, &format!("token {}", token.expose()), body.as_bytes(), true)?;
+        self.fresh()?;
+        check_run(&mut self.body, run, false);
+        self.call("PATCH", Route::CheckRun(id), Auth::Installation, true)?;
         Ok(())
     }
 }
 
-/// A check run's JSON. `head_sha` is only taken when one is created.
-fn check_run(run: &CheckRun, create: bool) -> serde_json::Value {
+/// A check run's JSON into `out`, written straight from `run` (no `serde_json::Value`, no copy
+/// of the summary), keys sorted as serde_json's map sorts them. `head_sha` is only taken when
+/// one is created.
+fn check_run(out: &mut Vec<u8>, run: &CheckRun, create: bool) {
     let (status, conclusion, title) = match run.status {
         CheckStatus::Queued => ("queued", None, "Queued"),
         CheckStatus::InProgress => ("in_progress", None, "Running"),
@@ -381,31 +447,105 @@ fn check_run(run: &CheckRun, create: bool) -> serde_json::Value {
         CheckStatus::Failure => ("completed", Some("failure"), "Failed"),
         CheckStatus::Cancelled => ("completed", Some("cancelled"), "Cancelled"),
     };
-    let mut body = json!({
-        "name": run.name,
-        "status": status,
-        "output": { "title": title, "summary": summary(&run.summary) },
-    });
-    if create {
-        body["head_sha"] = json!(run.commit);
-    }
+    out.clear();
+    out.push(b'{');
     if let Some(conclusion) = conclusion {
-        body["conclusion"] = json!(conclusion);
+        out.extend_from_slice(b"\"conclusion\":\"");
+        out.extend_from_slice(conclusion.as_bytes());
+        out.extend_from_slice(b"\",");
     }
-    body
+    if create {
+        out.extend_from_slice(b"\"head_sha\":");
+        json_string(out, &[&run.commit]);
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"name\":");
+    json_string(out, &[&run.name]);
+    out.extend_from_slice(b",\"output\":{\"summary\":");
+    let (kept, cut) = summary(&run.summary);
+    json_string(out, &[kept, cut]);
+    out.extend_from_slice(b",\"title\":\"");
+    out.extend_from_slice(title.as_bytes());
+    out.extend_from_slice(b"\"},\"status\":\"");
+    out.extend_from_slice(status.as_bytes());
+    out.extend_from_slice(b"\"}");
 }
 
-/// `text` cut to GitHub's limit at a char boundary, saying it was cut. Bytes are counted,
-/// never fewer than characters, so the cut text is within the limit however GitHub counts.
-fn summary(text: &str) -> String {
+/// `parts`, one after another, as one JSON string escaped byte for byte as serde_json escapes:
+/// `"` and `\`, the five controls with a short form, every other control as `\u00xx` in lower
+/// case, and nothing else.
+fn json_string(out: &mut Vec<u8>, parts: &[&str]) {
+    out.push(b'"');
+    for part in parts {
+        escape(out, part.as_bytes());
+    }
+    out.push(b'"');
+}
+
+const LOW: u64 = 0x0101_0101_0101_0101;
+const HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Whether any byte of `word` is a control, `"` or `\`. Each test (Mycroft's has-less-than and
+/// has-zero) can't tell which byte, but is exact for whether any is.
+fn needs_escape(word: u64) -> bool {
+    let less = |n: u64| word.wrapping_sub(LOW * n) & !word & HIGH;
+    let zero = |x: u64| x.wrapping_sub(LOW) & !x & HIGH;
+    less(0x20) | zero(word ^ (LOW * u64::from(b'"'))) | zero(word ^ (LOW * u64::from(b'\\'))) != 0
+}
+
+/// `bytes` escaped onto `out`, eight at a time while none of them needs it, the runs between
+/// escapes copied whole.
+fn escape(out: &mut Vec<u8>, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let (mut start, mut at) = (0, 0);
+    while at < bytes.len() {
+        if let Some(word) = bytes.get(at..at + 8) {
+            let word = u64::from_le_bytes(word.try_into().expect("eight bytes"));
+            if !needs_escape(word) {
+                at += 8;
+                continue;
+            }
+        }
+        let byte = bytes[at];
+        let short: &[u8] = match byte {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            0x00..=0x1f => b"",
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        out.extend_from_slice(&bytes[start..at]);
+        if short.is_empty() {
+            let (high, low) = (HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]);
+            out.extend_from_slice(&[b'\\', b'u', b'0', b'0', high, low]);
+        } else {
+            out.extend_from_slice(short);
+        }
+        at += 1;
+        start = at;
+    }
+    out.extend_from_slice(&bytes[start..]);
+}
+
+/// `text` cut to GitHub's limit at a char boundary, and the note that it was cut, empty when it
+/// was not. Bytes are counted, never fewer than characters, so the cut text is within the limit
+/// however GitHub counts.
+fn summary(text: &str) -> (&str, &'static str) {
     if text.len() <= MOST_SUMMARY {
-        return text.to_owned();
+        return (text, "");
     }
     let mut at = MOST_SUMMARY - CUT.len();
     while !text.is_char_boundary(at) {
         at -= 1;
     }
-    format!("{}{CUT}", &text[..at])
+    (&text[..at], CUT)
 }
 
 /// A client config with the machine's roots, the ring provider, TLS 1.2 and 1.3.
@@ -495,9 +635,10 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
 }
 
 #[derive(Deserialize)]
-struct Minted {
+struct Minted<'a> {
     token: String,
-    expires_at: String,
+    #[serde(borrow)]
+    expires_at: Cow<'a, str>,
 }
 
 #[derive(Deserialize)]

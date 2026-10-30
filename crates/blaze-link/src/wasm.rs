@@ -216,11 +216,14 @@ impl Writer for Wasm {
     }
 
     fn order(&self, classes: &mut Vec<Class>) {
-        let name = |class: &Class| match class {
-            Class::Named { name, .. } => name.clone(),
-            _ => String::new(),
+        let key = |class: &Class| {
+            let name = match class {
+                Class::Named { name, .. } => name.as_str(),
+                _ => "",
+            };
+            (place(class), name)
         };
-        classes.sort_by_cached_key(|class| (place(class), name(class)));
+        classes.sort_by(|a, b| key(a).cmp(&key(b)));
         classes.dedup();
     }
 
@@ -330,6 +333,7 @@ mod tests {
             live: None,
             tags: 0,
             stack,
+            windows_subsystem: false,
         }
     }
 

@@ -20,12 +20,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 static MADE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a cgroup made here was seen to have `memory.max` and `memory.peak`.
+static KERNEL_CHECKED: AtomicBool = AtomicBool::new(false);
 
 /// The cgroup each process's cgroup is made in, once readied.
 static PARENT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -96,28 +99,39 @@ impl Cgroup {
 
     fn hold(&self, limit: u64) -> io::Result<()> {
         let max = self.dir.join("memory.max");
-        if !max.exists() {
-            return Err(io::Error::new(
+        let not_enabled = || {
+            io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
                     "{} has no memory.max: the memory controller is not enabled for it",
                     self.dir.display()
                 ),
-            ));
+            )
+        };
+        // The kernel and the parent's controllers are the same for every cgroup made, so the
+        // first one's files answer for the rest, which spares each spawn two `stat`s.
+        if !KERNEL_CHECKED.load(Ordering::Relaxed) {
+            if !max.exists() {
+                return Err(not_enabled());
+            }
+            // Asked of it once the process has exited; refused now rather than after the run.
+            // A kernel that keeps it (5.19) also has `cgroup.kill` (5.14), which its end needs.
+            if !self.dir.join("memory.peak").exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{} has no memory.peak: Linux 5.19 or later keeps it, and this is Linux {}",
+                        self.dir.display(),
+                        kernel()
+                    ),
+                ));
+            }
+            KERNEL_CHECKED.store(true, Ordering::Relaxed);
         }
-        // Asked of it once the process has exited; refused now rather than after the run.
-        // A kernel that keeps it (5.19) also has `cgroup.kill` (5.14), which its end needs.
-        if !self.dir.join("memory.peak").exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "{} has no memory.peak: Linux 5.19 or later keeps it, and this is Linux {}",
-                    self.dir.display(),
-                    kernel()
-                ),
-            ));
-        }
-        write(&max, &limit.to_string())?;
+        write(&max, &limit.to_string()).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => not_enabled(),
+            _ => error,
+        })?;
         let swap = self.dir.join("memory.swap.max");
         match write(&swap, "0") {
             Ok(()) => Ok(()),

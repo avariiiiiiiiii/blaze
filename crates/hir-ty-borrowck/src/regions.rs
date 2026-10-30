@@ -38,7 +38,7 @@ use salsa::SalsaValue;
 pub(super) use super::inference::{RegionValues, infer};
 use super::{
     Ctx,
-    bitset::BitSet,
+    bitset::BitMatrix,
     cfg::{Cfg, Location},
     constraints::Constraints,
 };
@@ -169,7 +169,7 @@ pub(super) struct Regions<'db> {
     /// The universal region of each early-bound lifetime parameter, by its index.
     pub(super) early: FxHashMap<u32, Rv>,
     /// Per universal region, the universal regions it is known to outlive.
-    known: Vec<BitSet>,
+    known: BitMatrix,
     /// The type parameters known to outlive a region.
     pub(super) type_bounds: Vec<(Ty<'db>, Rv)>,
     /// The type of each local, its regions variables.
@@ -218,7 +218,7 @@ impl<'db> Regions<'db> {
     }
 
     pub(super) fn knows(&self, longer: usize, shorter: usize) -> bool {
-        self.known[longer].contains(shorter)
+        self.known.contains(longer, shorter)
     }
 
     /// The regions the where clauses say the type parameter `ty` outlives.
@@ -702,7 +702,7 @@ pub(super) fn build<'db>(
             universals: Vec::new(),
             universal_index: FxHashMap::default(),
             static_rv: 0,
-            known: Vec::new(),
+            known: BitMatrix::default(),
             type_bounds: Vec::new(),
             early: FxHashMap::default(),
             local_tys: Vec::new(),
@@ -2716,29 +2716,29 @@ impl<'db> Builder<'_, '_, 'db> {
             self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
         }
         let count = self.regions.universals.len();
-        let mut known = vec![BitSet::new(count); count];
+        let mut known = BitMatrix::new(count, count);
         let static_index = self.regions.universal(self.regions.static_rv).unwrap();
-        for (index, row) in known.iter_mut().enumerate() {
-            row.insert(index);
+        for index in 0..count {
+            known.insert(index, index);
             // Every universal region outlives the body.
-            row.insert(1);
+            known.insert(index, 1);
         }
         for shorter in 0..count {
-            known[static_index].insert(shorter);
+            known.insert(static_index, shorter);
         }
         for (longer, shorter) in pairs {
             if let (Some(longer), Some(shorter)) =
                 (self.regions.universal(longer), self.regions.universal(shorter))
             {
-                known[longer].insert(shorter);
+                known.insert(longer, shorter);
             }
         }
-        // What is known is closed under transitivity.
+        // What is known is closed under transitivity: Warshall's, a row union a word at a
+        // time, `count³ / 64` word operations.
         for middle in 0..count {
             for longer in 0..count {
-                if known[longer].contains(middle) {
-                    let row = known[middle].clone();
-                    known[longer].union(&row);
+                if known.contains(longer, middle) {
+                    known.union_rows(longer, middle);
                 }
             }
         }

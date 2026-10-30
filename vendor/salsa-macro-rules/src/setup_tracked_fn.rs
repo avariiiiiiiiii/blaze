@@ -509,12 +509,7 @@ macro_rules! setup_tracked_fn {
                     }
                 }
 
-                /// Sets the lru capacity
-                ///
-                /// **WARNING:** Just like an ordinary write, this method triggers
-                /// cancellation. If you invoke it while a snapshot exists, it
-                /// will block until that snapshot is dropped -- if that snapshot
-                /// is owned by the current thread, this could trigger deadlock.
+                /// Sets the lru capacity. It takes `&mut`, like a write.
                 fn set_lru_capacity(db: &mut dyn $Db, value: usize) where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
                     $Configuration::fn_ingredient_mut(db).set_capacity(value);
                 }
@@ -525,12 +520,8 @@ macro_rules! setup_tracked_fn {
                 /// durability did not drop), backdates it, so nothing that read it runs again.
                 /// Returns how many values were dropped.
                 ///
-                /// Only functions whose output implements `Hash` have this.
-                ///
-                /// **WARNING:** Just like an ordinary write, this method triggers
-                /// cancellation. If you invoke it while a snapshot exists, it
-                /// will block until that snapshot is dropped -- if that snapshot
-                /// is owned by the current thread, this could trigger deadlock.
+                /// Only functions whose output implements `Hash` have this. It takes `&mut`, like
+                /// a write, so no query runs while it drops values.
                 #[allow(dead_code)]
                 $vis fn evict_values(db: &mut dyn $Db) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
                     let zalsa = db.zalsa_mut();

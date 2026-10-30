@@ -225,7 +225,7 @@ impl<'db> UnsafeVisitor<'db> {
     }
 
     fn walk_pat(&mut self, current: PatId) {
-        let pat = &self.body[current];
+        let pat = self.body.pat(current);
 
         if self.inside_union_destructure {
             match pat {
@@ -258,7 +258,7 @@ impl<'db> UnsafeVisitor<'db> {
                 }
             }
             Pat::Path(path) => self.mark_unsafe_path(current.into(), path),
-            &Pat::Expr(expr) => self.walk_expr(expr),
+            Pat::Expr(expr) => self.walk_expr(expr),
             _ => {}
         }
 
@@ -266,10 +266,10 @@ impl<'db> UnsafeVisitor<'db> {
     }
 
     fn walk_expr(&mut self, current: ExprId) {
-        let expr = &self.body[current];
+        let expr = self.body.expr(current);
         let inside_assignment = mem::replace(&mut self.inside_assignment, false);
         match expr {
-            &Expr::Call { callee, .. } => {
+            Expr::Call { callee, .. } => {
                 let callee = self.infer.expr_ty(callee);
                 if let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(func)), _) =
                     callee.kind()
@@ -288,7 +288,7 @@ impl<'db> UnsafeVisitor<'db> {
                 self.resolver.reset_to_guard(guard);
             }
             Expr::Ref { expr, rawness: Rawness::RawPtr, mutability: _ } => {
-                match self.body[*expr] {
+                match self.body.expr(expr) {
                     // Do not report unsafe for `addr_of[_mut]!(EXTERN_OR_MUT_STATIC)`,
                     // see https://github.com/rust-lang/rust/pull/125834.
                     Expr::Path(_) => return,
@@ -301,12 +301,12 @@ impl<'db> UnsafeVisitor<'db> {
                     _ => (),
                 }
 
-                let mut peeled = *expr;
-                while let Expr::Field { expr: lhs, .. } = &self.body[peeled] {
+                let mut peeled = expr;
+                while let Expr::Field { expr: lhs, .. } = self.body.expr(peeled) {
                     if let Some(Either::Left(FieldId { parent: VariantId::UnionId(_), .. })) =
                         self.infer.field_resolution(peeled)
                     {
-                        peeled = *lhs;
+                        peeled = lhs;
                     } else {
                         break;
                     }
@@ -323,11 +323,11 @@ impl<'db> UnsafeVisitor<'db> {
                 }
             }
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-                if let TyKind::RawPtr(..) = self.infer.expr_ty(*expr).kind() {
+                if let TyKind::RawPtr(..) = self.infer.expr_ty(expr).kind() {
                     self.on_unsafe_op(current.into(), UnsafetyReason::RawPtrDeref);
                 }
             }
-            &Expr::Assignment { target, value: _ } => {
+            Expr::Assignment { target, value: _ } => {
                 let old_inside_assignment = mem::replace(&mut self.inside_assignment, true);
                 self.walk_pats_top(std::iter::once(target), current);
                 self.inside_assignment = old_inside_assignment;
@@ -396,7 +396,7 @@ impl<'db> UnsafeVisitor<'db> {
             Expr::Match { arms, .. } => {
                 self.walk_pats_top(arms.iter().map(|arm| arm.pat), current);
             }
-            &Expr::Let { pat, .. } => {
+            Expr::Let { pat, .. } => {
                 self.walk_pats_top(std::iter::once(pat), current);
             }
             Expr::Closure { args, .. } => {

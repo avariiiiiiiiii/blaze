@@ -200,7 +200,147 @@ def selftest() -> list[str]:
         {"name": "nushell body", "verdict": "fail", "detail": "took 80 ms", "numbers": {"ms": 80, "budget": 30}}]})])
     if "| nushell body | fail | ms=80  budget=30 | took 80 ms |" not in md:
         wrong.append(f"markdown has no row of the budget:\n{md}")
-    return wrong + v2_work_wrong()
+    return wrong + v2_work_wrong() + files_wrong() + v1_logs_wrong()
+
+
+def old_outputs(target: Path, profile: str) -> dict[str, str]:
+    """`engine.outputs` as it was (iterdir, an lstat a file, a read a megabyte): its model."""
+    import hashlib
+    import stat
+
+    top = target / profile
+    found: dict[str, str] = {}
+    for sub in (top, top / "examples", top / "deps"):
+        if not sub.is_dir():
+            continue
+        for path in sorted(sub.iterdir()):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if (bool(info.st_mode & 0o111) and not path.suffix) or path.suffix in engine.OUTPUT_SUFFIXES:
+                found[str(path.relative_to(top))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return found
+
+
+def old_first_difference(a: Path, b: Path) -> str:
+    """`engine.first_difference` as it was (64 KiB reads, a byte loop): its model."""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        at = 0
+        while True:
+            x, y = fa.read(1 << 16), fb.read(1 << 16)
+            if x != y:
+                for i, (p, q) in enumerate(zip(x, y)):
+                    if p != q:
+                        return f"byte {at + i:#x}: {p:#04x} against {q:#04x}"
+                return f"one ends at byte {at + min(len(x), len(y)):#x}"
+            if not x:
+                return "the same"
+            at += len(x)
+
+
+def files_wrong() -> list[str]:
+    """`engine.outputs`, `first_difference`, `tree_digest` and `Kept` against their models, on
+    files made here: sizes across the megabyte buffers, every kind of entry `outputs` skips."""
+    import os
+    import random
+    import tempfile
+
+    wrong: list[str] = []
+    rng = random.Random(1606)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        top = root / "target" / "debug"
+        for sub in (top / "deps", top / "examples", top / ".fingerprint"):
+            sub.mkdir(parents=True)
+        names = ["app", "libx.rlib", "libx.rmeta", "x.d", "x.o", "libz.so", "test-1a2b", "empty.rlib", ".cargo-lock"]
+        for i, name in enumerate(names):
+            for sub in (top, top / "deps", top / "examples"):
+                size = rng.choice([0, 1, 4095, (1 << 20) + 3, 3 << 20]) if i % 3 == 0 else rng.randrange(2000)
+                (sub / name).write_bytes(rng.randbytes(size))
+                if name in ("app", "test-1a2b", "x.o"):
+                    (sub / name).chmod(0o755)
+        (top / "deps" / "link").symlink_to(top / "app")
+        (top / "deps" / "dir.rlib").mkdir()
+        if (got := engine.outputs(root / "target")) != (want := old_outputs(root / "target", "debug")):
+            wrong.append(f"engine.outputs: {sorted(set(got.items()) ^ set(want.items()))[:4]}")
+        if engine.outputs(root / "target", "release"):
+            wrong.append("engine.outputs: a profile with no directory has outputs")
+        a, b = root / "a", root / "b"
+        for size in (0, 1, 64, 65, 1 << 16, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, (2 << 20) + 77):
+            body = rng.randbytes(size)
+            a.write_bytes(body)
+            cases = [body, body + b"x", body[:-1] if body else b"y", body[: size // 2]]
+            for at in {0, size // 3, size - 1, (1 << 20) - 1, 1 << 20} if size else set[int]():
+                if 0 <= at < size:
+                    other = bytearray(body)
+                    other[at] ^= 0x10
+                    if at + 7 < size:
+                        other[-1] ^= 1
+                    cases.append(bytes(other))
+            for other in cases:
+                b.write_bytes(other)
+                for first, second in ((a, b), (b, a)):
+                    if (got_d := engine.first_difference(first, second)) != (want_d := old_first_difference(first, second)):
+                        wrong.append(f"engine.first_difference, {size} bytes: {got_d!r}, not {want_d!r}")
+        src = root / "src"
+        (src / "target").mkdir(parents=True)
+        (src / "lib.rs").write_text("fn f() {}\n")
+        (src / "target" / "out").write_text("built\n")
+        (src / "build.sh").write_text("#!/bin/sh\n")
+        before = engine.tree_digest(src, ("target",))
+        (src / "target" / "out").write_text("built again\n")
+        if engine.tree_digest(src, ("target",)) != before:
+            wrong.append("engine.tree_digest reads a directory it skips")
+        for change in ("edit", "mode", "link", "rename"):
+            if change == "edit":
+                (src / "lib.rs").write_text("fn g() {}\n")
+            elif change == "mode":
+                (src / "build.sh").chmod(0o755)
+            elif change == "link":
+                os.symlink("lib.rs", src / "alias.rs")
+            else:
+                (src / "lib.rs").rename(src / "main.rs")
+            after = engine.tree_digest(src, ("target",))
+            if after == before:
+                wrong.append(f"engine.tree_digest misses a {change}")
+            before = after
+        kept = engine.Kept(str(root / "kept"), "test")
+        key = kept.key("a", "b")
+        if key == kept.key("a\0b") or key == engine.Kept("", "other").key("a", "b"):
+            wrong.append("engine.Kept.key: two inputs have one key")
+        if kept.get(key) is not None:
+            wrong.append("engine.Kept.get: an entry before it was put")
+        kept.put(key, {"returncode": 1, "stdout": "x"})
+        if kept.get(key) != {"returncode": 1, "stdout": "x"}:
+            wrong.append(f"engine.Kept: {kept.get(key)!r} came back")
+        off = engine.Kept("", "test")
+        off.put(key, 1)
+        if off.get(key) is not None:
+            wrong.append("engine.Kept with no root kept something")
+    return wrong
+
+
+def v1_logs_wrong() -> list[str]:
+    """`V1.work_since` reads only what each worker's log gained after the mark, and all of it."""
+    import tempfile
+
+    wrong: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        logs = [home / "workers" / str(i) / "log" for i in (1, 2)]
+        for log in logs:
+            log.parent.mkdir(parents=True)
+            log.write_text("stats: 100 of 100 functions compiled\n")
+        eng = engine.V1(engine.EngineSpec("v1", sys.executable))
+        mark = eng.mark(home)
+        with open(logs[0], "a") as f:
+            f.write("stats: 3 of 10 functions compiled\nlink: app (spliced into the running program)\n")
+        with open(logs[1], "a") as f:
+            f.write("store: 5 functions found, 2 compiled and added\nstats: 2 of 9 functions compiled\n")
+        work = eng.work_since(home, mark)
+        if (work.compiled, work.found, work.link) != (5, 5, "spliced"):
+            wrong.append(f"V1.work_since: {work}")
+    return wrong
 
 
 def v2_work_wrong() -> list[str]:

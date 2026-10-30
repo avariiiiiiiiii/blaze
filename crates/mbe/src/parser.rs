@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use intern::{Symbol, sym};
+use rustc_hash::FxHashMap;
 use span::{Edition, Span, SyntaxContext};
 use tt::{
     MAX_GLUED_PUNCT_LEN,
@@ -90,13 +91,20 @@ impl MetaTemplate {
     }
 }
 
+/// The number of a metavariable its rule's pattern declares, given by [`resolve_binders`]: the
+/// index of its bindings, so that matching and transcribing never hash a name.
+pub(crate) type Binder = u32;
+
+/// A metavariable the pattern does not declare (or one not resolved yet).
+pub(crate) const NO_BINDER: Binder = u32::MAX;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
-    Var { name: MetaVar, kind: Option<MetaVarKind>, id: Span },
-    Ignore { name: MetaVar, id: Span },
+    Var { name: MetaVar, kind: Option<MetaVarKind>, id: Span, binder: Binder },
+    Ignore { name: MetaVar, id: Span, binder: Binder },
     Index { depth: usize },
     Len { depth: usize },
-    Count { name: MetaVar, depth: usize },
+    Count { name: MetaVar, depth: usize, binder: Binder },
     Concat { elements: Box<[ConcatMetaVarExprElem]>, span: Span },
     Repeat { tokens: MetaTemplate, kind: RepeatKind, separator: Option<Arc<Separator>> },
     Subtree { tokens: MetaTemplate, delimiter: tt::Delimiter },
@@ -108,7 +116,7 @@ pub(crate) enum Op {
 /// The name of a metavariable. Two of one spelling are two variables when they were written by
 /// different expansions, as the `$arg`s of a macro that another macro writes out an argument at a
 /// time.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MetaVar {
     sym: Symbol,
     ctx: SyntaxContext,
@@ -137,7 +145,7 @@ pub(crate) enum ConcatMetaVarExprElem {
     Ident(tt::Ident),
     /// There is a preceding dollar sign, which means that this identifier should be expanded
     /// and interpreted as a variable.
-    Var(tt::Ident),
+    Var { ident: tt::Ident, binder: Binder },
     /// For example, a number or a string.
     Literal(tt::Literal),
 }
@@ -264,15 +272,15 @@ fn next_op(
                     }
                     tt::Leaf::Ident(ident) => {
                         let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = MetaVar::new(ident.sym.clone(), ident.span);
+                        let name = MetaVar::new(ident.sym, ident.span);
                         let id = ident.span;
-                        Op::Var { name, kind, id }
+                        Op::Var { name, kind, id, binder: NO_BINDER }
                     }
                     tt::Leaf::Literal(lit) if is_boolean_literal(&lit) => {
                         let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = MetaVar::new(lit.text_and_suffix.clone(), lit.span);
+                        let name = MetaVar::new(lit.text_and_suffix, lit.span);
                         let id = lit.span;
-                        Op::Var { name, kind, id }
+                        Op::Var { name, kind, id, binder: NO_BINDER }
                     }
                     tt::Leaf::Punct(punct @ tt::Punct { char: '$', .. }) => match mode {
                         Mode::Pattern => {
@@ -425,7 +433,11 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
         s if sym::ignore == *s => {
             args_iter.expect_dollar()?;
             let ident = args_iter.expect_ident()?;
-            Op::Ignore { name: MetaVar::new(ident.sym.clone(), ident.span), id: ident.span }
+            Op::Ignore {
+                name: MetaVar::new(ident.sym, ident.span),
+                id: ident.span,
+                binder: NO_BINDER,
+            }
         }
         s if sym::index == *s => Op::Index { depth: parse_depth(&mut args_iter)? },
         s if sym::len == *s => Op::Len { depth: parse_depth(&mut args_iter)? },
@@ -434,7 +446,7 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
             let ident = args_iter.expect_ident()?;
             let depth =
                 if try_eat_comma(&mut args_iter) { parse_depth(&mut args_iter)? } else { 0 };
-            Op::Count { name: MetaVar::new(ident.sym.clone(), ident.span), depth }
+            Op::Count { name: MetaVar::new(ident.sym, ident.span), depth, binder: NO_BINDER }
         }
         s if sym::concat == *s => {
             let mut elements = Vec::new();
@@ -447,7 +459,7 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
                     let ident = args_iter.expect_ident_or_underscore()?.clone();
 
                     if is_var {
-                        ConcatMetaVarExprElem::Var(ident)
+                        ConcatMetaVarExprElem::Var { ident, binder: NO_BINDER }
                     } else {
                         ConcatMetaVarExprElem::Ident(ident)
                     }
@@ -500,4 +512,48 @@ fn try_eat_dollar(src: &mut TtIter<'_>) -> bool {
         return true;
     }
     false
+}
+
+/// Numbers the metavariables `lhs` declares, one number per name in the order the names first
+/// appear, and gives every metavariable of `lhs` and `rhs` its name's number ([`NO_BINDER`] for
+/// one `lhs` declares no binding for). Returns how many numbers there are. Runs once per rule,
+/// when the macro is defined.
+pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) -> u32 {
+    let mut binders = FxHashMap::default();
+    declare(lhs, &mut binders);
+    resolve(rhs, &binders);
+    return binders.len() as u32;
+
+    fn declare(template: &mut MetaTemplate, binders: &mut FxHashMap<MetaVar, Binder>) {
+        for op in template.0.iter_mut() {
+            match op {
+                Op::Var { name, binder, .. } => {
+                    let next = binders.len() as Binder;
+                    *binder = *binders.entry(*name).or_insert(next);
+                }
+                Op::Repeat { tokens, .. } | Op::Subtree { tokens, .. } => declare(tokens, binders),
+                _ => (),
+            }
+        }
+    }
+
+    fn resolve(template: &mut MetaTemplate, binders: &FxHashMap<MetaVar, Binder>) {
+        let lookup = |name: &MetaVar| binders.get(name).copied().unwrap_or(NO_BINDER);
+        for op in template.0.iter_mut() {
+            match op {
+                Op::Var { name, binder, .. }
+                | Op::Ignore { name, binder, .. }
+                | Op::Count { name, binder, .. } => *binder = lookup(name),
+                Op::Concat { elements, .. } => {
+                    for element in elements.iter_mut() {
+                        if let ConcatMetaVarExprElem::Var { ident, binder } = element {
+                            *binder = lookup(&MetaVar::new(ident.sym, ident.span));
+                        }
+                    }
+                }
+                Op::Repeat { tokens, .. } | Op::Subtree { tokens, .. } => resolve(tokens, binders),
+                _ => (),
+            }
+        }
+    }
 }

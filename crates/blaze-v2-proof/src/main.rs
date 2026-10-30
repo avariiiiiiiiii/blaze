@@ -57,9 +57,19 @@ struct Output {
     needless: Vec<String>,
 }
 
+/// `kkkk:` and the first 8 bytes of the input in hex, written into one 21-byte string.
 fn name(key: &QueryKey) -> String {
-    let hex: String = key.input.0[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("{:04x}:{hex}", key.kind.0)
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(21);
+    for shift in [12, 8, 4, 0] {
+        out.push(HEX[usize::from(key.kind.0 >> shift) & 15] as char);
+    }
+    out.push(':');
+    for &b in &key.input.0[..8] {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 15)] as char);
+    }
+    out
 }
 
 fn found(stale: &Stale) -> Found {
@@ -96,8 +106,8 @@ fn read_input(arg: &str) -> Result<Given, String> {
 }
 
 fn trace(path: &Path) -> Result<Trace, String> {
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    blaze_protocol::cbor::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    let mapped = blaze_v2_proof::bytes::Mapped::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    blaze_protocol::cbor::from_slice(mapped.bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn compare(input: &Input) -> Result<Output, String> {

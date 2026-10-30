@@ -114,6 +114,8 @@ have no locks.
    (deref it for `&[u8]`), and `list` is a borrowed iterator. blaze-vfs has no lock left.
    Two follow-ups are outside these paths: items 8 and 9.
 
+> applied: by lane vfs itself (`crates/blaze-vfs/src/reader.rs`, as its note says); 8 and 9 are the follow-ups.
+
 ## 8. db: hold a view's bytes as lent, not as an `Arc`
 
 What: `blaze_query::Tree::file` returns borrowed bytes, and `InputData::File` keeps the
@@ -127,6 +129,8 @@ reaches, so bytes lent for a view stay valid until that view closes and a reclai
 `MemTree` would keep its roots in a `blaze_ids::Sharded` (append-only, lock-free), which also
 drops its `Mutex`, banned in blaze-query by concurrency.md.
 
+> forwarded to db: `blaze_query::Tree` and `InputData` (`crates/blaze-query/`) are lane db's; it waits on item 7, also db's.
+
 ## 9. daemon (core/integration): call `Vfs::reclaim` at quiescence
 
 What: once every worker has passed a task boundary after a `Vfs::collect` (or any change, for
@@ -135,3 +139,5 @@ grown levels), the daemon calls `unsafe { vfs.reclaim() }`.
 Why: retired table levels and dropped nodes are held until then, so without the call memory
 grows with every collection (nothing is unsound, it is just never freed until the `Vfs` and
 every `Reader` are dropped). The contract is in `Vfs::reclaim`'s doc.
+
+> forwarded to cargo: the daemon's loop is `crates/blaze-cargo/src/serve/daemon.rs`, lane cargo's (after a `Vfs::collect` and at the task boundary the plane reports).

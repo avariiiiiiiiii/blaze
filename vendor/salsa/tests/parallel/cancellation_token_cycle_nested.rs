@@ -9,7 +9,7 @@
 use salsa::Database;
 
 use crate::setup::{Knobs, KnobsDatabase};
-use crate::sync::thread;
+use crate::sync::{mpsc, thread};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 struct CycleValue(u32);
@@ -74,73 +74,93 @@ fn initial(db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 #[test]
 fn multi_threaded_cycle_completes_despite_cancellation() {
     let db = Knobs::default();
-    let db_t1 = db.clone();
-    let db_t2 = db.clone();
-    let db_t3 = db.clone();
-    let db_t4 = db.clone();
-    let db_t5 = db.clone();
-    let db_signaler = db;
+    let db = &db;
+    thread::scope(|scope| {
+        let (token_tx, token_rx) = mpsc::channel();
 
-    let token_t1 = db_t1.cancellation_token();
-    let token_t2 = db_t2.cancellation_token();
-    let token_t3 = db_t3.cancellation_token();
-    let token_t5 = db_t5.cancellation_token();
+        // Thread 1: Runs the main cycle, will have cancellation requested during it
+        let t1 = scope.spawn({
+            let token_tx = token_tx.clone();
+            move || {
+                token_tx.send(db.cancellation_token()).unwrap();
+                query_a(db)
+            }
+        });
+        let token_t1 = token_rx.recv().unwrap();
 
-    // Thread 1: Runs the main cycle, will have cancellation requested during it
-    let t1 = thread::spawn(move || query_a(&db_t1));
+        // Wait for t1 to start the cycle
+        db.wait_for(1);
 
-    // Wait for t1 to start the cycle
-    db_signaler.wait_for(1);
+        // Spawn t2 and wait for it to block on the cycle
+        let t2 = scope.spawn({
+            let token_tx = token_tx.clone();
+            move || {
+                token_tx.send(db.cancellation_token()).unwrap();
+                db.signal_on_will_block(2);
+                query_b(db)
+            }
+        });
+        let token_t2 = token_rx.recv().unwrap();
+        db.wait_for(2);
 
-    // Spawn t2 and wait for it to block on the cycle
-    db_signaler.signal_on_will_block(2);
-    let t2 = thread::spawn(move || query_b(&db_t2));
-    db_signaler.wait_for(2);
+        // Spawn t3 and wait for it to block on the cycle
+        let t3 = scope.spawn({
+            let token_tx = token_tx.clone();
+            move || {
+                token_tx.send(db.cancellation_token()).unwrap();
+                db.signal_on_will_block(3);
+                query_d(db)
+            }
+        });
+        let token_t3 = token_rx.recv().unwrap();
+        db.wait_for(3);
 
-    // Spawn t3 and wait for it to block on the cycle
-    db_signaler.signal_on_will_block(3);
-    let t3 = thread::spawn(move || query_d(&db_t3));
-    db_signaler.wait_for(3);
+        // Spawn t4 - doesn't get cancelled
+        let t4 = scope.spawn(move || {
+            db.signal_on_will_block(4);
+            query_e(db)
+        });
+        db.wait_for(4);
 
-    // Spawn t4 - doesn't get cancelled
-    db_signaler.signal_on_will_block(4);
-    let t4 = thread::spawn(move || query_e(&db_t4));
-    db_signaler.wait_for(4);
+        // Spawn t5 - blocked on the cycle without being part of it
+        let t5 = scope.spawn(move || {
+            token_tx.send(db.cancellation_token()).unwrap();
+            db.signal_on_will_block(5);
+            query_f(db)
+        });
+        let token_t5 = token_rx.recv().unwrap();
+        db.wait_for(5);
 
-    // Spawn t5 - doesn't get cancelled
-    db_signaler.signal_on_will_block(5);
-    let t5 = thread::spawn(move || query_f(&db_t5));
-    db_signaler.wait_for(5);
+        // Request cancellation while t2 and t3 are blocked on the cycle
+        // This should be deferred until after the cycle completes
+        token_t1.cancel();
+        token_t2.cancel();
+        token_t3.cancel();
+        token_t5.cancel();
 
-    // Request cancellation while t2 and t3 are blocked on the cycle
-    // This should be deferred until after the cycle completes
-    token_t1.cancel();
-    token_t2.cancel();
-    token_t3.cancel();
-    token_t5.cancel();
+        // Let t1 continue - the cycle should still complete because
+        // cancellation is disabled during fixpoint iteration
+        db.signal(6);
 
-    // Let t1 continue - the cycle should still complete because
-    // cancellation is disabled during fixpoint iteration
-    db_signaler.signal(6);
+        // All threads should complete successfully
+        let r_t1 = t1.join().unwrap();
+        let r_t2 = t2.join().unwrap();
+        let r_t3 = t3.join().unwrap();
+        let r_t4 = t4.join().unwrap();
 
-    // All threads should complete successfully
-    let r_t1 = t1.join().unwrap();
-    let r_t2 = t2.join().unwrap();
-    let r_t3 = t3.join().unwrap();
-    let r_t4 = t4.join().unwrap();
+        let r_t5 = t5.join().unwrap_err();
 
-    let r_t5 = t5.join().unwrap_err();
-
-    // All should get MAX because cycles defer cancellation
-    assert_eq!(r_t1, MAX, "t1 should get MAX");
-    assert_eq!(r_t2, MAX, "t2 should get MAX");
-    assert_eq!(r_t3, MAX, "t3 should get MAX");
-    assert_eq!(r_t4, MAX, "t4 should get MAX");
-    assert!(
-        matches!(
-            *r_t5.downcast::<salsa::Cancelled>().unwrap(),
-            salsa::Cancelled::Local
-        ),
-        "t5 should be cancelled as its blocked on the cycle, not participating in it and calling an uncomputed query after"
-    );
+        // All should get MAX because cycles defer cancellation
+        assert_eq!(r_t1, MAX, "t1 should get MAX");
+        assert_eq!(r_t2, MAX, "t2 should get MAX");
+        assert_eq!(r_t3, MAX, "t3 should get MAX");
+        assert_eq!(r_t4, MAX, "t4 should get MAX");
+        assert!(
+            matches!(
+                *r_t5.downcast::<salsa::Cancelled>().unwrap(),
+                salsa::Cancelled::Local
+            ),
+            "t5 should be cancelled as its blocked on the cycle, not participating in it and calling an uncomputed query after"
+        );
+    });
 }

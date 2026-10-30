@@ -34,15 +34,15 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> u32 {
 #[test]
 fn execute() {
     let db = Knobs::default();
+    let db = &db;
 
-    let db_t1 = db.clone();
-    let t1 = std::thread::spawn(move || query_a(&db_t1));
+    std::thread::scope(|scope| {
+        let t1 = scope.spawn(move || query_a(db));
+        let t2 = scope.spawn(move || query_b(db));
 
-    let db_t2 = db.clone();
-    let t2 = std::thread::spawn(move || query_b(&db_t2));
-
-    // The main thing here is that we don't deadlock.
-    let (r1, r2) = (t1.join(), t2.join());
-    assert!(r1.is_err());
-    assert!(r2.is_err());
+        // The main thing here is that we don't deadlock.
+        let (r1, r2) = (t1.join(), t2.join());
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+    });
 }

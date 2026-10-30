@@ -186,15 +186,24 @@ impl Site {
         let closed = std::thread::Builder::new()
             .name("blaze-web-socket".into())
             .spawn(move || read_until_closed(reader))?;
+        let mut frames = Frames::default();
         let sent = (|| {
             while !closed.is_finished() {
                 match following.next(PATIENCE / 10) {
-                    Next::Message(message) => write_frame(&mut writer, 0x2, &message)?,
+                    // Every message there already goes in the same writes.
+                    Next::Message(message) => {
+                        frames.push(&mut writer, 0x2, &message)?;
+                        while let Some(message) = following.ready() {
+                            frames.push(&mut writer, 0x2, &message)?;
+                        }
+                        frames.flush(&mut writer)?;
+                    }
                     Next::Nothing => {}
                     Next::Gone => break,
                 }
             }
-            write_frame(&mut writer, 0x8, &[])
+            frames.push(&mut writer, 0x8, &[])?;
+            frames.flush(&mut writer)
         })();
         let _ = writer.shutdown(Shutdown::Both);
         sent
@@ -297,23 +306,85 @@ fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io:
     stream.write_all(&response)
 }
 
-/// Writes one unmasked frame of `opcode`, as a server does.
-pub(crate) fn write_frame(to: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut head = Vec::with_capacity(10);
-    head.push(0x80 | opcode);
-    match payload.len() {
-        len @ 0..=125 => head.push(len as u8),
-        len @ 126..=0xffff => {
-            head.push(126);
-            head.extend((len as u16).to_be_bytes());
+/// A payload this long is written from where it is, beside what is buffered, not copied.
+const IN_PLACE: usize = 64 << 10;
+/// What is buffered is written once it is this long.
+const BUFFERED: usize = 256 << 10;
+
+/// Unmasked frames, as a server sends them, in as few writes as they fit: heads and short
+/// payloads are copied into one buffer, written with the next long payload or at a flush.
+#[derive(Default)]
+pub(crate) struct Frames {
+    out: Vec<u8>,
+}
+
+impl Frames {
+    pub(crate) fn push(
+        &mut self,
+        to: &mut impl Write,
+        opcode: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        head(&mut self.out, opcode, payload.len());
+        if payload.len() >= IN_PLACE {
+            write_both(to, &self.out, payload)?;
+            self.out.clear();
+            return Ok(());
         }
-        len => {
-            head.push(127);
-            head.extend((len as u64).to_be_bytes());
+        self.out.extend_from_slice(payload);
+        if self.out.len() >= BUFFERED {
+            self.flush(to)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self, to: &mut impl Write) -> io::Result<()> {
+        if !self.out.is_empty() {
+            to.write_all(&self.out)?;
+            self.out.clear();
+        }
+        Ok(())
+    }
+}
+
+fn head(out: &mut Vec<u8>, opcode: u8, len: usize) {
+    out.push(0x80 | opcode);
+    match len {
+        0..=125 => out.push(len as u8),
+        126..=0xffff => {
+            out.push(126);
+            out.extend((len as u16).to_be_bytes());
+        }
+        _ => {
+            out.push(127);
+            out.extend((len as u64).to_be_bytes());
         }
     }
-    to.write_all(&head)?;
-    to.write_all(payload)
+}
+
+/// `first` then `then`, in one write when the stream takes both.
+fn write_both(to: &mut impl Write, mut first: &[u8], mut then: &[u8]) -> io::Result<()> {
+    while !first.is_empty() {
+        match to.write_vectored(&[io::IoSlice::new(first), io::IoSlice::new(then)]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) if n < first.len() => first = &first[n..],
+            Ok(n) => {
+                then = &then[n - first.len()..];
+                first = &[];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    to.write_all(then)
+}
+
+/// Writes one unmasked frame of `opcode`, as a server does.
+#[cfg(test)]
+pub(crate) fn write_frame(to: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    let mut frames = Frames::default();
+    frames.push(to, opcode, payload)?;
+    frames.flush(to)
 }
 
 /// What a frame from the page is.

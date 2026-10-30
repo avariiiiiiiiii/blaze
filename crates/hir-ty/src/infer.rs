@@ -1529,6 +1529,11 @@ impl<'db> InferenceResult<'db> {
         &self.diagnostics
     }
 
+    /// The anonymous consts of the body this inferred, including those inside them.
+    pub fn defined_anon_consts(&self) -> &[AnonConstId<'db>] {
+        &self.defined_anon_consts
+    }
+
     pub fn tuple_field_access_type<'a>(&self, id: TupleId) -> Tys<'a> {
         self.tuple_field_access_types[id.0 as usize].as_ref()
     }

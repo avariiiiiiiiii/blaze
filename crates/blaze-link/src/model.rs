@@ -496,7 +496,8 @@ pub(crate) struct Tls {
     pub align: u64,
 }
 
-/// An image placed and relocated, as a writer reads it.
+/// An image placed and relocated, as a writer reads it. `got`, `rebase`, `binds` and
+/// `functions` are in address order.
 pub(crate) struct Placed<'a> {
     pub output: &'a Output,
     /// The image's file name, the last component of where it is written: a code signature's
@@ -637,7 +638,8 @@ pub(crate) trait Writer: Send + Sync {
     /// Where the region at `addr` is in the file: `None` for one not in the file (zeroed).
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64>;
 
-    /// The file's headers and its parts outside the address space.
+    /// The file's headers and its parts outside the address space. `placed` holds each
+    /// synthetic region's bytes as [`Writer::synthesize`] returned them.
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError>;
 }
 

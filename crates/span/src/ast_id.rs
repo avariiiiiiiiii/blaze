@@ -37,7 +37,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use la_arena::{Arena, Idx, RawIdx};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
     AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
@@ -496,8 +495,10 @@ fn block_expr_ast_id(
     }
 }
 
+/// The next index of each kind and hash value, keyed by both in one word (`kind << 16 | hash`),
+/// so a key hashes with one multiply.
 #[derive(Default)]
-struct ErasedAstIdNextIndexMap(FxHashMap<(ErasedFileAstIdKind, u16), u32>);
+struct ErasedAstIdNextIndexMap(FxHashMap<u32, u32>);
 
 impl ErasedAstIdNextIndexMap {
     #[inline]
@@ -509,7 +510,7 @@ impl ErasedAstIdNextIndexMap {
         // to handle it gracefully. We just increment the hash.
         let mut hash = initial_hash;
         let index = loop {
-            match self.0.entry((kind, hash)) {
+            match self.0.entry(((kind as u32) << HASH_BITS) | u32::from(hash)) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let i = entry.get_mut();
                     if *i < ((1 << INDEX_BITS) - 1) {
@@ -641,116 +642,294 @@ register_assoc_item_ast_id! {
 /// outline parses only the bodies asked about. Which bodies were walked is not part of what
 /// the map is: two maps are equal when their ids outside bodies are, and their bodies are at
 /// the same places with the same text and slots, which make the same ids.
-#[derive(Default)]
+///
+/// Costs: an id outside fn bodies is a 16-byte [`Entry`] in both [`Index`]es (11 to 21 bytes
+/// each), 37 to 59 bytes in all, and a lookup either way is a multiply and two cache lines. A
+/// body is 60 bytes until it is walked ([`Bodies`]) and 24 bytes per id after ([`BodyIds`]);
+/// a lookup in one is a binary search of the bodies, then one of its ids. A lookup locks
+/// nothing and writes nothing shared, but for the first one in a body, which fills its
+/// `OnceLock`; a filled one is read with one acquire load.
 pub struct AstIdMap {
-    /// An arena of the ptrs and their associated ID.
-    arena: Arena<(SyntaxNodePtr, ErasedFileAstId)>,
-    /// Map ptr to id.
-    ptr_map: hashbrown::HashTable<ArenaId>,
-    /// Map id to ptr.
-    id_map: hashbrown::HashTable<ArenaId>,
-    /// The fn bodies, in the order of their text.
-    bodies: Box<[Body]>,
-    /// The bodies' numbers in `bodies`, in the order of their first slot.
-    by_slot: Box<[u32]>,
+    /// What is outside fn bodies: the root first, then in the walk's order.
+    entries: Box<[Entry]>,
+    /// `entries` by where they begin.
+    by_start: Index,
+    /// `entries` by id.
+    by_id: Index,
+    bodies: Bodies,
 }
 
-type ArenaId = Idx<(SyntaxNodePtr, ErasedFileAstId)>;
+/// A node with an id, as words: where it begins, where it ends, its kind and its id. Plain
+/// words, so that a map's entries are compared as one `[u32]` and hashed with one `write`:
+/// salsa compares and fingerprints maps to backdate them.
+type Entry = [u32; 4];
+const START: usize = 0;
+const END: usize = 1;
+const KIND: usize = 2;
+const ID: usize = 3;
+const _: () = assert!(size_of::<Entry>() == 16);
 
-/// A fn body, whose ids are made by a walk of it alone, when it is first asked about.
-struct Body {
+/// A node's place and kind, as the first three words of its [`Entry`].
+type Key = [u32; 3];
+
+#[inline]
+fn entry(kind: SyntaxKind, range: TextRange, id: ErasedFileAstId) -> Entry {
+    let [start, end, kind] = key_of(kind, range);
+    [start, end, kind, id.0]
+}
+
+#[inline]
+fn key_of(kind: SyntaxKind, range: TextRange) -> Key {
+    [u32::from(range.start()), u32::from(range.end()), u32::from(u16::from(kind))]
+}
+
+#[inline]
+fn key(ptr: SyntaxNodePtr) -> Key {
+    key_of(ptr.kind(), ptr.text_range())
+}
+
+#[inline]
+fn entry_ptr(entry: &Entry) -> SyntaxNodePtr {
+    SyntaxNodePtr::from_parts(
+        SyntaxKind::from(entry[KIND] as u16),
+        TextRange::new(entry[START].into(), entry[END].into()),
+    )
+}
+
+#[inline]
+fn entry_id(entry: &Entry) -> ErasedFileAstId {
+    ErasedFileAstId(entry[ID])
+}
+
+#[inline]
+fn is_at(entry: &Entry, key: Key) -> bool {
+    entry[START] == key[0] && entry[END] == key[1] && entry[KIND] == key[2]
+}
+
+/// An open-addressed table from one word of each of a map's entries (where it begins, or its
+/// id) to the entry's number. Each slot is the word and the number plus one (0 for empty):
+/// 8 bytes, 8 to a cache line. The table is a power of two, under 3/4 full, probed linearly
+/// from a Fibonacci hash of the word (a multiply and a shift, no hasher), so a hit probes at
+/// most 2.5 slots on average, nearly always in one line, and a miss stops at the first empty
+/// slot. 10.7 to 21.3 bytes per entry. Built once; read by any number of threads with plain
+/// loads.
+#[derive(Default)]
+struct Index {
+    slots: Box<[[u32; 2]]>,
+    /// `slots.len()` is `1 << bits`.
+    bits: u32,
+}
+
+impl Index {
+    /// The index of `len` entries, the `i`th's word `word(i)`.
+    fn new(len: usize, word: impl Fn(usize) -> u32) -> Index {
+        let size = (len + len / 3 + 1).next_power_of_two().max(2);
+        let bits = size.trailing_zeros();
+        let mut slots = vec![[0u32; 2]; size].into_boxed_slice();
+        for it in 0..len {
+            let key = word(it);
+            let mut at = home(key, bits);
+            while slots[at][1] != 0 {
+                at = (at + 1) & (size - 1);
+            }
+            slots[at] = [key, it as u32 + 1];
+        }
+        Index { slots, bits }
+    }
+
+    /// The first of the entries whose word is `word` that `is` accepts, each asked in the order
+    /// they were added. Linear probing without removal keeps them in that order along the probe.
+    #[inline]
+    fn find(&self, word: u32, mut is: impl FnMut(usize) -> bool) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = home(word, self.bits);
+        loop {
+            let [found, number] = self.slots[at];
+            if number == 0 {
+                return None;
+            }
+            if found == word && is(number as usize - 1) {
+                return Some(number as usize - 1);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+}
+
+/// Where `word` is first probed for in a table of `1 << bits` slots: the top bits of its
+/// product with 2^64 over the golden ratio, which spreads offsets and ids alike.
+#[inline]
+fn home(word: u32, bits: u32) -> usize {
+    (u64::from(word).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+}
+
+/// A map's fn bodies, as columns in the order of their text. A body's ids are made by a walk of
+/// it alone, when something in it is first asked about. 60 bytes per body until then.
+#[derive(Default)]
+struct Bodies {
+    /// Where each begins: what the body holding a node is searched by.
+    starts: Box<[u32]>,
+    /// Each one's [`Row`]. With `starts`, what two maps compare and hash of their bodies: their
+    /// places, slots and texts, which make the same ids; not which were walked.
+    rows: Box<[Row]>,
+    /// Each one's first slot and number, sorted: what the body an id names is searched by.
+    by_slot: Box<[[u32; 2]]>,
+    /// Each one's element in `tree`: a lazy node, walked through its part, or a fn's block.
+    ats: Box<[u32]>,
+    /// Each one's ids as [`BodyIds`] words, once walked.
+    ids: Box<[OnceLock<Box<[u32]>>]>,
+    /// The tree the bodies are elements of; `None` when there are none.
+    tree: Option<Arc<FlatTree>>,
+}
+
+/// A body's end, the first of the hash values its ids have, how many it has (`INDEX_MASK + 1`
+/// ids of each kind in each, [`take_slots`]), and its text's hash, low word first.
+type Row = [u32; 5];
+const ROW_END: usize = 0;
+const ROW_FIRST_SLOT: usize = 1;
+const ROW_SLOTS: usize = 2;
+const ROW_TEXT_HASH: usize = 3;
+
+/// A fn body and where it is: what [`Bodies::new`] is made of.
+struct Placed {
     range: TextRange,
-    /// The hash values its ids have: `slots` of them from `first_slot` on, `INDEX_MASK + 1`
-    /// ids of each kind in each.
     first_slot: u32,
     slots: u32,
     text_hash: u64,
-    /// What the body is walked from: a lazy node, walked through its part, or a parsed block.
-    tree: Arc<FlatTree>,
     at: u32,
-    entries: OnceLock<BodyEntries>,
 }
 
-struct BodyEntries {
-    entries: Box<[(SyntaxNodePtr, ErasedFileAstId)]>,
-    by_ptr: FxHashMap<SyntaxNodePtr, u32>,
-    by_id: FxHashMap<ErasedFileAstId, u32>,
-}
-
-impl Body {
-    fn entries(&self) -> &BodyEntries {
-        self.entries.get_or_init(|| {
-            let (tree, at) = expanded(&self.tree, self.at);
-            BodyEntries::new(body_entries(tree, at, self.first_slot, self.slots))
-        })
+impl Bodies {
+    /// The bodies `placed`, elements of `tree`.
+    fn new(tree: &Arc<FlatTree>, mut placed: Vec<Placed>) -> Bodies {
+        // Bodies don't overlap, so no two begin at one place.
+        placed.sort_unstable_by_key(|it| it.range.start());
+        let mut by_slot: Box<[[u32; 2]]> =
+            placed.iter().zip(0u32..).map(|(it, body)| [it.first_slot, body]).collect();
+        by_slot.sort_unstable();
+        let row = |it: &Placed| -> Row {
+            [
+                u32::from(it.range.end()),
+                it.first_slot,
+                it.slots,
+                it.text_hash as u32,
+                (it.text_hash >> 32) as u32,
+            ]
+        };
+        Bodies {
+            starts: placed.iter().map(|it| u32::from(it.range.start())).collect(),
+            rows: placed.iter().map(row).collect(),
+            by_slot,
+            ats: placed.iter().map(|it| it.at).collect(),
+            ids: placed.iter().map(|_| OnceLock::new()).collect(),
+            tree: (!placed.is_empty()).then(|| tree.clone()),
+        }
     }
 
-    /// The same body, of the same text at `range` of `tree`, element `at`.
-    fn moved(&self, range: TextRange, tree: Arc<FlatTree>, at: u32) -> Body {
-        Body {
+    fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    fn range(&self, body: usize) -> TextRange {
+        TextRange::new(self.starts[body].into(), self.rows[body][ROW_END].into())
+    }
+
+    /// The body `range` is in: the last to begin at or before it, if it ends at or after it.
+    #[inline]
+    fn holding(&self, range: TextRange) -> Option<usize> {
+        let start = u32::from(range.start());
+        let body = self.starts.partition_point(|&it| it <= start).checked_sub(1)?;
+        (u32::from(range.end()) <= self.rows[body][ROW_END]).then_some(body)
+    }
+
+    /// The body `id`, an id of a node in a body, is of: the one with its hash value among its
+    /// slots.
+    #[inline]
+    fn of(&self, id: ErasedFileAstId) -> Option<usize> {
+        let slot = u32::from(id.hash_value());
+        let n = self.by_slot.partition_point(|it| it[0] <= slot);
+        let [first, body] = *self.by_slot[..n].last()?;
+        (slot < first + self.rows[body as usize][ROW_SLOTS]).then_some(body as usize)
+    }
+
+    /// The ids of body `body`, walking it if no one asked about it before.
+    #[inline]
+    fn ids(&self, body: usize) -> BodyIds<'_> {
+        BodyIds::of(self.ids[body].get_or_init(|| {
+            let tree = self.tree.as_deref().expect("a map with bodies keeps their tree");
+            let (tree, at) = expanded(tree, self.ats[body]);
+            let row = &self.rows[body];
+            body_ids(tree, at, row[ROW_FIRST_SLOT], row[ROW_SLOTS])
+        }))
+    }
+
+    /// Body `body` with the same text at `range`, element `at` of another tree: the same slots.
+    fn moved(&self, body: usize, range: TextRange, at: u32) -> Placed {
+        let row = &self.rows[body];
+        Placed {
             range,
-            first_slot: self.first_slot,
-            slots: self.slots,
-            text_hash: self.text_hash,
-            tree,
+            first_slot: row[ROW_FIRST_SLOT],
+            slots: row[ROW_SLOTS],
+            text_hash: u64::from(row[ROW_TEXT_HASH]) | (u64::from(row[ROW_TEXT_HASH + 1]) << 32),
             at,
-            entries: OnceLock::new(),
         }
     }
 }
 
-impl BodyEntries {
-    fn new(entries: Vec<(SyntaxNodePtr, ErasedFileAstId)>) -> BodyEntries {
-        let mut by_ptr = FxHashMap::with_capacity_and_hasher(entries.len(), FxBuildHasher);
-        let mut by_id = FxHashMap::with_capacity_and_hasher(entries.len(), FxBuildHasher);
-        for (i, &(ptr, id)) in entries.iter().enumerate() {
-            by_ptr.insert(ptr, i as u32);
-            by_id.insert(id, i as u32);
-        }
-        BodyEntries { entries: entries.into_boxed_slice(), by_ptr, by_id }
-    }
-
-    fn id(&self, ptr: SyntaxNodePtr) -> Option<ErasedFileAstId> {
-        self.by_ptr.get(&ptr).map(|&i| self.entries[i as usize].1)
-    }
-
-    fn ptr(&self, id: ErasedFileAstId) -> Option<SyntaxNodePtr> {
-        self.by_id.get(&id).map(|&i| self.entries[i as usize].0)
-    }
-}
-
-impl PartialEq for Body {
-    fn eq(&self, other: &Body) -> bool {
-        self.range == other.range
-            && self.first_slot == other.first_slot
-            && self.slots == other.slots
-            && self.text_hash == other.text_hash
-    }
-}
-
-impl Hash for Body {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.range.hash(state);
-        self.first_slot.hash(state);
-        self.slots.hash(state);
-        self.text_hash.hash(state);
-    }
-}
-
-impl fmt::Debug for Body {
+impl fmt::Debug for Bodies {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Body")
-            .field("range", &self.range)
-            .field("first_slot", &self.first_slot)
-            .field("slots", &self.slots)
+        f.debug_list()
+            .entries((0..self.len()).map(|body| {
+                let row = &self.rows[body];
+                (self.range(body), row[ROW_FIRST_SLOT], row[ROW_SLOTS])
+            }))
             .finish()
+    }
+}
+
+/// A body's ids, as one slice of words: its `n` [`Entry`]s sorted by where they begin, then `n`
+/// pairs of an id and its entry's number, sorted by id. 24 bytes per id, and one allocation per
+/// body with ids, none for one without. A lookup is a binary search of either half.
+#[derive(Clone, Copy)]
+struct BodyIds<'a> {
+    entries: &'a [Entry],
+    by_id: &'a [[u32; 2]],
+}
+
+impl<'a> BodyIds<'a> {
+    fn of(words: &'a [u32]) -> BodyIds<'a> {
+        let (entries, by_id) = words.split_at(words.len() / 6 * 4);
+        BodyIds { entries: entries.as_chunks().0, by_id: by_id.as_chunks().0 }
+    }
+
+    #[inline]
+    fn id(self, key: Key) -> Option<ErasedFileAstId> {
+        let first = self.entries.partition_point(|it| it[START] < key[0]);
+        self.entries[first..]
+            .iter()
+            .take_while(|it| it[START] == key[0])
+            .find(|it| is_at(it, key))
+            .map(entry_id)
+    }
+
+    #[inline]
+    fn ptr(self, id: ErasedFileAstId) -> Option<SyntaxNodePtr> {
+        let at = self.by_id.partition_point(|it| it[0] < id.0);
+        let [found, number] = *self.by_id.get(at)?;
+        (found == id.0).then(|| entry_ptr(&self.entries[number as usize]))
     }
 }
 
 impl fmt::Debug for AstIdMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AstIdMap")
-            .field("arena", &self.arena)
+            .field(
+                "entries",
+                &self.entries.iter().map(|it| (entry_ptr(it), entry_id(it))).collect::<Vec<_>>(),
+            )
             .field("bodies", &self.bodies)
             .finish()
     }
@@ -758,18 +937,19 @@ impl fmt::Debug for AstIdMap {
 
 impl PartialEq for AstIdMap {
     fn eq(&self, other: &Self) -> bool {
-        self.arena == other.arena && self.bodies == other.bodies
+        self.entries.as_flattened() == other.entries.as_flattened()
+            && self.bodies.starts == other.bodies.starts
+            && self.bodies.rows.as_flattened() == other.bodies.rows.as_flattened()
     }
 }
 impl Eq for AstIdMap {}
 
 impl Hash for AstIdMap {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.arena.len().hash(state);
-        for (_, entry) in self.arena.iter() {
-            entry.hash(state);
-        }
-        self.bodies.hash(state);
+        // Each a `[u32]`, hashed as its length and one `write` of its bytes.
+        self.entries.as_flattened().hash(state);
+        self.bodies.starts.hash(state);
+        self.bodies.rows.as_flattened().hash(state);
     }
 }
 
@@ -925,15 +1105,11 @@ fn walk<P: Copy>(
 }
 
 /// The ids of the body at `root` of `tree`, which has `slots` hash values from `first_slot`
-/// on: each node's is its number among the body's nodes of its kind, in the walk's order.
-fn body_entries(
-    tree: &FlatTree,
-    root: u32,
-    first_slot: u32,
-    slots: u32,
-) -> Vec<(SyntaxNodePtr, ErasedFileAstId)> {
+/// on, as [`BodyIds`] words: each node's is its number among the body's nodes of its kind, in
+/// the walk's order.
+fn body_ids(tree: &FlatTree, root: u32, first_slot: u32, slots: u32) -> Box<[u32]> {
     let mut next = [0u32; ErasedFileAstIdKind::Root as usize + 1];
-    let mut entries = Vec::new();
+    let mut words: Vec<u32> = Vec::new();
     walk::<()>(tree, root, false, |step| {
         let (at, kind) = match step {
             Step::Block { at, .. } => (at, ErasedFileAstIdKind::BlockExpr),
@@ -947,13 +1123,18 @@ fn body_entries(
         // bytes, which its slots were counted from.
         assert!(slot < slots, "more {kind:?} nodes in a fn body than it has bytes");
         let id = pack((first_slot + slot) as u16, n & INDEX_MASK, true, kind as u32);
-        entries.push((
-            SyntaxNodePtr::from_parts(kind_of(tree, at), tree.range(at)),
-            ErasedFileAstId(id),
-        ));
+        words.extend_from_slice(&entry(kind_of(tree, at), tree.range(at), ErasedFileAstId(id)));
         Some(())
     });
-    entries
+    let n = words.len() / 4;
+    words.as_chunks_mut::<4>().0.sort_unstable();
+    words.reserve_exact(2 * n);
+    for number in 0..n {
+        let id = words[4 * number + ID];
+        words.extend_from_slice(&[id, number as u32]);
+    }
+    words[4 * n..].as_chunks_mut::<2>().0.sort_unstable();
+    words.into_boxed_slice()
 }
 
 /// The first of `slots` hash values in a row none of which is in `used`, looked for from
@@ -981,90 +1162,84 @@ fn take_slots(used: &mut [u64], start: u16, slots: u32) -> u32 {
 
 /// `found`'s bodies of `tree`, each with the owner it was found in, given their slots in the
 /// order they were found.
-fn place_bodies(tree: &Arc<FlatTree>, found: Vec<(u32, ErasedFileAstId)>) -> Vec<Body> {
-    let mut used = vec![0u64; (SLOTS / 64) as usize];
+fn place_bodies(tree: &Arc<FlatTree>, found: Vec<(u32, ErasedFileAstId)>) -> Bodies {
+    let mut used = [0u64; (SLOTS / 64) as usize];
     let source = tree.source();
-    found
+    let placed = found
         .into_iter()
         .map(|(at, owner)| {
             let range = tree.range(at);
             let slots = u32::from(range.len()) / (INDEX_MASK + 1) + 1;
             let first_slot = take_slots(&mut used, u16_hash(FxBuildHasher.hash_one(owner)), slots);
-            Body {
-                range,
-                first_slot,
-                slots,
-                text_hash: FxBuildHasher.hash_one(&source[range]),
-                tree: tree.clone(),
-                at,
-                entries: OnceLock::new(),
-            }
+            Placed { range, first_slot, slots, text_hash: FxBuildHasher.hash_one(&source[range]), at }
         })
-        .collect()
+        .collect();
+    Bodies::new(tree, placed)
 }
 
 impl AstIdMap {
     pub fn from_source(node: &SyntaxNode) -> AstIdMap {
         assert!(node.parent().is_none());
-        let mut res = AstIdMap::default();
         let mut index_map = ErasedAstIdNextIndexMap::default();
 
         // Ensure we allocate the root.
-        res.arena.alloc((SyntaxNodePtr::new(node), ROOT_ERASED_FILE_AST_ID));
+        let mut entries = vec![entry(node.kind(), node.text_range(), ROOT_ERASED_FILE_AST_ID)];
 
         // A cursor is made only of an item, to name it; a fn's body is not walked into, but
         // kept to be walked when asked about.
         let root = node.to_flat();
         let (tree, at) = root.flat().expect("a flat tree");
         let mut found = Vec::new();
-        walk::<ArenaId>(tree, at, true, |step| match step {
+        walk::<u32>(tree, at, true, |step| match step {
             Step::Block { at, parent } => {
-                let parent = parent_of(parent, &res.arena).copied();
+                let parent = parent_of(parent, &entries);
                 let kind = kind_of(tree, at);
                 let id = block_expr_ast_id(kind, &mut index_map, parent.as_ref())
                     .expect("not a BlockExpr");
-                res.arena.alloc((SyntaxNodePtr::from_parts(kind, tree.range(at)), id));
+                entries.push(entry(kind, tree.range(at), id));
                 None
             }
             Step::Item { at, kind: _, parent } => {
-                let parent = parent_of(parent, &res.arena).copied();
+                let parent = parent_of(parent, &entries);
                 let item = root.flat_element(at).into_node().expect("a node");
                 let id = ErasedFileAstId::ast_id_for(&item, &mut index_map, parent.as_ref())
                     .expect("this node should have an ast id");
-                let ptr = SyntaxNodePtr::from_parts(kind_of(tree, at), tree.range(at));
-                Some(res.arena.alloc((ptr, id)))
+                entries.push(entry(kind_of(tree, at), tree.range(at), id));
+                Some(entries.len() as u32 - 1)
             }
             Step::Body { at, parent } => {
-                found.push((at, parent.map_or(ROOT_ERASED_FILE_AST_ID, |it| res.arena[it].1)));
+                let owner =
+                    parent.map_or(ROOT_ERASED_FILE_AST_ID, |it| entry_id(&entries[it as usize]));
+                found.push((at, owner));
                 None
             }
         });
-        res.set_bodies(place_bodies(tree, found));
-        res.index();
-        return res;
+        let bodies = place_bodies(tree, found);
+        return AstIdMap::new(entries, bodies);
 
-        fn parent_of(
-            parent_idx: Option<ArenaId>,
-            arena: &Arena<(SyntaxNodePtr, ErasedFileAstId)>,
-        ) -> Option<&ErasedFileAstId> {
-            let mut parent = parent_idx.map(|parent_idx| &arena[parent_idx].1);
-            if parent.is_some_and(|parent| parent.kind() == ErasedFileAstIdKind::ExternBlock as u32)
-            {
-                // See the comment on `ErasedAssocItemFileAstId` for why is this.
-                // FIXME: Technically there could be an extern block inside another item, e.g.:
-                // ```
-                // fn foo() {
-                //     extern "C" {
-                //         fn bar();
-                //     }
-                // }
-                // ```
-                // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
-                // Shouldn't be a big deal though.
-                parent = None;
-            }
-            parent
+        fn parent_of(parent: Option<u32>, entries: &[Entry]) -> Option<ErasedFileAstId> {
+            let parent = entry_id(&entries[parent? as usize]);
+            // See the comment on `ErasedAssocItemFileAstId` for why is this.
+            // FIXME: Technically there could be an extern block inside another item, e.g.:
+            // ```
+            // fn foo() {
+            //     extern "C" {
+            //         fn bar();
+            //     }
+            // }
+            // ```
+            // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
+            // Shouldn't be a big deal though.
+            (parent.kind() != ErasedFileAstIdKind::ExternBlock as u32).then_some(parent)
         }
+    }
+
+    /// The map of `entries`, the root's first, and `bodies`.
+    fn new(entries: Vec<Entry>, bodies: Bodies) -> AstIdMap {
+        let entries = entries.into_boxed_slice();
+        let by_start = Index::new(entries.len(), |it| entries[it][START]);
+        let by_id = Index::new(entries.len(), |it| entries[it][ID]);
+        AstIdMap { entries, by_start, by_id, bodies }
     }
 
     /// The ids of the nodes of `node`, a node of the tree this map is of, as nodes of
@@ -1088,9 +1263,9 @@ impl AstIdMap {
         );
         let moved = |range: TextRange| range - start + relative_range.start();
         // Under a node in a body, everything is that body's.
-        let in_body = self.body_holding(tree.range(at)).is_some();
-        let mut res = AstIdMap::default();
-        let mut bodies = Vec::new();
+        let in_body = self.bodies.holding(tree.range(at)).is_some();
+        let mut entries = Vec::new();
+        let mut placed = Vec::new();
         let end = tree.end(at);
         let mut it = at;
         while it < end {
@@ -1102,86 +1277,30 @@ impl AstIdMap {
             let range = tree.range(it);
             if !in_body && is_body(tree, it, kind) {
                 let body = self
-                    .body_holding(range)
-                    .filter(|body| body.range == range)
+                    .bodies
+                    .holding(range)
+                    .filter(|&body| self.bodies.range(body) == range)
                     .expect("a fn body of the node is one of the map's");
                 let range = moved(range);
                 let relative_at = find_node(relative_tree, relative_at, kind, range)
                     .expect("the relative node has the body");
-                bodies.push(body.moved(range, relative_tree.clone(), relative_at));
+                placed.push(self.bodies.moved(body, range, relative_at));
                 it = tree.end(it);
                 continue;
             }
             let may_have_id =
                 ast::BlockExpr::can_cast(kind) || ErasedFileAstId::should_alloc(kind).is_some();
-            if may_have_id
-                && let Some(id) = self.try_erased_ast_id(SyntaxNodePtr::from_parts(kind, range))
-            {
-                res.arena.alloc((SyntaxNodePtr::from_parts(kind, moved(range)), id));
+            if may_have_id && let Some(id) = self.id_at(key_of(kind, range)) {
+                entries.push(entry(kind, moved(range), id));
             }
             it += 1;
         }
-        res.set_bodies(bodies);
-        res.index();
-        res
-    }
-
-    fn set_bodies(&mut self, mut bodies: Vec<Body>) {
-        bodies.sort_by_key(|it| it.range.start());
-        let mut by_slot: Vec<u32> = (0..bodies.len() as u32).collect();
-        by_slot.sort_by_key(|&it| bodies[it as usize].first_slot);
-        self.bodies = bodies.into_boxed_slice();
-        self.by_slot = by_slot.into_boxed_slice();
-    }
-
-    /// The fn body `range` is in.
-    fn body_holding(&self, range: TextRange) -> Option<&Body> {
-        let n = self.bodies.partition_point(|it| it.range.start() <= range.start());
-        self.bodies[..n].last().filter(|it| it.range.contains_range(range))
-    }
-
-    /// The fn body `id`, an id of a node in a body, is of: the one with its hash value.
-    fn body_of(&self, id: ErasedFileAstId) -> Option<&Body> {
-        let slot = u32::from(id.hash_value());
-        let n = self.by_slot.partition_point(|&it| self.bodies[it as usize].first_slot <= slot);
-        let body = &self.bodies[*self.by_slot[..n].last()? as usize];
-        (slot < body.first_slot + body.slots).then_some(body)
-    }
-
-    fn index(&mut self) {
-        let res = self;
-        res.ptr_map = hashbrown::HashTable::with_capacity(res.arena.len());
-        res.id_map = hashbrown::HashTable::with_capacity(res.arena.len());
-        for (idx, (ptr, ast_id)) in res.arena.iter() {
-            let ptr_hash = hash_ptr(ptr);
-            let ast_id_hash = hash_ast_id(ast_id);
-            match res.ptr_map.entry(
-                ptr_hash,
-                |idx2| *idx2 == idx,
-                |&idx| hash_ptr(&res.arena[idx].0),
-            ) {
-                hashbrown::hash_table::Entry::Occupied(_) => unreachable!(),
-                hashbrown::hash_table::Entry::Vacant(entry) => {
-                    entry.insert(idx);
-                }
-            }
-            match res.id_map.entry(
-                ast_id_hash,
-                |idx2| *idx2 == idx,
-                |&idx| hash_ast_id(&res.arena[idx].1),
-            ) {
-                hashbrown::hash_table::Entry::Occupied(_) => unreachable!(),
-                hashbrown::hash_table::Entry::Vacant(entry) => {
-                    entry.insert(idx);
-                }
-            }
-        }
-        res.arena.shrink_to_fit();
+        AstIdMap::new(entries, Bodies::new(relative_tree, placed))
     }
 
     /// The root node.
     pub fn root(&self) -> SyntaxNodePtr {
-        self.arena[Idx::from_raw(RawIdx::from_u32(0))].0
+        entry_ptr(&self.entries[0])
     }
 
     pub fn ast_id<N: AstIdNode>(&self, item: &N) -> FileAstId<N> {
@@ -1212,7 +1331,7 @@ impl AstIdMap {
             panic!(
                 "Can't find SyntaxNodePtr {:?} in AstIdMap:\n{:?}",
                 ptr,
-                self.arena.iter().map(|(_id, i)| i).collect::<Vec<_>>(),
+                self.entries.iter().map(entry_id).collect::<Vec<_>>(),
             )
         })
     }
@@ -1220,11 +1339,16 @@ impl AstIdMap {
     /// The id of the node at `ptr`; of a node in a fn body, after walking that body if no one
     /// asked about it before.
     fn try_erased_ast_id(&self, ptr: SyntaxNodePtr) -> Option<ErasedFileAstId> {
-        let hash = hash_ptr(&ptr);
-        if let Some(&idx) = self.ptr_map.find(hash, |&idx| self.arena[idx].0 == ptr) {
-            return Some(self.arena[idx].1);
+        self.id_at(key(ptr))
+    }
+
+    #[inline]
+    fn id_at(&self, key: Key) -> Option<ErasedFileAstId> {
+        if let Some(it) = self.by_start.find(key[0], |it| is_at(&self.entries[it], key)) {
+            return Some(entry_id(&self.entries[it]));
         }
-        self.body_holding(ptr.text_range())?.entries().id(ptr)
+        let range = TextRange::new(key[0].into(), key[1].into());
+        self.bodies.ids(self.bodies.holding(range)?).id(key)
     }
 
     // Don't bound on `AstIdNode` here, because `BlockExpr`s are also valid here (`ast::BlockExpr`
@@ -1239,9 +1363,9 @@ impl AstIdMap {
     /// The nodes this map has an id of: every item of the file, and the blocks with items,
     /// those in fn bodies too (which walks every body no one asked about before).
     pub fn ptrs(&self) -> impl Iterator<Item = SyntaxNodePtr> + '_ {
-        let bodies =
-            self.bodies.iter().flat_map(|body| body.entries().entries.iter().map(|(ptr, _)| *ptr));
-        self.arena.iter().map(|(_, (ptr, _))| *ptr).chain(bodies)
+        let bodies = (0..self.bodies.len())
+            .flat_map(move |body| self.bodies.ids(body).entries.iter().map(entry_ptr));
+        self.entries.iter().map(entry_ptr).chain(bodies)
     }
 
     /// The node of `id`, when this map has it: a map [`AstIdMap::relative_to`] a node has only
@@ -1249,10 +1373,9 @@ impl AstIdMap {
     /// one asked about it before.
     pub fn try_get_erased(&self, id: ErasedFileAstId) -> Option<SyntaxNodePtr> {
         if id.in_body() {
-            return self.body_of(id)?.entries().ptr(id);
+            return self.bodies.ids(self.bodies.of(id)?).ptr(id);
         }
-        let hash = hash_ast_id(&id);
-        self.id_map.find(hash, |&idx| self.arena[idx].1 == id).map(|&idx| self.arena[idx].0)
+        self.by_id.find(id.0, |_| true).map(|it| entry_ptr(&self.entries[it]))
     }
 
     pub fn get_erased(&self, id: ErasedFileAstId) -> SyntaxNodePtr {
@@ -1260,7 +1383,7 @@ impl AstIdMap {
             panic!(
                 "Can't find ast id {:?} in AstIdMap:\n{:?}\n{:?}",
                 id,
-                self.arena.iter().map(|(_id, i)| i).collect::<Vec<_>>(),
+                self.entries.iter().map(|it| (entry_ptr(it), entry_id(it))).collect::<Vec<_>>(),
                 self.bodies,
             )
         })
@@ -1268,19 +1391,14 @@ impl AstIdMap {
 }
 
 #[cfg(not(no_salsa_async_drops))]
-type Dropped = (
-    Arena<(SyntaxNodePtr, ErasedFileAstId)>,
-    hashbrown::HashTable<ArenaId>,
-    hashbrown::HashTable<ArenaId>,
-    Box<[Body]>,
-);
+type Dropped = (Box<[Entry]>, Index, Index, Bodies);
 
 #[cfg(not(no_salsa_async_drops))]
 impl Drop for AstIdMap {
     fn drop(&mut self) {
-        let arena = std::mem::take(&mut self.arena);
-        let ptr_map = std::mem::take(&mut self.ptr_map);
-        let id_map = std::mem::take(&mut self.id_map);
+        let entries = std::mem::take(&mut self.entries);
+        let by_start = std::mem::take(&mut self.by_start);
+        let by_id = std::mem::take(&mut self.by_id);
         let bodies = std::mem::take(&mut self.bodies);
         static AST_ID_MAP_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Dropped>> =
             std::sync::OnceLock::new();
@@ -1304,19 +1422,9 @@ impl Drop for AstIdMap {
                     .unwrap();
                 sender
             })
-            .send((arena, ptr_map, id_map, bodies))
+            .send((entries, by_start, by_id, bodies))
             .unwrap();
     }
-}
-
-#[inline]
-fn hash_ptr(ptr: &SyntaxNodePtr) -> u64 {
-    FxBuildHasher.hash_one(ptr)
-}
-
-#[inline]
-fn hash_ast_id(ptr: &ErasedFileAstId) -> u64 {
-    FxBuildHasher.hash_one(ptr)
 }
 
 #[cfg(test)]
@@ -1664,6 +1772,170 @@ fn foo() {
                 }
             }
             assert!(parsed(&file).is_empty(), "the file's bodies are walked in the relative trees");
+        }
+    }
+
+    /// splitmix64: the seeded inputs of the tests below.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// What a map keeps, read from its columns and not its indexes: each node it has an id
+    /// of, with the id (walking every body).
+    fn stored(map: &AstIdMap) -> Vec<(SyntaxNodePtr, ErasedFileAstId)> {
+        let pair = |it: &super::Entry| (super::entry_ptr(it), super::entry_id(it));
+        let bodies = (0..map.bodies.len())
+            .flat_map(|body| map.bodies.ids(body).entries.iter().map(pair).collect::<Vec<_>>());
+        map.entries.iter().map(pair).chain(bodies).collect()
+    }
+
+    #[test]
+    fn an_index_finds_what_a_linear_search_does() {
+        let mut state = 1;
+        for len in [0usize, 1, 2, 3, 7, 8, 9, 100, 1000, 5000] {
+            // Few distinct keys, so most are shared by many entries.
+            let keys: Vec<u32> =
+                (0..len).map(|_| (next(&mut state) % (len as u64 / 2 + 1)) as u32).collect();
+            let index = super::Index::new(len, |it| keys[it]);
+            assert!(index.slots.len() * 3 > len * 4, "{len} entries fill the table past 3/4");
+            for key in 0..len as u32 + 10 {
+                let want: Vec<usize> = (0..len).filter(|&it| keys[it] == key).collect();
+                let mut asked = Vec::new();
+                assert_eq!(
+                    index.find(key, |it| {
+                        asked.push(it);
+                        false
+                    }),
+                    None
+                );
+                assert_eq!(asked, want, "{len} entries, key {key}: asked in the order added");
+                assert_eq!(index.find(key, |_| true), want.first().copied());
+                assert_eq!(index.find(key, |it| Some(&it) == want.last()), want.last().copied());
+            }
+        }
+        assert_eq!(super::Index::default().find(0, |_| true), None);
+    }
+
+    /// The indexes give what hash maps of the stored ids give (the layout before, which kept
+    /// `FxHashMap`s by node and by id), for every node of a file and for ids no node has.
+    #[test]
+    fn lookups_agree_with_maps_of_the_stored_ids() {
+        for (path, text) in corpus() {
+            let path = path.display();
+            let full = full_of(&text);
+            for map in [AstIdMap::from_source(&full), AstIdMap::from_source(&outline_of(&text))] {
+                let stored = stored(&map);
+                let by_ptr: FxHashMap<_, _> = stored.iter().copied().collect();
+                let by_id: FxHashMap<_, _> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
+                assert_eq!(by_ptr.len(), stored.len(), "{path}: a node is kept twice");
+                assert_eq!(by_id.len(), stored.len(), "{path}: an id is kept twice");
+                for node in full.descendants() {
+                    let ptr = SyntaxNodePtr::new(&node);
+                    let want = by_ptr.get(&ptr).copied();
+                    assert_eq!(map.try_erased_ast_id(ptr), want, "{path}: {ptr:?}");
+                }
+                for &(_, id) in &stored {
+                    let others = [
+                        id,
+                        ErasedFileAstId(id.0 ^ (1 << super::HASH_BITS)),
+                        ErasedFileAstId(id.0.wrapping_add(1)),
+                    ];
+                    for other in others {
+                        let want = by_id.get(&other).copied();
+                        assert_eq!(map.try_get_erased(other), want, "{path}: {other:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A body's ids are one slice: entries sorted by where they begin, then each id with its
+    /// entry's number, sorted by id.
+    #[test]
+    fn a_body_keeps_its_ids_sorted_both_ways() {
+        for (path, text) in corpus() {
+            let path = path.display();
+            let map = AstIdMap::from_source(&outline_of(&text));
+            for body in 0..map.bodies.len() {
+                let ids = map.bodies.ids(body);
+                assert_eq!(ids.entries.len(), ids.by_id.len(), "{path}");
+                assert!(ids.entries.is_sorted(), "{path}: entries out of order");
+                assert!(ids.by_id.is_sorted(), "{path}: ids out of order");
+                for &[id, number] in ids.by_id {
+                    assert_eq!(ids.entries[number as usize][super::ID], id, "{path}");
+                }
+                let range = map.bodies.range(body);
+                for entry in ids.entries {
+                    let ptr = super::entry_ptr(entry);
+                    assert!(range.contains_range(ptr.text_range()), "{path}: {ptr:?}");
+                    assert!(super::entry_id(entry).in_body(), "{path}: {ptr:?}");
+                }
+            }
+        }
+    }
+
+    /// Equal maps hash the same, and an item more is another map.
+    #[test]
+    fn equality_and_hash_follow_the_ids() {
+        for (path, text) in corpus().into_iter().take(60) {
+            let path = path.display();
+            let a = AstIdMap::from_source(&full_of(&text));
+            let b = AstIdMap::from_source(&outline_of(&text));
+            assert!(a == b, "{path}");
+            assert_eq!(FxBuildHasher.hash_one(&a), FxBuildHasher.hash_one(&b), "{path}");
+            let more: Arc<str> = format!("{text}\nstruct BlazeOneMore;\n").into();
+            let c = AstIdMap::from_source(&full_of(&more));
+            assert!(a != c, "{path}: another item, the same map");
+        }
+    }
+
+    /// The next index is keyed by `kind << 16 | hash` in one word, and numbers nodes as the key
+    /// `(kind, hash)` did, also past 1024 nodes of one kind and hash.
+    #[test]
+    fn packed_index_keys_number_as_pairs_did() {
+        use std::collections::hash_map::Entry;
+
+        use super::{ErasedAstIdNextIndexMap, ErasedFileAstIdKind as Kind, INDEX_BITS, pack};
+
+        #[derive(Default)]
+        struct Pairs(FxHashMap<(Kind, u16), u32>);
+
+        impl Pairs {
+            fn new_id(&mut self, kind: Kind, data: u64) -> ErasedFileAstId {
+                let initial_hash = super::u16_hash(FxBuildHasher.hash_one(data));
+                let mut hash = initial_hash;
+                let index = loop {
+                    match self.0.entry((kind, hash)) {
+                        Entry::Occupied(mut entry) => {
+                            let i = entry.get_mut();
+                            if *i < ((1 << INDEX_BITS) - 1) {
+                                *i += 1;
+                                break *i;
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(0);
+                            break 0;
+                        }
+                    }
+                    hash = hash.wrapping_add(1);
+                    assert_ne!(hash, initial_hash);
+                };
+                ErasedFileAstId(pack(hash, index, false, kind as u32))
+            }
+        }
+
+        let kinds = [Kind::Fn, Kind::Struct, Kind::MacroCall, Kind::Use, Kind::Impl, Kind::Root];
+        let (mut packed, mut pairs) = (ErasedAstIdNextIndexMap::default(), Pairs::default());
+        let mut state = 2;
+        for _ in 0..60_000 {
+            let kind = kinds[(next(&mut state) % kinds.len() as u64) as usize];
+            let data = next(&mut state) % 4;
+            assert_eq!(packed.new_id(kind, data), pairs.new_id(kind, data));
         }
     }
 }

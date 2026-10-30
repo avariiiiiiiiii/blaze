@@ -16,9 +16,17 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 rustc-hash.workspace = true
+serde = { workspace = true, features = ["derive"] }
+blaze-format.workspace = true
+blaze-ids.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
+blaze-query.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
+blaze-units = { workspace = true, features = ["query"] }
+
+[dev-dependencies]
+blaze-vfs.workspace = true
 
 [lints]
 workspace = true

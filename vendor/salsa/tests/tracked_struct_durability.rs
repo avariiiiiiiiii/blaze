@@ -94,7 +94,7 @@ fn check(db: &dyn Db, file: File) -> Inference<'_> {
 #[test]
 fn execute() {
     #[salsa::db]
-    #[derive(Default, Clone)]
+    #[derive(Default)]
     struct Database {
         storage: salsa::Storage<Self>,
         files: Vec<File>,

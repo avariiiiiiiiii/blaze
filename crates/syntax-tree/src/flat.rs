@@ -65,11 +65,16 @@ const _: () = assert!(
     FAR_KIND & TAG == 0 && (LONG << VALUE) & (FAR << UP) == 0 && UP + 10 == 32 && VALUE + 20 == 32
 );
 
-/// What parses a lazy node: called with the node's kind, its text and the tree's `data`, it
-/// gives a tree whose root is a node of that kind over exactly that text, and the errors
-/// parsing it found, their ranges in that text.
-pub type Expand =
-    fn(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>);
+/// What parses a lazy node: called with the node's kind, the tree's source, the node's range
+/// in it and the tree's `data`, it gives a tree over that source whose root is a node of that
+/// kind and range ([`FlatTreeBuilder::sourced_range`] makes one without copying the text), and
+/// the errors parsing it found, their ranges in the source.
+pub type Expand = fn(
+    kind: SyntaxKind,
+    source: &Arc<str>,
+    range: TextRange,
+    data: u32,
+) -> (FlatTree, Vec<(TextRange, Box<str>)>);
 
 #[derive(Clone)]
 pub struct FlatTree {
@@ -1000,25 +1005,23 @@ impl FlatTree {
     fn expand(&self, at: u32) -> Part {
         let lazy = self.lazy.as_deref().expect("a lazy node's tree has an expander");
         let (kind, range) = (self.kind(at), self.range(at));
-        let text = &self.source[range];
-        let (part, errors) = (lazy.expand)(kind, text, lazy.data);
+        let (part, errors) = (lazy.expand)(kind, &self.source, range, lazy.data);
         let root = part.range(0);
+        // Over the same source at the same range, the part's text is the node's: no compare.
         assert!(
             !part.is_token(0)
                 && part.kind(0) == kind
                 && part.lazy.is_none()
-                && part.source.get(usize::from(root.start())..usize::from(root.end()))
-                    == Some(text),
-            "the part of the lazy {kind:?} at {range:?} is not one {kind:?} over its text \
-             without lazy nodes: its root is a {:?} at {root:?}",
+                && Arc::ptr_eq(&part.source, &self.source)
+                && root == range,
+            "the part of the lazy {kind:?} at {range:?} is not one {kind:?} over its text in \
+             the tree's source without lazy nodes: its root is a {:?} at {root:?}",
             part.kind(0),
         );
-        if let Some((error, _)) = errors.iter().find(|it| it.0.end() > range.len()) {
-            panic!("the part of the lazy {kind:?} at {range:?} has an error past its text, at {error:?}");
+        if let Some((error, _)) = errors.iter().find(|it| !range.contains_range(it.0)) {
+            panic!("the part of the lazy {kind:?} at {range:?} has an error outside it, at {error:?}");
         }
-        let tree = part.moved(self.source.clone(), root.start().into(), range.start().into());
-        let errors = errors.into_iter().map(|(it, message)| (it + range.start(), message));
-        Part { tree: Arc::new(tree), errors: errors.collect() }
+        Part { tree: Arc::new(part), errors: errors.into() }
     }
 }
 
@@ -1040,6 +1043,8 @@ pub struct FlatTreeBuilder {
     source: Option<Arc<str>>,
     /// The next byte of `source`.
     next: usize,
+    /// Where in `source` the tree ends.
+    end: usize,
     packer: Packer,
     marks: Vec<u32>,
     open: Vec<u32>,
@@ -1068,11 +1073,27 @@ impl FlatTreeBuilder {
     /// of a copy: `token` checks its text is the next bytes of `source` and moves past them,
     /// and `finish` checks every byte was reached.
     pub fn sourced(source: Arc<str>) -> FlatTreeBuilder {
-        let elements = source.len() / 2;
+        let range = TextRange::up_to(TextSize::of(&*source));
+        FlatTreeBuilder::sourced_range(source, range)
+    }
+
+    /// A sourced builder ([`Self::sourced`]) of a tree over `range` of `source` only: its first
+    /// token starts at `range.start()`, and `finish` checks every byte to `range.end()` was
+    /// reached. The tree's ranges are in `source`, as a lazy node's part's are.
+    pub fn sourced_range(source: Arc<str>, range: TextRange) -> FlatTreeBuilder {
+        let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        assert!(
+            end <= source.len() && source.is_char_boundary(start) && source.is_char_boundary(end),
+            "{range:?} is not a range of a source of {} bytes",
+            source.len(),
+        );
+        let elements = (end - start) / 2;
         FlatTreeBuilder {
             packer: Packer::with_capacity(elements),
             marks: Vec::with_capacity(elements / MARK as usize + 1),
             source: Some(source),
+            next: start,
+            end,
             ..FlatTreeBuilder::default()
         }
     }
@@ -1110,8 +1131,12 @@ impl FlatTreeBuilder {
         let end = self.offset() + text.len();
         assert!(end <= u32::MAX as usize, "a text of 4 GiB or more");
         if let Some(source) = &self.source {
+            // A token that is a slice of the source at the next byte is those bytes: only a
+            // token copied from another text has its bytes compared.
+            let here = text.as_ptr() == source.as_ptr().wrapping_add(self.next);
             assert!(
-                source.as_bytes().get(self.next..end) == Some(text.as_bytes()),
+                end <= self.end
+                    && (here || source.as_bytes().get(self.next..end) == Some(text.as_bytes())),
                 "the {kind:?} {text:?} is not the source's next bytes, at {}",
                 self.next,
             );
@@ -1132,7 +1157,7 @@ impl FlatTreeBuilder {
         match &self.source {
             None => panic!("a lazy {kind:?} in a tree built without a source"),
             Some(source) => assert!(
-                end <= source.len() && source.is_char_boundary(end),
+                end <= self.end && source.is_char_boundary(end),
                 "a lazy {kind:?} of {len} bytes at {} does not end in the source",
                 self.next,
             ),
@@ -1162,9 +1187,10 @@ impl FlatTreeBuilder {
         let source: Arc<str> = match self.source {
             Some(source) => {
                 assert!(
-                    self.next == source.len(),
-                    "the tree ends at byte {} of a source of {}",
+                    self.next == self.end,
+                    "the tree ends at byte {} of a source it should cover to {} (of {})",
                     self.next,
+                    self.end,
                     source.len(),
                 );
                 source
@@ -1308,15 +1334,25 @@ mod tests {
         }
     }
 
-    /// The expander of the tests' outlines. Its error is the part's number, at the number.
-    fn expand(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
+    /// The expander of the tests' outlines: the part kept in [`PARTS`], rebuilt over the
+    /// source at `range`. Its error is the part's number, at the number.
+    fn expand(
+        kind: SyntaxKind,
+        source: &Arc<str>,
+        range: TextRange,
+        data: u32,
+    ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
         assert_eq!(data, DATA);
+        let text = &source[range];
         let end = text.find('>').expect("a part's number");
         let n: usize = text[1..end].parse().unwrap();
         let part = PARTS.lock().unwrap()[&n].clone();
         assert_eq!(part.kind(0), kind);
-        let at = TextRange::new(1.into(), (end as u32).into());
-        (part, vec![(at, n.to_string().into())])
+        let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
+        let part = SyntaxNode::new_flat_root(Arc::new(part));
+        crate::cursor::copy_element(&mut builder, &NodeOrToken::Node(part));
+        let at = TextRange::new(1.into(), (end as u32).into()) + range.start();
+        (builder.finish(), vec![(at, n.to_string().into())])
     }
 
     /// The errors [`expand`] gives lazy node `at` of `tree`, absolute.
@@ -1894,10 +1930,15 @@ mod tests {
     #[test]
     fn a_part_is_parsed_once_whichever_thread_asks() {
         static CALLS: AtomicU32 = AtomicU32::new(0);
-        fn counting(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
+        fn counting(
+            kind: SyntaxKind,
+            source: &Arc<str>,
+            range: TextRange,
+            data: u32,
+        ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
             CALLS.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(20));
-            expand(kind, text, data)
+            expand(kind, source, range, data)
         }
         let body = vec![
             Shape::Token(SyntaxKind(2), "{".into()),
@@ -1981,12 +2022,56 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_over_a_range_of_a_source_shares_it() {
+        let source: Arc<str> = "fn f() { body }".into();
+        let range = TextRange::new(7.into(), 15.into());
+        let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
+        builder.start_node(SyntaxKind(101));
+        // Slices of the source are taken by address, a copy by its bytes.
+        builder.token(SyntaxKind(2), &source[7..9]);
+        builder.token(SyntaxKind(3), "body");
+        builder.token(SyntaxKind(2), &source[13..15]);
+        builder.finish_node();
+        let tree = builder.finish();
+        assert!(Arc::ptr_eq(tree.source(), &source));
+        assert_eq!(tree.range(0), range);
+        assert_eq!(tree.range(2), TextRange::new(9.into(), 13.into()));
+        assert_eq!(tree.token_text(3), " }");
+    }
+
+    #[test]
+    #[should_panic(expected = "the tree ends at byte 9")]
+    fn a_tree_over_a_range_reaches_its_end() {
+        let source: Arc<str> = "fn f() { body }".into();
+        let mut builder = FlatTreeBuilder::sourced_range(source.clone(), TextRange::new(7.into(), 15.into()));
+        builder.start_node(SyntaxKind(101));
+        builder.token(SyntaxKind(2), &source[7..9]);
+        builder.finish_node();
+        let _ = builder.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "is not the source's next bytes")]
+    fn a_tree_over_a_range_stays_in_it() {
+        let source: Arc<str> = "fn f() { body }".into();
+        let mut builder = FlatTreeBuilder::sourced_range(source.clone(), TextRange::new(7.into(), 9.into()));
+        builder.start_node(SyntaxKind(101));
+        builder.token(SyntaxKind(2), &source[7..10]);
+    }
+
+    #[test]
     #[should_panic(expected = "the part of the lazy")]
     fn a_part_must_be_its_lazy_node_over_its_text() {
-        fn short(kind: SyntaxKind, text: &str, _: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
-            let mut builder = FlatTreeBuilder::new();
+        fn short(
+            kind: SyntaxKind,
+            source: &Arc<str>,
+            range: TextRange,
+            _: u32,
+        ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
+            let range = TextRange::new(range.start() + TextSize::from(1), range.end());
+            let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
             builder.start_node(kind);
-            builder.token(SyntaxKind(1), &text[1..]);
+            builder.token(SyntaxKind(1), &source[range]);
             builder.finish_node();
             (builder.finish(), Vec::new())
         }

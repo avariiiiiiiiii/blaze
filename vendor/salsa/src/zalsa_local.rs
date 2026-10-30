@@ -24,17 +24,17 @@ use crate::fingerprint::Fingerprint;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::sync::atomic::AtomicBool;
-use crate::table::{PageIndex, Slot, Table};
+use crate::table::{PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
 use crate::zalsa::{IngredientIndex, Zalsa};
 use crate::{Cancelled, Id, Revision};
 
-/// State that is specific to a single execution thread.
+/// State that is specific to a single task: one per database, thread and task depth
+/// ([`crate::task`]).
 ///
 /// Internally, this type uses ref-cells.
 ///
-/// **Note also that all mutations to the database handle (and hence
-/// to the local-state) must be undone during unwinding.**
+/// **Note also that all mutations to the local-state must be undone during unwinding.**
 pub struct ZalsaLocal {
     /// Vector of active queries.
     ///
@@ -95,11 +95,11 @@ impl ZalsaLocal {
         }
     }
 
-    pub(crate) fn record_unfilled_pages(&mut self, table: &Table) {
-        let most_recent_pages = self.most_recent_pages.get_mut();
-        most_recent_pages
-            .drain()
-            .for_each(|(ingredient, page)| table.record_unfilled_page(ingredient, page));
+    /// The pages this task allocates in, which it gives up.
+    pub(crate) fn take_unfilled_pages(
+        &mut self,
+    ) -> impl Iterator<Item = (IngredientIndex, PageIndex)> + '_ {
+        self.most_recent_pages.get_mut().drain()
     }
 
     /// Allocate a new id in `table` for the given ingredient

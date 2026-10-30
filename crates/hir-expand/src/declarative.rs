@@ -15,7 +15,7 @@ use crate::{
     AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, Lookup, MacroCallId,
     MacroCallStyle,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
-    hygiene::{Transparency, apply_mark},
+    hygiene::{MarkCache, Transparency, apply_mark},
     tt,
 };
 
@@ -41,19 +41,23 @@ impl DeclarativeMacroExpander {
                 (tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }), None),
                 ExpandError::new(span, ExpandErrorKind::MacroDefinition),
             ),
-            None => self
-                .mac
-                .expand(
-                    db,
-                    tt,
-                    |s| {
-                        s.ctx =
-                            apply_mark(db, s.ctx, call_id.into(), self.transparency, self.edition)
-                    },
-                    loc.kind.call_style(),
-                    span,
-                )
-                .map_err(Into::into),
+            None => {
+                let marks = MarkCache::new();
+                let marks = &marks;
+                self.mac
+                    .expand(
+                        db,
+                        tt,
+                        |s| {
+                            s.ctx = marks.get_or_insert_with(s.ctx, |ctx| {
+                                apply_mark(db, ctx, call_id.into(), self.transparency, self.edition)
+                            })
+                        },
+                        loc.kind.call_style(),
+                        span,
+                    )
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -89,8 +93,6 @@ impl AstId<ast::Macro> {
     ) -> DeclarativeMacroExpander {
         let id = self;
         let (root, map) = id.file_id.parse_with_map(db);
-
-        let root = root.syntax_node();
 
         let transparency = |node: ast::AnyHasAttrs| {
             let mut cfg_options = None;

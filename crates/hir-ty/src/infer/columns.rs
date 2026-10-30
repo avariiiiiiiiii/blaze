@@ -104,6 +104,9 @@ impl<K: DenseKey> TyColumn<K> {
     /// The column of `at` and `tys` as [`Self::at`] and [`Self::tys`] give them, refused when
     /// it is not one [`Self::from_entries`] makes.
     pub(crate) fn from_parts(at: Box<[u32]>, tys: Box<[StoredTy]>) -> Result<Self, &'static str> {
+        if at.last() == Some(&NONE) {
+            return Err("a type column that ends in a key without a type");
+        }
         let mut next = 0u32;
         for &place in &at {
             match place {
@@ -200,6 +203,36 @@ impl<K: DenseKey, V> IndexColumn<K, V> {
             })
             .collect();
         IndexColumn { at, rows: rows.into_boxed_slice(), key: PhantomData }
+    }
+
+    /// The column of `at` and `rows` as [`Self::at`] and [`Self::rows`] give them, refused
+    /// when it is not one [`Self::from_entries`] makes.
+    pub(crate) fn from_parts(at: Box<[u32]>, rows: Box<[V]>) -> Result<Self, &'static str> {
+        if at.last() == Some(&NONE) {
+            return Err("a row column that ends in a key without a row");
+        }
+        let mut next = 0u32;
+        for &place in &at {
+            match place {
+                NONE => {}
+                _ if place == next => next += 1,
+                _ => return Err("a row column out of key order"),
+            }
+        }
+        if next as usize != rows.len() {
+            return Err("a row column with a row no key has");
+        }
+        Ok(IndexColumn { at, rows, key: PhantomData })
+    }
+
+    /// Where each key's row is in [`Self::rows`], [`NONE`] for a key without one.
+    pub fn at(&self) -> &[u32] {
+        &self.at
+    }
+
+    /// The rows, in key order.
+    pub fn rows(&self) -> &[V] {
+        &self.rows
     }
 
     #[inline]
@@ -358,6 +391,57 @@ impl FieldColumn {
         }
     }
 
+    /// The column of the parts [`Self::tags`], [`Self::data`], [`Self::fields`] and
+    /// [`Self::tuple_fields`] give, refused when it is not one [`Self::from_entries`] makes.
+    pub(crate) fn from_parts(
+        tags: Box<[u8]>,
+        data: Box<[u32]>,
+        fields: Box<[FieldId]>,
+        tuple_fields: Box<[TupleFieldId]>,
+    ) -> Result<Self, &'static str> {
+        if tags.len() != data.len() {
+            return Err("a field column whose tags and words differ in length");
+        }
+        if tags.last() == Some(&FIELD_NONE) {
+            return Err("a field column that ends in an expression without a field");
+        }
+        let (mut next_field, mut next_tuple_field) = (0u32, 0u32);
+        for (&tag, &word) in tags.iter().zip(&data) {
+            let next = match tag {
+                FIELD_NONE if word == 0 => continue,
+                FIELD => &mut next_field,
+                TUPLE_FIELD => &mut next_tuple_field,
+                _ => return Err("a field column entry that is none of its kinds"),
+            };
+            if word != *next {
+                return Err("a field column out of expression order");
+            }
+            *next += 1;
+        }
+        if next_field as usize != fields.len() || next_tuple_field as usize != tuple_fields.len() {
+            return Err("a field column with a field no expression has");
+        }
+        Ok(FieldColumn { tags, data, fields, tuple_fields })
+    }
+
+    /// Per expression, none, a field or a tuple field.
+    pub fn tags(&self) -> &[u8] {
+        &self.tags
+    }
+
+    /// Per expression, its field's place in [`Self::fields`] or [`Self::tuple_fields`].
+    pub fn data(&self) -> &[u32] {
+        &self.data
+    }
+
+    pub fn fields(&self) -> &[FieldId] {
+        &self.fields
+    }
+
+    pub fn tuple_fields(&self) -> &[TupleFieldId] {
+        &self.tuple_fields
+    }
+
     #[inline]
     pub fn get(&self, expr: ExprId) -> Option<either::Either<FieldId, TupleFieldId>> {
         let index = expr.to_index();
@@ -487,6 +571,9 @@ impl<K: DenseKey, T> Csr<K, T> {
     /// The column of `ranges` and `items` as [`Self::ranges`] and [`Self::items`] give them,
     /// refused when it is not one [`CsrBuilder::freeze`] makes.
     pub(crate) fn from_parts(ranges: Box<[Range]>, items: Box<[T]>) -> Result<Self, &'static str> {
+        if ranges.last().is_some_and(|range| range.is_absent()) {
+            return Err("a list column that ends in a key without a list");
+        }
         let mut next = 0u64;
         for range in &ranges {
             if range.is_absent() {
@@ -669,7 +756,10 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
     }
 
     pub(crate) fn freeze(self) -> Csr<K, T> {
-        let CsrBuilder { ranges, items, .. } = self;
+        let CsrBuilder { mut ranges, items, .. } = self;
+        while ranges.last().is_some_and(|range| range.is_absent()) {
+            ranges.pop();
+        }
         let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
         let mut flat = Vec::with_capacity(items.len());
         let ranges = ranges
@@ -852,6 +942,9 @@ impl<K: DenseKey> ModeColumn<K> {
     }
 
     pub(crate) fn from_codes(codes: Box<[u8]>) -> Result<Self, &'static str> {
+        if codes.last() == Some(&MODE_NONE) {
+            return Err("a binding mode column that ends in a pattern without one");
+        }
         match codes.iter().all(|&code| code == MODE_NONE || (code as usize) < BINDING_MODES.len()) {
             true => Ok(ModeColumn { codes, key: PhantomData }),
             false => Err("a binding mode that is none of them"),

@@ -1,6 +1,6 @@
 //! Things related to the Interner in the next-trait-solver.
 
-use std::{fmt, ops::ControlFlow};
+use std::{fmt, marker::PhantomData, num::NonZeroU32, ops::ControlFlow};
 
 use either::Either;
 use macros::GenericTypeVisitable;
@@ -61,6 +61,7 @@ use super::{
     abi::Safety,
     fold::{BoundVarReplacer, BoundVarReplacerDelegate, FnMutDelegate},
     generics::{Generics, generics},
+    persist,
     region::{BoundRegion, BoundRegionKind, EarlyParamRegion, Region},
     util::sizedness_constraint_for_ty,
 };
@@ -183,6 +184,10 @@ macro_rules! interned_slice {
             #[inline]
             pub(crate) fn at(index: ::std::num::NonZeroU32) -> Self {
                 Self { index, _db: ::std::marker::PhantomData }
+            }
+
+            pub(crate) fn row(self) -> ::std::num::NonZeroU32 {
+                self.index
             }
         }
 
@@ -614,6 +619,23 @@ impl AdtDef {
         }
     }
 
+    /// The bits of what `new` found of the ADT's definition, for an interned type's row.
+    #[inline]
+    pub(super) fn flag_bits(self) -> u8 {
+        self.flags().bits()
+    }
+
+    /// The ADT `new` gave with these flag bits, `None` for bits it never sets.
+    #[inline]
+    pub(super) fn from_parts(id: AdtId, bits: u8) -> Option<AdtDef> {
+        let flags = AdtFlags::from_bits(bits)?;
+        Some(AdtDef(match id {
+            AdtId::StructId(id) => AdtDefInner::Struct { id, flags },
+            AdtId::UnionId(id) => AdtDefInner::Union { id, flags },
+            AdtId::EnumId(id) => AdtDefInner::Enum { id, flags },
+        }))
+    }
+
     #[inline]
     pub fn is_struct(self) -> bool {
         matches!(self.0, AdtDefInner::Struct { .. })
@@ -792,30 +814,53 @@ impl std::ops::Deref for UnsizingParams {
 
 pub type PatternKind<'db> = rustc_type_ir::PatternKind<DbInterner<'db>>;
 
+/// Every interned [`Pattern`].
+static PATTERNS: table::Rows = table::Rows::new("patterns", table::LAST_ROW);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Pattern<'db> {
-    interned: InternedRef<'db, PatternInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-struct PatternInterned(PatternKind<'static>);
-
-impl_internable!(gc; PatternInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Pattern<'static>>();
-};
+const _: () = assert!(size_of::<Option<Pattern<'static>>>() == 4);
 
 impl<'db> Pattern<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: PatternKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<PatternKind<'db>, PatternKind<'static>>(kind) };
-        Self { interned: Interned::new_gc(PatternInterned(kind)) }
+        Self::intern(kind)
     }
 
-    pub fn inner(&self) -> &PatternKind<'db> {
-        let inner = &self.interned.0;
-        unsafe { std::mem::transmute::<&PatternKind<'static>, &PatternKind<'db>>(inner) }
+    pub(super) fn intern(kind: PatternKind<'db>) -> Self {
+        let words = persist::encode(&kind);
+        Self::at(PATTERNS.intern(&words, || pattern_flags(kind)))
+    }
+
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Pattern { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
+    }
+}
+
+/// The flags and outer exclusive binder of a pattern: those of the constants in it.
+fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIndex) {
+    match kind {
+        PatternKind::Range { start, end } => (
+            start.flags() | end.flags(),
+            start.outer_exclusive_binder().max(end.outer_exclusive_binder()),
+        ),
+        PatternKind::Or(pats) => pats.iter().fold(
+            (TypeFlags::empty(), rustc_type_ir::INNERMOST),
+            |(flags, binder), pat| {
+                (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
+            },
+        ),
+        PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
     }
 }
 
@@ -826,44 +871,25 @@ impl<'db> std::fmt::Debug for Pattern<'db> {
 }
 
 impl<'db> Flags for Pattern<'db> {
+    #[inline]
     fn flags(&self) -> TypeFlags {
-        match self.inner() {
-            PatternKind::Range { start, end } => {
-                FlagComputation::for_const_kind(&start.kind()).flags
-                    | FlagComputation::for_const_kind(&end.kind()).flags
-            }
-            PatternKind::Or(pats) => {
-                let mut flags = pats.as_slice()[0].flags();
-                for pat in pats.as_slice()[1..].iter() {
-                    flags |= pat.flags();
-                }
-                flags
-            }
-            PatternKind::NotNull => TypeFlags::empty(),
-        }
+        // SAFETY: a `Pattern` is a row of `PATTERNS`.
+        unsafe { PATTERNS.flags(self.index) }
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        match self.inner() {
-            PatternKind::Range { start, end } => {
-                start.outer_exclusive_binder().max(end.outer_exclusive_binder())
-            }
-            PatternKind::Or(pats) => {
-                let mut idx = pats.as_slice()[0].outer_exclusive_binder();
-                for pat in pats.as_slice()[1..].iter() {
-                    idx = idx.max(pat.outer_exclusive_binder());
-                }
-                idx
-            }
-            PatternKind::NotNull => rustc_type_ir::INNERMOST,
-        }
+        // SAFETY: as in `flags`.
+        unsafe { PATTERNS.binder(self.index) }
     }
 }
 
 impl<'db> rustc_type_ir::inherent::IntoKind for Pattern<'db> {
     type Kind = rustc_type_ir::PatternKind<DbInterner<'db>>;
+    #[inline]
     fn kind(self) -> Self::Kind {
-        *self.inner()
+        // SAFETY: as in `flags`.
+        persist::decode(unsafe { PATTERNS.fields(self.index) })
     }
 }
 
@@ -878,7 +904,7 @@ impl<'db> rustc_type_ir::TypeVisitable<DbInterner<'db>> for Pattern<'db> {
 
 impl<'db, V: WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Pattern<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(PATTERNS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }
@@ -2619,115 +2645,906 @@ mod tls_db {
 
 mod tls_cache;
 
-impl WorldExposer for intern::GarbageCollector {
-    fn on_interned<T: intern::Internable>(
-        &mut self,
-        interned: InternedRef<'_, T>,
-    ) -> ControlFlow<()> {
-        self.mark_interned_alive(interned)
-    }
-
-    fn on_interned_slice<T: intern::SliceInternable>(
-        &mut self,
-        interned: InternedSliceRef<'_, T>,
-    ) -> ControlFlow<()> {
-        self.mark_interned_slice_alive(interned)
-    }
-}
-
-/// # Safety
+/// The tables every interned kind is an index into (`docs/v2/plan/design/data.md`, "types"). A
+/// value is written once, at a row that never moves and is never freed, so its index names it
+/// for the life of the process, on every thread, in every revision. A value is found by its
+/// hash in an [`Index`]: no lock on a hit, the lock of one shard of the index to add a value.
 ///
-/// This cannot be called if there are some not-yet-recorded type values. Generally, if you have a mutable
-/// reference to the database, and there are no other database - then you can call this safely, but you
-/// also need to make sure to maintain the mutable reference while this is running.
-pub unsafe fn collect_ty_garbage() {
-    let mut gc = intern::GarbageCollector::default();
+/// - [`Rows`], for the kinds with a structure (types, regions, constants, predicates,
+///   patterns): a `u8` tag column, a `u32` data column holding the value's one field, or where
+///   its fields start in an `extra` column when it has more, and the flags and outer exclusive
+///   binder in columns of their own.
+/// - [`Lists`], for the lists (generic arguments, types, clauses, ...): a start and a length
+///   column over one column of items (CSR), and for clauses the flags of the whole list.
+/// - [`Values`], for the kinds whose API hands out references (value trees, allocations, the
+///   solver's external constraints).
+pub(crate) mod table {
+    use std::{
+        alloc::{self, Layout},
+        hash::{BuildHasher, Hash},
+        marker::PhantomData,
+        num::NonZeroU32,
+        ptr,
+        sync::{
+            Mutex, MutexGuard, PoisonError,
+            atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        },
+    };
 
-    gc.add_storage::<super::consts::ConstInterned>();
-    gc.add_storage::<super::consts::ValTreeInterned>();
-    gc.add_storage::<super::allocation::AllocationInterned>();
-    gc.add_storage::<PatternInterned>();
-    gc.add_storage::<super::opaques::ExternalConstraintsInterned>();
-    gc.add_storage::<super::predicate::PredicateInterned>();
-    gc.add_storage::<super::region::RegionInterned>();
-    gc.add_storage::<super::ty::TyInterned>();
+    use rustc_hash::FxBuildHasher;
+    use rustc_type_ir::{DebruijnIndex, TypeFlags};
 
-    gc.add_slice_storage::<super::consts::ConstsStorage>();
-    gc.add_slice_storage::<super::predicate::ClausesStorage>();
-    gc.add_slice_storage::<super::generic_arg::GenericArgsStorage>();
-    gc.add_slice_storage::<BoundVarKindsStorage>();
-    gc.add_slice_storage::<VariancesOfStorage>();
-    gc.add_slice_storage::<CanonicalVarsStorage>();
-    gc.add_slice_storage::<PatListStorage>();
-    gc.add_slice_storage::<super::opaques::PredefinedOpaquesStorage>();
-    gc.add_slice_storage::<super::opaques::SolverDefIdsStorage>();
-    gc.add_slice_storage::<super::predicate::BoundExistentialPredicatesStorage>();
-    gc.add_slice_storage::<super::region::RegionAssumptionsStorage>();
-    gc.add_slice_storage::<super::ty::TysStorage>();
-    gc.add_slice_storage::<crate::mir::ProjectionStorage>();
+    /// The last row of a table whose rows a [`GenericArg`](super::GenericArg) packs with a
+    /// 2-bit tag in a `u32`: types, regions and constants, and so every table, alike.
+    pub(crate) const LAST_ROW: u32 = (1 << 30) - 1;
 
-    // SAFETY:
-    //  - By our precondition, there are no unrecorded types.
-    //  - We implement `GcInternedVisit` and `GcInternedSliceVisit` correctly for all types.
-    //  - We added all storages (FIXME: it's too easy to forget to add a new storage here).
-    unsafe { gc.collect() };
-}
+    /// The first segment of a column holds 2^10 values, each next one twice as many, so 23
+    /// segments hold all 2^32 positions.
+    const FIRST_BITS: u32 = 10;
+    const SEGMENTS: usize = 23;
 
-macro_rules! impl_gc_visit {
-    ( $($ty:ty),* $(,)? ) => {
-        $(
-            impl ::intern::GcInternedVisit for $ty {
-                #[inline]
-                fn visit_with(&self, gc: &mut ::intern::GarbageCollector) {
-                    self.generic_visit_with(gc);
+    const fn segment_start(segment: usize) -> u64 {
+        ((1 << segment) - 1) << FIRST_BITS
+    }
+
+    const fn segment_len(segment: usize) -> u64 {
+        1 << (FIRST_BITS as usize + segment)
+    }
+
+    /// The segment position `at` is in, and where in it.
+    #[inline]
+    fn locate(at: u64) -> (usize, usize) {
+        let segment = (63 - ((at >> FIRST_BITS) + 1).leading_zeros()) as usize;
+        (segment, (at - segment_start(segment)) as usize)
+    }
+
+    /// Values by position, appended and never moved or freed: segments allocated on first use,
+    /// so a reference into one lives as long as the column (a `static`). Each position is
+    /// written once, by the thread that claimed it, before anything naming it is published by
+    /// a release store that the reader's acquire load pairs with.
+    pub(crate) struct Column<T> {
+        segments: [AtomicPtr<T>; SEGMENTS],
+        /// Whether segments start zeroed: a column of atomics that are read before they are
+        /// written.
+        zeroed: bool,
+        of: PhantomData<T>,
+    }
+
+    impl<T> Column<T> {
+        pub(crate) const fn new() -> Column<T> {
+            Column::with(false)
+        }
+
+        /// A column of atomics whose all-zero bits are a value: what a position not written yet
+        /// reads as.
+        pub(crate) const fn zeroed() -> Column<T> {
+            Column::with(true)
+        }
+
+        const fn with(zeroed: bool) -> Column<T> {
+            Column {
+                segments: [const { AtomicPtr::new(ptr::null_mut()) }; SEGMENTS],
+                zeroed,
+                of: PhantomData,
+            }
+        }
+
+        /// Where segment `segment` starts, allocated if this is its first use.
+        #[inline]
+        fn segment(&self, segment: usize) -> *mut T {
+            let base = self.segments[segment].load(Ordering::Acquire);
+            if base.is_null() { self.allocate(segment) } else { base }
+        }
+
+        #[cold]
+        fn allocate(&self, segment: usize) -> *mut T {
+            let layout = Layout::array::<T>(segment_len(segment) as usize)
+                .expect("a column segment fits in memory");
+            assert!(layout.size() > 0, "a column of zero-sized values");
+            // SAFETY: `layout` is not zero-sized.
+            let fresh = unsafe {
+                if self.zeroed { alloc::alloc_zeroed(layout) } else { alloc::alloc(layout) }
+            }
+            .cast::<T>();
+            if fresh.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            match self.segments[segment].compare_exchange(
+                ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(won) => {
+                    // SAFETY: `fresh` was allocated above with `layout` and lost the race to be
+                    // published, so no other thread has seen it.
+                    unsafe { alloc::dealloc(fresh.cast(), layout) };
+                    won
                 }
             }
-        )*
-    };
-}
+        }
 
-impl_gc_visit!(
-    super::consts::ConstInterned,
-    super::consts::ValTreeInterned,
-    super::allocation::AllocationInterned,
-    PatternInterned,
-    super::opaques::ExternalConstraintsInterned,
-    super::predicate::PredicateInterned,
-    super::region::RegionInterned,
-    super::ty::TyInterned,
-    super::predicate::ClausesCachedTypeInfo,
-);
+        /// Writes `value` at `at`.
+        ///
+        /// # Safety
+        ///
+        /// `at` is below 2^32, claimed by the calling thread alone and not written yet.
+        #[inline]
+        pub(crate) unsafe fn write(&self, at: u64, value: T) {
+            let (segment, offset) = locate(at);
+            // SAFETY: `offset` is within the segment, and the position is the caller's alone.
+            unsafe { self.segment(segment).add(offset).write(value) }
+        }
 
-macro_rules! impl_gc_visit_slice {
-    ( $($ty:ty),* $(,)? ) => {
-        $(
-            impl ::intern::GcInternedSliceVisit for $ty {
-                #[inline]
-                fn visit_header(header: &<Self as ::intern::SliceInternable>::Header, gc: &mut ::intern::GarbageCollector) {
-                    header.generic_visit_with(gc);
-                }
+        /// The value at `at`, of a zeroed column, its segment allocated if need be: a position
+        /// to store into.
+        ///
+        /// # Safety
+        ///
+        /// The column is [`Column::zeroed`] and `T` is an atomic, and `at` is below 2^32.
+        #[inline]
+        pub(crate) unsafe fn place(&self, at: u64) -> &T {
+            let (segment, offset) = locate(at);
+            // SAFETY: the segment is allocated and zeroed, which is a `T` (the caller's
+            // precondition), and never freed.
+            unsafe { &*self.segment(segment).add(offset) }
+        }
 
-                #[inline]
-                fn visit_slice(slice: &[<Self as ::intern::SliceInternable>::SliceType], gc: &mut ::intern::GarbageCollector) {
-                    slice.generic_visit_with(gc);
+        /// The value at `at` of a zeroed column, `None` when its segment was never allocated
+        /// (so it was never written).
+        ///
+        /// # Safety
+        ///
+        /// As [`Column::place`].
+        #[inline]
+        pub(crate) unsafe fn peek(&self, at: u64) -> Option<&T> {
+            let (segment, offset) = locate(at);
+            let base = self.segments[segment].load(Ordering::Acquire);
+            // SAFETY: as in `place`.
+            (!base.is_null()).then(|| unsafe { &*base.add(offset) })
+        }
+
+        /// The value at `at`.
+        ///
+        /// # Safety
+        ///
+        /// `at` was written (or the column is zeroed and `T` an atomic), and that write happens
+        /// before this call. The write allocated the segment, so the relaxed load of its address
+        /// sees it.
+        #[inline]
+        pub(crate) unsafe fn get(&self, at: u64) -> &T {
+            let (segment, offset) = locate(at);
+            // SAFETY: the caller's precondition; segments are never freed.
+            unsafe { &*self.segments[segment].load(Ordering::Relaxed).add(offset) }
+        }
+
+        /// The `len` values from `start`.
+        ///
+        /// # Safety
+        ///
+        /// As [`Column::get`] for each of them, and they are in one segment, as [`Run::claim`]
+        /// gives them.
+        #[inline]
+        pub(crate) unsafe fn slice(&self, start: u64, len: usize) -> &[T] {
+            if len == 0 {
+                return &[];
+            }
+            let (segment, offset) = locate(start);
+            // SAFETY: the caller's precondition.
+            unsafe {
+                std::slice::from_raw_parts(
+                    self.segments[segment].load(Ordering::Relaxed).add(offset),
+                    len,
+                )
+            }
+        }
+    }
+
+    /// A column whose positions are claimed in runs that never cross a segment, so that a run
+    /// is one slice.
+    pub(crate) struct Run<T> {
+        pub(crate) column: Column<T>,
+        next: AtomicU64,
+    }
+
+    impl<T> Run<T> {
+        pub(crate) const fn new() -> Run<T> {
+            Run { column: Column::new(), next: AtomicU64::new(0) }
+        }
+
+        /// Claims `len` (not 0) positions in a row for the calling thread, returning the first.
+        /// Panics, naming `what`, past 2^32 positions.
+        pub(crate) fn claim(&self, len: u64, what: &str) -> u64 {
+            let mut next = self.next.load(Ordering::Relaxed);
+            loop {
+                let start = fit(next, len);
+                let end = start + len;
+                assert!(end <= 1 << 32, "the {what} table holds 2^32 words");
+                match self.next.compare_exchange_weak(
+                    next,
+                    end,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return start,
+                    Err(now) => next = now,
                 }
             }
-        )*
-    };
-}
+        }
+    }
 
-impl_gc_visit_slice!(
-    super::predicate::ClausesStorage,
-    super::generic_arg::GenericArgsStorage,
-    BoundVarKindsStorage,
-    VariancesOfStorage,
-    CanonicalVarsStorage,
-    PatListStorage,
-    super::opaques::PredefinedOpaquesStorage,
-    super::opaques::SolverDefIdsStorage,
-    super::predicate::BoundExistentialPredicatesStorage,
-    super::region::RegionAssumptionsStorage,
-    super::ty::TysStorage,
-    super::consts::ConstsStorage,
-    crate::mir::ProjectionStorage,
-);
+    /// The first position from `from` where `len` positions in a row are in one segment, or
+    /// 2^32 when there is none.
+    fn fit(from: u64, len: u64) -> u64 {
+        let (mut segment, offset) = locate(from);
+        if offset as u64 + len <= segment_len(segment) {
+            return from;
+        }
+        loop {
+            segment += 1;
+            if segment >= SEGMENTS {
+                return 1 << 32;
+            }
+            if len <= segment_len(segment) {
+                return segment_start(segment);
+            }
+        }
+    }
+
+    /// The hash a value is found by: its Fx hash, mixed (murmur's finalizer) so that its top
+    /// bits pick a shard and its low half a slot.
+    #[inline]
+    pub(crate) fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
+        let hash = FxBuildHasher.hash_one(value);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^ (hash >> 33)
+    }
+
+    const SHARD_BITS: u32 = 6;
+    const SHARDS: usize = 1 << SHARD_BITS;
+    const FIRST_SLOTS: usize = 16;
+
+    /// Finds a row by its value's hash: 64 shards, each an open-addressed table (linear
+    /// probing, at most half full) of `u64` slots, each the low half of a hash and a row (0 for
+    /// an empty slot, as rows start at 1). A hit is loads alone; an insert takes the shard's
+    /// lock, looks again and publishes the row with a release store. A table that grows is
+    /// copied and the old one leaked, as a reader may still be probing it.
+    pub(crate) struct Index {
+        shards: [Shard; SHARDS],
+    }
+
+    struct Shard {
+        /// Null until the first insert; replaced only by the holder of `len`.
+        slots: AtomicPtr<Slots>,
+        /// How many rows the shard holds.
+        len: Mutex<usize>,
+    }
+
+    struct Slots {
+        words: Box<[AtomicU64]>,
+    }
+
+    impl Slots {
+        fn new(len: usize) -> Slots {
+            Slots { words: (0..len).map(|_| AtomicU64::new(0)).collect() }
+        }
+
+        #[inline]
+        fn find(&self, hash: u32, mut same: impl FnMut(NonZeroU32) -> bool) -> Option<NonZeroU32> {
+            let mask = self.words.len() - 1;
+            let mut at = hash as usize & mask;
+            loop {
+                let word = self.words[at].load(Ordering::Acquire);
+                let row = NonZeroU32::new(word as u32)?;
+                if (word >> 32) as u32 == hash && same(row) {
+                    return Some(row);
+                }
+                at = (at + 1) & mask;
+            }
+        }
+
+        /// Puts `word` in the first empty slot from its hash's. Only the holder of the shard's
+        /// lock calls it, on a table with an empty slot.
+        fn put(&self, word: u64) {
+            let mask = self.words.len() - 1;
+            let mut at = (word >> 32) as usize & mask;
+            while self.words[at].load(Ordering::Relaxed) != 0 {
+                at = (at + 1) & mask;
+            }
+            self.words[at].store(word, Ordering::Release);
+        }
+    }
+
+    pub(crate) enum Entry<'a> {
+        Found(NonZeroU32),
+        Vacant(Vacant<'a>),
+    }
+
+    /// A hash not in the index, with its shard's lock held until a row is inserted for it.
+    pub(crate) struct Vacant<'a> {
+        shard: &'a Shard,
+        len: MutexGuard<'a, usize>,
+        hash: u32,
+    }
+
+    impl Index {
+        pub(crate) const fn new() -> Index {
+            Index {
+                shards: [const {
+                    Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) }
+                }; SHARDS],
+            }
+        }
+
+        #[inline]
+        fn shard(&self, hash: u64) -> &Shard {
+            &self.shards[(hash >> (64 - SHARD_BITS)) as usize]
+        }
+
+        /// The row of hash `hash` that `same` accepts.
+        #[inline]
+        pub(crate) fn find(
+            &self,
+            hash: u64,
+            same: impl FnMut(NonZeroU32) -> bool,
+        ) -> Option<NonZeroU32> {
+            let slots = self.shard(hash).slots.load(Ordering::Acquire);
+            // SAFETY: a published table is never freed.
+            unsafe { slots.as_ref() }?.find(hash as u32, same)
+        }
+
+        /// The row of hash `hash` that `same` accepts, looked for again under its shard's lock,
+        /// or the lock to insert one.
+        pub(crate) fn lock(&self, hash: u64, same: impl FnMut(NonZeroU32) -> bool) -> Entry<'_> {
+            let shard = self.shard(hash);
+            let len = shard.len.lock().unwrap_or_else(PoisonError::into_inner);
+            match self.find(hash, same) {
+                Some(row) => Entry::Found(row),
+                None => Entry::Vacant(Vacant { shard, len, hash: hash as u32 }),
+            }
+        }
+    }
+
+    impl Vacant<'_> {
+        /// Publishes `row`, written in full, for the hash, and releases the shard's lock.
+        pub(crate) fn insert(mut self, row: NonZeroU32) {
+            let len = *self.len + 1;
+            let mut slots = self.shard.slots.load(Ordering::Relaxed);
+            // SAFETY: a published table is never freed.
+            let capacity = unsafe { slots.as_ref() }.map_or(0, |slots| slots.words.len());
+            if len * 2 > capacity {
+                let grown = Slots::new((capacity * 2).max(FIRST_SLOTS));
+                // SAFETY: as above.
+                if let Some(old) = unsafe { slots.as_ref() } {
+                    for word in &old.words {
+                        let word = word.load(Ordering::Relaxed);
+                        if word != 0 {
+                            grown.put(word);
+                        }
+                    }
+                }
+                slots = Box::into_raw(Box::new(grown));
+                self.shard.slots.store(slots, Ordering::Release);
+            }
+            // SAFETY: `slots` is the shard's table, never freed.
+            unsafe { &*slots }.put((u64::from(self.hash) << 32) | u64::from(row.get()));
+            *self.len = len;
+        }
+    }
+
+    /// Set in a stored tag when the value's fields are its data word (at most one of them).
+    const INLINE: u8 = 0x80;
+
+    /// The rows of one kind with a structure. A value is its words (its codec's, in
+    /// `persist.rs`: the first a tag below 127, children as their indices); the row holds the
+    /// tag, plus one, in `tag` (so 0 is a row not written yet, and storing it publishes the
+    /// row), and in `data` the one word after it ([`INLINE`] set), or where `[len, words...]`
+    /// of the rest start in `extra`. Flags and outer exclusive binder are computed once, when
+    /// the value is added.
+    pub(crate) struct Rows {
+        what: &'static str,
+        last: u32,
+        next: AtomicU64,
+        tag: Column<AtomicU8>,
+        data: Column<u32>,
+        flags: Column<u32>,
+        binder: Column<u32>,
+        extra: Run<u32>,
+        index: Index,
+    }
+
+    /// The bytes a row takes in its columns, its `extra` words aside.
+    pub(crate) const ROW_BYTES: usize =
+        size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>() + size_of::<u32>();
+    const _: () = assert!(ROW_BYTES == 13);
+
+    /// A row's words: the tag, and the rest. An inline row's `words` is its data word, which
+    /// is 0 when it has no field; a decoder reads only the words its value has.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Fields<'a> {
+        pub(crate) tag: u32,
+        pub(crate) words: &'a [u32],
+        inline: bool,
+    }
+
+    impl Rows {
+        /// A table of rows 1 to `last`, named `what` in what it panics with.
+        pub(crate) const fn new(what: &'static str, last: u32) -> Rows {
+            Rows {
+                what,
+                last,
+                next: AtomicU64::new(1),
+                tag: Column::zeroed(),
+                data: Column::new(),
+                flags: Column::new(),
+                binder: Column::new(),
+                extra: Run::new(),
+                index: Index::new(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of the value whose words are `words` (its tag first), added with the flags
+        /// and outer exclusive binder `info` computes if it is not there.
+        pub(crate) fn intern(
+            &self,
+            words: &[u32],
+            info: impl FnOnce() -> (TypeFlags, DebruijnIndex),
+        ) -> NonZeroU32 {
+            let hash = hash_of(words);
+            let same = |row| self.holds(row, words);
+            if let Some(row) = self.index.find(hash, same) {
+                return row;
+            }
+            let (flags, binder) = info();
+            let vacant = match self.index.lock(hash, same) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let (&tag, fields) = words.split_first().expect("a value has a tag");
+            assert!(tag < u32::from(INLINE) - 1, "a {} tag of {tag}", self.what);
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(self.last), "the {} table holds {} rows", self.what, self.last);
+            // SAFETY: `row` is ours alone (claimed above) and below 2^32, as are the `extra`
+            // positions `claim` gives; `insert` publishes them after these writes. The tag
+            // column is zeroed and of atomics.
+            unsafe {
+                let tag = tag as u8 + 1;
+                let tag = match fields {
+                    [] | [_] => {
+                        self.data.write(row, fields.first().copied().unwrap_or(0));
+                        tag | INLINE
+                    }
+                    _ => {
+                        let at = self.extra.claim(fields.len() as u64 + 1, self.what);
+                        self.extra.column.write(at, fields.len() as u32);
+                        for (i, &word) in fields.iter().enumerate() {
+                            self.extra.column.write(at + 1 + i as u64, word);
+                        }
+                        self.data.write(row, at as u32);
+                        tag
+                    }
+                };
+                self.flags.write(row, flags.bits());
+                self.binder.write(row, binder.as_u32());
+                self.tag.place(row).store(tag, Ordering::Release);
+            }
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// Whether `row`, a row of this table, holds the value of words `words`.
+        fn holds(&self, row: NonZeroU32, words: &[u32]) -> bool {
+            // SAFETY: the index only names rows `intern` wrote.
+            let fields = unsafe { self.fields(row) };
+            let Some((&tag, rest)) = words.split_first() else { return false };
+            fields.tag == tag
+                && match fields.inline {
+                    true => rest.len() <= 1 && fields.words[0] == rest.first().copied().unwrap_or(0),
+                    false => fields.words == rest,
+                }
+        }
+
+        /// Whether `row` is a row written in full: what a handle made from a bare index checks.
+        pub(crate) fn published(&self, row: NonZeroU32) -> bool {
+            // SAFETY: the tag column is zeroed and of atomics, and a row is below 2^32.
+            unsafe { self.tag.peek(row.get().into()) }
+                .is_some_and(|tag| tag.load(Ordering::Acquire) != 0)
+        }
+
+        /// The words of `row`.
+        ///
+        /// # Safety
+        ///
+        /// `row` was given by [`Rows::intern`], or [`Rows::published`] accepted it.
+        #[inline]
+        pub(crate) unsafe fn fields(&self, row: NonZeroU32) -> Fields<'_> {
+            let row = u64::from(row.get());
+            // SAFETY: the row was written, and its publication happens before this call (the
+            // caller's precondition), as do the `extra` words it names.
+            unsafe {
+                let tag = self.tag.get(row).load(Ordering::Relaxed);
+                let data = self.data.get(row);
+                if tag & INLINE != 0 {
+                    Fields {
+                        tag: u32::from(tag & !INLINE) - 1,
+                        words: std::slice::from_ref(data),
+                        inline: true,
+                    }
+                } else {
+                    let at = u64::from(*data);
+                    let len = *self.extra.column.get(at);
+                    Fields {
+                        tag: u32::from(tag) - 1,
+                        words: self.extra.column.slice(at + 1, len as usize),
+                        inline: false,
+                    }
+                }
+            }
+        }
+
+        /// The flags of `row`.
+        ///
+        /// # Safety
+        ///
+        /// As [`Rows::fields`].
+        #[inline]
+        pub(crate) unsafe fn flags(&self, row: NonZeroU32) -> TypeFlags {
+            // SAFETY: the caller's precondition.
+            TypeFlags::from_bits_retain(unsafe { *self.flags.get(row.get().into()) })
+        }
+
+        /// The outer exclusive binder of `row`.
+        ///
+        /// # Safety
+        ///
+        /// As [`Rows::fields`].
+        #[inline]
+        pub(crate) unsafe fn binder(&self, row: NonZeroU32) -> DebruijnIndex {
+            // SAFETY: the caller's precondition.
+            DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
+        }
+    }
+
+    /// Interned lists of `T`: each row a start and a length over one column of items. A list's
+    /// items are one run, so a list is one slice. The length column holds the length plus one,
+    /// 0 for a row not written yet, and storing it publishes the row. For a kind whose lists
+    /// have flags (clauses), the flags and outer exclusive binder of the whole list are columns
+    /// too: one load tests a block of items.
+    pub(crate) struct Lists<T> {
+        what: &'static str,
+        next: AtomicU64,
+        start: Column<u32>,
+        len: Column<AtomicU32>,
+        flags: Column<u32>,
+        binder: Column<u32>,
+        items: Run<T>,
+        index: Index,
+    }
+
+    /// The bytes a list takes in its columns, its items aside (and the flag columns, for the
+    /// lists that have them).
+    pub(crate) const LIST_BYTES: usize = size_of::<u32>() + size_of::<AtomicU32>();
+    const _: () = assert!(LIST_BYTES == 8);
+
+    impl<T: Copy + Hash + Eq> Lists<T> {
+        pub(crate) const fn new(what: &'static str) -> Lists<T> {
+            Lists {
+                what,
+                next: AtomicU64::new(1),
+                start: Column::new(),
+                len: Column::zeroed(),
+                flags: Column::new(),
+                binder: Column::new(),
+                items: Run::new(),
+                index: Index::new(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of the list `items`, added if it is not there.
+        pub(crate) fn intern(&self, items: &[T]) -> NonZeroU32 {
+            self.put(items, || None)
+        }
+
+        /// As [`Lists::intern`], for a kind whose lists have flags: `info` computes them.
+        pub(crate) fn intern_with(
+            &self,
+            items: &[T],
+            info: impl FnOnce() -> (TypeFlags, DebruijnIndex),
+        ) -> NonZeroU32 {
+            self.put(items, || Some(info()))
+        }
+
+        fn put(
+            &self,
+            items: &[T],
+            info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
+        ) -> NonZeroU32 {
+            let hash = hash_of(items);
+            // SAFETY: the index only names rows `put` wrote.
+            let same = |row| unsafe { self.get(row) } == items;
+            if let Some(row) = self.index.find(hash, same) {
+                return row;
+            }
+            let info = info();
+            let vacant = match self.index.lock(hash, same) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let len = u32::try_from(items.len() + 1)
+                .unwrap_or_else(|_| panic!("a list of {} items in {}", items.len(), self.what));
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
+            let start = match items.is_empty() {
+                true => 0,
+                false => self.items.claim(items.len() as u64, self.what),
+            };
+            // SAFETY: `row` and the item positions `claim` gave are ours alone and below 2^32;
+            // `insert` publishes them after these writes. The length column is zeroed and of
+            // atomics.
+            unsafe {
+                for (i, &item) in items.iter().enumerate() {
+                    self.items.column.write(start + i as u64, item);
+                }
+                self.start.write(row, start as u32);
+                if let Some((flags, binder)) = info {
+                    self.flags.write(row, flags.bits());
+                    self.binder.write(row, binder.as_u32());
+                }
+                self.len.place(row).store(len, Ordering::Release);
+            }
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// Whether `row` is a list written in full: what a handle made from a bare index checks.
+        pub(crate) fn published(&self, row: NonZeroU32) -> bool {
+            // SAFETY: the length column is zeroed and of atomics, and a row is below 2^32.
+            unsafe { self.len.peek(row.get().into()) }
+                .is_some_and(|len| len.load(Ordering::Acquire) != 0)
+        }
+
+        /// The items of `row`.
+        ///
+        /// # Safety
+        ///
+        /// `row` was given by [`Lists::intern`] or [`Lists::intern_with`], or
+        /// [`Lists::published`] accepted it.
+        #[inline]
+        pub(crate) unsafe fn get(&self, row: NonZeroU32) -> &[T] {
+            let row = u64::from(row.get());
+            // SAFETY: the row and its items were written, before this call (the caller's
+            // precondition), in one run.
+            unsafe {
+                let len = self.len.get(row).load(Ordering::Relaxed) - 1;
+                self.items.column.slice(u64::from(*self.start.get(row)), len as usize)
+            }
+        }
+
+        /// The flags of `row`.
+        ///
+        /// # Safety
+        ///
+        /// `row` was given by [`Lists::intern_with`].
+        #[inline]
+        pub(crate) unsafe fn flags(&self, row: NonZeroU32) -> TypeFlags {
+            // SAFETY: the caller's precondition.
+            TypeFlags::from_bits_retain(unsafe { *self.flags.get(row.get().into()) })
+        }
+
+        /// The outer exclusive binder of `row`.
+        ///
+        /// # Safety
+        ///
+        /// As [`Lists::flags`].
+        #[inline]
+        pub(crate) unsafe fn binder(&self, row: NonZeroU32) -> DebruijnIndex {
+            // SAFETY: the caller's precondition.
+            DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
+        }
+    }
+
+    /// Interned values kept whole, for the kinds whose API hands out a reference to the value.
+    pub(crate) struct Values<T> {
+        what: &'static str,
+        next: AtomicU64,
+        values: Column<T>,
+        index: Index,
+    }
+
+    impl<T: Hash + Eq> Values<T> {
+        pub(crate) const fn new(what: &'static str) -> Values<T> {
+            Values { what, next: AtomicU64::new(1), values: Column::new(), index: Index::new() }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of `value`, added if it is not there.
+        pub(crate) fn intern(&self, value: T) -> NonZeroU32 {
+            let hash = hash_of(&value);
+            // SAFETY: the index only names rows `intern` wrote.
+            let same = |row| unsafe { self.get(row) } == &value;
+            if let Some(row) = self.index.find(hash, same) {
+                return row;
+            }
+            let vacant = match self.index.lock(hash, same) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
+            // SAFETY: `row` is ours alone and below 2^32; `insert` publishes it after this.
+            unsafe { self.values.write(row, value) };
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// The value of `row`.
+        ///
+        /// # Safety
+        ///
+        /// `row` was given by [`Values::intern`].
+        #[inline]
+        pub(crate) unsafe fn get(&self, row: NonZeroU32) -> &T {
+            // SAFETY: the caller's precondition.
+            unsafe { self.values.get(row.get().into()) }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{collections::HashMap, num::NonZeroU32, sync::Barrier};
+
+        use rustc_type_ir::{DebruijnIndex, INNERMOST, TypeFlags};
+
+        use super::{FIRST_BITS, Lists, Rows, SEGMENTS, Values, fit, locate, segment_len, segment_start};
+
+        fn no_flags() -> (TypeFlags, DebruijnIndex) {
+            (TypeFlags::empty(), INNERMOST)
+        }
+
+        #[test]
+        fn positions_are_in_the_segment_that_holds_them() {
+            for segment in 0..SEGMENTS {
+                let start = segment_start(segment);
+                let end = start + segment_len(segment) - 1;
+                assert_eq!(locate(start), (segment, 0));
+                assert_eq!(locate(end), (segment, (segment_len(segment) - 1) as usize));
+            }
+            assert!(segment_start(SEGMENTS - 1) + segment_len(SEGMENTS - 1) >= 1 << 32);
+            assert_eq!(segment_len(0), 1 << FIRST_BITS);
+        }
+
+        #[test]
+        fn a_run_never_crosses_a_segment() {
+            assert_eq!(fit(0, 10), 0);
+            assert_eq!(fit(1020, 4), 1020);
+            assert_eq!(fit(1021, 4), 1024);
+            assert_eq!(fit(1021, 3000), segment_start(2));
+            assert_eq!(fit(0, 1 << 33), 1 << 32);
+        }
+
+        #[test]
+        fn a_row_interned_twice_is_one_row() {
+            static ROWS: Rows = Rows::new("test rows", 1000);
+            let values: [&[u32]; 5] = [&[0], &[0, 7], &[0, 7, 8], &[1, 0], &[3, 1, 2, 3, 4, 5]];
+            let rows: Vec<_> = values.iter().map(|words| ROWS.intern(words, no_flags)).collect();
+            for (words, &row) in values.iter().zip(&rows) {
+                assert_eq!(ROWS.intern(words, || panic!("computed flags of a value interned")), row);
+                // SAFETY: `row` came from `intern`.
+                let fields = unsafe { ROWS.fields(row) };
+                assert_eq!(fields.tag, words[0]);
+                assert_eq!(&fields.words[..words.len() - 1], &words[1..]);
+                assert!(ROWS.published(row));
+            }
+            let distinct: std::collections::HashSet<_> = rows.iter().collect();
+            assert_eq!(distinct.len(), values.len());
+            assert!(!ROWS.published(NonZeroU32::new(999).unwrap()));
+        }
+
+        #[test]
+        fn a_row_keeps_its_flags() {
+            static ROWS: Rows = Rows::new("test rows with flags", 10);
+            let row = ROWS.intern(&[2, 5, 6], || {
+                (TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR, DebruijnIndex::from_u32(3))
+            });
+            // SAFETY: `row` came from `intern`.
+            unsafe {
+                assert_eq!(ROWS.flags(row), TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR);
+                assert_eq!(ROWS.binder(row), DebruijnIndex::from_u32(3));
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "the tiny table holds 2 rows")]
+        fn a_full_table_says_so() {
+            static ROWS: Rows = Rows::new("tiny", 2);
+            for tag in 0..3 {
+                ROWS.intern(&[tag], no_flags);
+            }
+        }
+
+        #[test]
+        fn a_list_interned_twice_is_one_list() {
+            static LISTS: Lists<u64> = Lists::new("test lists");
+            let lists: [&[u64]; 4] = [&[], &[1], &[1, 2], &[2, 1]];
+            let rows: Vec<_> = lists.iter().map(|items| LISTS.intern(items)).collect();
+            for (items, &row) in lists.iter().zip(&rows) {
+                assert_eq!(LISTS.intern(items), row);
+                // SAFETY: `row` came from `intern`.
+                assert_eq!(unsafe { LISTS.get(row) }, *items);
+                assert!(LISTS.published(row));
+            }
+            assert_eq!(rows.iter().collect::<std::collections::HashSet<_>>().len(), lists.len());
+            // A list longer than a first segment's free room starts in a later segment.
+            let long: Vec<u64> = (0..5000).collect();
+            let row = LISTS.intern(&long);
+            // SAFETY: as above.
+            assert_eq!(unsafe { LISTS.get(row) }, &long[..]);
+        }
+
+        #[test]
+        fn a_value_interned_twice_is_one_value() {
+            static VALUES: Values<String> = Values::new("test values");
+            let a = VALUES.intern("a".to_owned());
+            let b = VALUES.intern("b".to_owned());
+            assert_ne!(a, b);
+            assert_eq!(VALUES.intern("a".to_owned()), a);
+            // SAFETY: `a` came from `intern`.
+            assert_eq!(unsafe { VALUES.get(a) }, "a");
+        }
+
+        #[test]
+        fn eight_threads_interning_at_once_get_one_row_per_value() {
+            static ROWS: Rows = Rows::new("parallel rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("parallel lists");
+            const THREADS: u32 = 8;
+            const VALUES: u32 = 20_000;
+            let barrier = Barrier::new(THREADS as usize);
+            let seen: Vec<HashMap<u32, (NonZeroU32, NonZeroU32)>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|thread| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            // Each thread interns every value, in an order of its own.
+                            (0..VALUES)
+                                .map(|i| (i * 7919 + thread * 104_729) % VALUES)
+                                .map(|value| {
+                                    let words = [value % 100, value, value / 3];
+                                    let row = ROWS.intern(&words, no_flags);
+                                    let list = LISTS.intern(&words[..1 + value as usize % 3]);
+                                    (value, (row, list))
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+            });
+            for value in 0..VALUES {
+                let first = seen[0][&value];
+                assert!(seen.iter().all(|thread| thread[&value] == first), "value {value}");
+            }
+            let rows: std::collections::HashSet<_> = seen[0].values().map(|it| it.0).collect();
+            assert_eq!(rows.len(), VALUES as usize);
+        }
+    }
+}

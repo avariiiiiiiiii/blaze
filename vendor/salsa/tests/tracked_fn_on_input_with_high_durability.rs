@@ -47,7 +47,6 @@ fn execute() {
     // executed the query.
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "DidValidateMemoizedValue { database_key: tracked_fn(Id(0)) }",
             "WillCheckCancellation",

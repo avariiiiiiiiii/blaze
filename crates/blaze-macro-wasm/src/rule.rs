@@ -1,5 +1,5 @@
 //! Which proc macros run as WebAssembly modules and which natively, in a sandboxed warm server
-//! (docs/v2/plan/lanes/usercode.md section 6.5): every one as a module, unless the workspace's root
+//! (docs/v2/plan/lanes/usercode.md): every one as a module, unless the workspace's root
 //! manifest lists its package in `[workspace.metadata.blaze] native-proc-macros` or
 //! `BLAZE_PROC_MACRO_WASM` is `0` or `off` for the whole build. Nothing else chooses: a macro
 //! that can't be built or run as a module fails, naming it ([`refused`]), and is never run

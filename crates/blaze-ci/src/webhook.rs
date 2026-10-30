@@ -1,7 +1,7 @@
 //! A GitHub webhook delivery: its signature checked against the App's secret, then its payload
 //! read into an [`Event`]. Nothing in a payload is trusted before [`verify`] passes.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use blaze_api::http::HttpRequest;
 use ring::hmac;
@@ -61,18 +61,25 @@ pub fn verify(secret: &[u8], body: &[u8], signature: Option<&str>) -> Result<(),
     })
 }
 
-fn hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() != 64 {
+/// The 32 bytes of 64 hex digits, on the stack.
+fn hex(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
         return None;
     }
     let digit = |byte: u8| char::from(byte).to_digit(16);
-    text.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8))
-        .collect()
+    let mut tag = [0; 32];
+    for (out, pair) in tag.iter_mut().zip(bytes.chunks_exact(2)) {
+        *out = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Some(tag)
 }
 
 /// The payload of event kind `kind` (`X-GitHub-Event`), delivery `id` (`X-GitHub-Delivery`).
+///
+/// One pass over the body: serde reads only the fields below, skipping the rest of the payload
+/// without building it, and borrows each string from the body unless it has escapes. The only
+/// copies are the [`Delivery`]'s own strings.
 pub fn parse(kind: &str, id: &str, body: &[u8]) -> Result<Delivery, WebhookError> {
     if body.len() > MOST_PAYLOAD {
         return Err(WebhookError::new(
@@ -86,12 +93,12 @@ pub fn parse(kind: &str, id: &str, body: &[u8]) -> Result<Delivery, WebhookError
     let id = id.to_owned();
     match kind {
         "push" => {
-            let push: PushPayload = payload(kind, body)?;
-            let repo = push.repository.full_name;
+            let push: PushPayload<'_> = payload(kind, body)?;
+            let repo = push.repository.full_name.into_owned();
             if push.deleted {
                 return Ok(Delivery { id, repo, event: None });
             }
-            let commit = sha(kind, "after", push.after)?;
+            let commit = sha(kind, "after", &push.after)?;
             let event = if let Some(branch) = push.reference.strip_prefix("refs/heads/") {
                 Some(Event::Push { branch: name(kind, "ref", branch)?, commit })
             } else if let Some(tag) = push.reference.strip_prefix("refs/tags/") {
@@ -102,29 +109,29 @@ pub fn parse(kind: &str, id: &str, body: &[u8]) -> Result<Delivery, WebhookError
             Ok(Delivery { id, repo, event })
         }
         "pull_request" => {
-            let action: ActionPayload = payload(kind, body)?;
-            if !matches!(&*action.action, "opened" | "synchronize" | "reopened" | "ready_for_review")
-            {
-                let repo = action.repository.map(|it| it.full_name).unwrap_or_default();
+            let pr: PullRequestPayload<'_> = payload(kind, body)?;
+            if !matches!(&*pr.action, "opened" | "synchronize" | "reopened" | "ready_for_review") {
+                let repo = pr.repository.map(|it| it.full_name.into_owned()).unwrap_or_default();
                 return Ok(Delivery { id, repo, event: None });
             }
-            let pr: PullRequestPayload = payload(kind, body)?;
-            let base_repo = pr.pull_request.base.repo.ok_or_else(|| {
-                WebhookError::new(400, "the pull_request payload has no pull_request.base.repo")
-            })?;
-            let from_fork =
-                pr.pull_request.head.repo.is_none_or(|head| head.full_name != base_repo.full_name);
+            let missing =
+                |field: &str| WebhookError::new(400, format!("the {kind} payload has no {field}"));
+            let repository = pr.repository.ok_or_else(|| missing("repository"))?;
+            let number = pr.number.ok_or_else(|| missing("number"))?;
+            let pull = pr.pull_request.ok_or_else(|| missing("pull_request"))?;
+            let base_repo = pull.base.repo.ok_or_else(|| missing("pull_request.base.repo"))?;
+            let from_fork = pull.head.repo.is_none_or(|head| head.full_name != base_repo.full_name);
             let event = Event::PullRequest {
-                number: pr.number,
-                head: sha(kind, "pull_request.head.sha", pr.pull_request.head.sha)?,
-                base: sha(kind, "pull_request.base.sha", pr.pull_request.base.sha)?,
+                number,
+                head: sha(kind, "pull_request.head.sha", &pull.head.sha)?,
+                base: sha(kind, "pull_request.base.sha", &pull.base.sha)?,
                 from_fork,
             };
-            Ok(Delivery { id, repo: pr.repository.full_name, event: Some(event) })
+            Ok(Delivery { id, repo: repository.full_name.into_owned(), event: Some(event) })
         }
         _ => {
-            let other: OtherPayload = payload(kind, body)?;
-            let repo = other.repository.map(|it| it.full_name).unwrap_or_default();
+            let other: OtherPayload<'_> = payload(kind, body)?;
+            let repo = other.repository.map(|it| it.full_name.into_owned()).unwrap_or_default();
             Ok(Delivery { id, repo, event: None })
         }
     }
@@ -163,10 +170,10 @@ fn payload<'a, T: Deserialize<'a>>(kind: &str, body: &'a [u8]) -> Result<T, Webh
 }
 
 /// A commit's full hex name, SHA-1 or SHA-256.
-fn sha(kind: &str, field: &str, sha: String) -> Result<String, WebhookError> {
+fn sha(kind: &str, field: &str, sha: &str) -> Result<String, WebhookError> {
     let hex = sha.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'));
     if hex && matches!(sha.len(), 40 | 64) {
-        Ok(sha)
+        Ok(sha.to_owned())
     } else {
         Err(WebhookError::new(400, format!("the {kind} payload's {field} {sha:?} is not a commit")))
     }
@@ -181,49 +188,56 @@ fn name(kind: &str, field: &str, name: &str) -> Result<String, WebhookError> {
 }
 
 #[derive(Deserialize)]
-struct Repository {
-    full_name: String,
+struct Repository<'a> {
+    #[serde(borrow)]
+    full_name: Cow<'a, str>,
 }
 
 #[derive(Deserialize)]
-struct PushPayload {
-    #[serde(rename = "ref")]
-    reference: String,
-    after: String,
+struct PushPayload<'a> {
+    #[serde(rename = "ref", borrow)]
+    reference: Cow<'a, str>,
+    #[serde(borrow)]
+    after: Cow<'a, str>,
     #[serde(default)]
     deleted: bool,
-    repository: Repository,
+    #[serde(borrow)]
+    repository: Repository<'a>,
+}
+
+/// Every action's payload: the fields past `action` are required only of the actions CI runs.
+#[derive(Deserialize)]
+struct PullRequestPayload<'a> {
+    #[serde(borrow)]
+    action: Cow<'a, str>,
+    number: Option<u64>,
+    #[serde(borrow)]
+    pull_request: Option<PullRequest<'a>>,
+    #[serde(borrow)]
+    repository: Option<Repository<'a>>,
 }
 
 #[derive(Deserialize)]
-struct ActionPayload {
-    action: String,
-    repository: Option<Repository>,
+struct PullRequest<'a> {
+    #[serde(borrow)]
+    head: Side<'a>,
+    #[serde(borrow)]
+    base: Side<'a>,
 }
 
 #[derive(Deserialize)]
-struct PullRequestPayload {
-    number: u64,
-    pull_request: PullRequest,
-    repository: Repository,
-}
-
-#[derive(Deserialize)]
-struct PullRequest {
-    head: Side,
-    base: Side,
-}
-
-#[derive(Deserialize)]
-struct Side {
-    sha: String,
+struct Side<'a> {
+    #[serde(borrow)]
+    sha: Cow<'a, str>,
     /// Null when the fork the head is in was deleted.
-    repo: Option<Repository>,
+    #[serde(borrow)]
+    repo: Option<Repository<'a>>,
 }
 
 #[derive(Deserialize)]
-struct OtherPayload {
-    repository: Option<Repository>,
+struct OtherPayload<'a> {
+    #[serde(borrow)]
+    repository: Option<Repository<'a>>,
 }
 
 #[cfg(test)]

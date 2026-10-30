@@ -7,7 +7,10 @@
 
 use either::Either;
 use hir::InFile;
-use syntax::{AstNode, TextRange};
+use syntax::{
+    AstNode, TextRange,
+    ast::{self, HasArgList as _},
+};
 
 use super::binary_operator_cannot_be_applied::code_fact;
 use crate::{
@@ -52,12 +55,42 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ExplicitDropMethodUse) -> Vec<Foun
         }
         Either::Right(path) => {
             let span = cx.span_of_ptr(*path);
+            let node = cx.node(*path);
+            let file = node.file_id;
+            let at = |range: TextRange| cx.span(InFile::new(file, range));
             let mut diag = Diag::error(Some("E0040"), message, span.clone());
             diag.span_label(span.clone(), label);
-            diag.suggestion(span, sugg, "drop", Applicability::MaybeIncorrect);
+            match first_argument(&node.value) {
+                Some((call, arg)) if !arg.is_empty() => {
+                    diag.suggestion_with_style(
+                        vec![
+                            (at(TextRange::new(call.start(), arg.start())), "drop(".to_owned()),
+                            (at(TextRange::new(arg.end(), call.end())), ")".to_owned()),
+                        ],
+                        sugg,
+                        Applicability::Unspecified,
+                        SuggestionStyle::HideCodeInline,
+                    );
+                }
+                _ => {
+                    diag.suggestion(span, sugg, "drop", Applicability::MaybeIncorrect);
+                }
+            }
             (diag, path.map(|it| it.syntax_node_ptr()))
         }
     };
     code_fact(cx, at, &mut diag);
     vec![Found::new(diag, Phase::Bodies)]
+}
+
+/// The call a path is the callee of and its first argument without the borrows before it
+/// (rustc's `arg_span` in `instantiate_value_path`).
+fn first_argument(path: &ast::Path) -> Option<(TextRange, TextRange)> {
+    let callee = ast::PathExpr::cast(path.syntax().parent()?)?;
+    let call = ast::CallExpr::cast(callee.syntax().parent()?)?;
+    let mut arg = call.arg_list()?.args().next()?;
+    while let ast::Expr::RefExpr(it) = &arg {
+        arg = it.expr()?;
+    }
+    Some((call.syntax().text_range(), arg.syntax().text_range()))
 }

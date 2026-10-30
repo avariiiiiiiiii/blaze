@@ -4,22 +4,26 @@
 
 use std::{
     cell::RefCell,
-    hash::{Hash, Hasher},
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
     iter,
+    sync::LazyLock,
 };
 
 use base_db::FileId;
 use cranelift_codegen::{
+    FinalizedMachReloc, FinalizedRelocTarget, binemit,
     ir::{self, Signature},
     isa::TargetIsa,
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
+use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
     DefWithBodyId, FunctionId, StaticId, TraitId,
     hir::{BindingId, ExprId},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 
 use hir_ty::{
     ParamEnvAndCrate,
@@ -46,6 +50,38 @@ pub(super) enum FuncTarget {
     Instance(Instance, StoredParamEnvAndCrate),
     /// The function an `asm!` block is assembled as, by its assembly.
     Asm(String),
+}
+
+/// A [`FuncTarget`] by reference: what a request is looked up by before anything of it is
+/// cloned, and what [`Wants`] hashes requests by.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum TargetRef<'a> {
+    Symbol(&'a str),
+    Path(&'a str),
+    Instance(&'a Instance, &'a StoredParamEnvAndCrate),
+    Asm(&'a str),
+}
+
+impl FuncTarget {
+    pub(super) fn as_ref(&self) -> TargetRef<'_> {
+        match self {
+            FuncTarget::Symbol(it) => TargetRef::Symbol(it),
+            FuncTarget::Path(it) => TargetRef::Path(it),
+            FuncTarget::Instance(instance, env) => TargetRef::Instance(instance, env),
+            FuncTarget::Asm(it) => TargetRef::Asm(it),
+        }
+    }
+}
+
+impl TargetRef<'_> {
+    fn to_owned(self) -> FuncTarget {
+        match self {
+            TargetRef::Symbol(it) => FuncTarget::Symbol(it.to_owned()),
+            TargetRef::Path(it) => FuncTarget::Path(it.to_owned()),
+            TargetRef::Instance(instance, env) => FuncTarget::Instance(instance.clone(), env.clone()),
+            TargetRef::Asm(it) => FuncTarget::Asm(it.to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -97,17 +133,13 @@ pub(super) struct Requests {
     pub(super) datas: Vec<DataRequest>,
 }
 
+#[derive(PartialEq)]
 pub(super) struct Code {
     pub(super) signature: Signature,
     pub(super) bytes: Vec<u8>,
     pub(super) align: u64,
-    pub(super) relocs: Vec<ModuleReloc>,
-    /// The relocations of `relocs`, by where they are, that Cranelift has no kind for, with
-    /// the type ELF has for each: the low bits of an address in an AArch64 load or store,
-    /// which go in in units of what it moves, and whatever the assembly of a function
-    /// names a symbol with. The kind in `relocs` stands in for it, and the object is given
-    /// the relocation when it is finished.
-    pub(super) elf_types: Vec<(u32, u32)>,
+    /// In the order the code generator made them, which is by offset for Cranelift's.
+    pub(super) relocs: Relocs,
     pub(super) unwind: Option<FunctionUnwind>,
     /// Which statement the code is of, from each offset where that changes.
     pub(super) lines: Vec<LineRow>,
@@ -115,35 +147,353 @@ pub(super) struct Code {
     pub(super) slots: SlotPlaces,
 }
 
-impl PartialEq for Code {
-    fn eq(&self, other: &Code) -> bool {
-        let same_target = |a: &ModuleRelocTarget, b: &ModuleRelocTarget| match (a, b) {
-            (
-                ModuleRelocTarget::User { namespace, index },
-                ModuleRelocTarget::User { namespace: other_namespace, index: other_index },
-            ) => namespace == other_namespace && index == other_index,
-            (ModuleRelocTarget::LibCall(a), ModuleRelocTarget::LibCall(b)) => a == b,
-            (ModuleRelocTarget::KnownSymbol(a), ModuleRelocTarget::KnownSymbol(b)) => a == b,
-            (
-                ModuleRelocTarget::FunctionOffset(func, offset),
-                ModuleRelocTarget::FunctionOffset(other_func, other_offset),
-            ) => func == other_func && offset == other_offset,
-            _ => false,
+/// What a relocation of a function's code points at.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum RelocName {
+    /// A function the code asks for, by its place among the [`Requests`].
+    Func(u32),
+    /// A data object the code asks for, by its place among the [`Requests`].
+    Data(u32),
+    LibCall(ir::LibCall),
+    Known(ir::KnownSymbol),
+    /// The function itself, this many bytes into its code.
+    Own(u32),
+}
+
+/// One relocation of a function's code, as [`Relocs`] gives it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Reloc {
+    pub(super) offset: u32,
+    pub(super) kind: binemit::Reloc,
+    pub(super) name: RelocName,
+    pub(super) addend: i64,
+    /// The type ELF has for it where Cranelift has no kind for that, and `kind` stands in:
+    /// the low bits of an address in an AArch64 load or store, which go in in units of what
+    /// it moves, and whatever the assembly of a function names a symbol with. The object is
+    /// given the relocation when it is finished.
+    pub(super) elf_type: Option<u32>,
+}
+
+/// The id a relocation of a function against itself has as a [`ModuleReloc`] until the
+/// function is stitched: one below `u32::MAX`, which `FuncId::from_u32` asserts away in
+/// debug builds.
+pub(super) fn unstitched() -> FuncId {
+    FuncId::from_u32(u32::MAX - 1)
+}
+
+impl Reloc {
+    /// As Cranelift's module takes it, `own` being the function's id there.
+    pub(super) fn module(self, own: FuncId) -> ModuleReloc {
+        let name = match self.name {
+            RelocName::Func(index) => ModuleRelocTarget::user(0, index),
+            RelocName::Data(index) => ModuleRelocTarget::user(1, index),
+            RelocName::LibCall(call) => ModuleRelocTarget::LibCall(call),
+            RelocName::Known(symbol) => ModuleRelocTarget::KnownSymbol(symbol),
+            RelocName::Own(offset) => ModuleRelocTarget::FunctionOffset(own, offset),
         };
-        self.bytes == other.bytes
-            && self.align == other.align
-            && self.signature == other.signature
-            && self.unwind == other.unwind
-            && self.lines == other.lines
-            && self.slots == other.slots
-            && self.elf_types == other.elf_types
-            && self.relocs.len() == other.relocs.len()
-            && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
-                a.offset == b.offset
-                    && a.kind == b.kind
-                    && a.addend == b.addend
-                    && same_target(&a.name, &b.name)
-            })
+        ModuleReloc { offset: self.offset, kind: self.kind, name, addend: self.addend }
+    }
+}
+
+impl RelocName {
+    /// The name Cranelift's module has for `namespace` and `index`: 0 for functions, 1 for
+    /// data, as [`Recorder::declare_func_in_func`] and [`Recorder::declare_data_in_func`]
+    /// declare them.
+    pub(super) fn user(namespace: u32, index: u32) -> std::result::Result<RelocName, RelocError> {
+        match namespace {
+            0 => Ok(RelocName::Func(index)),
+            1 => Ok(RelocName::Data(index)),
+            _ => Err(RelocError::Namespace(namespace)),
+        }
+    }
+
+    fn of_module(name: &ModuleRelocTarget) -> std::result::Result<RelocName, RelocError> {
+        Ok(match *name {
+            ModuleRelocTarget::User { namespace, index } => RelocName::user(namespace, index)?,
+            ModuleRelocTarget::LibCall(call) => RelocName::LibCall(call),
+            ModuleRelocTarget::KnownSymbol(symbol) => RelocName::Known(symbol),
+            ModuleRelocTarget::FunctionOffset(_, offset) => RelocName::Own(offset),
+        })
+    }
+}
+
+/// Why a relocation can't be kept as a [`Relocs`] row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RelocError {
+    /// A name in a namespace that is neither functions' (0) nor data's (1).
+    Namespace(u32),
+    /// An ELF type above 16 bits, which no relocation of x86-64 or AArch64 has.
+    ElfType(u32),
+    /// An ELF type for an offset where no relocation is, in the order of the relocations.
+    Unmatched(u32),
+    /// A libcall Cranelift's `LibCall::all_libcalls` does not list.
+    LibCall(ir::LibCall),
+    /// A name of a Cranelift test case.
+    TestCase,
+}
+
+impl fmt::Display for RelocError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelocError::Namespace(it) => write!(f, "a relocation against namespace {it}"),
+            RelocError::ElfType(it) => write!(f, "a relocation of ELF type {it}, above 16 bits"),
+            RelocError::Unmatched(it) => {
+                write!(f, "an ELF type for offset {it}, where no relocation is")
+            }
+            RelocError::LibCall(it) => write!(f, "a relocation against libcall {it}, unlisted"),
+            RelocError::TestCase => f.write_str("a relocation against a test case's name"),
+        }
+    }
+}
+
+impl From<RelocError> for CodegenError {
+    fn from(e: RelocError) -> Self {
+        CodegenError::Backend(e.to_string())
+    }
+}
+
+/// Which [`RelocName`] a [`Row`] holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum NameTag {
+    Func,
+    Data,
+    /// `index` is the call's place in `LibCall::all_libcalls`.
+    LibCall,
+    /// `index` is 0 for `ElfGlobalOffsetTable`, 1 for `CoffTlsIndex`.
+    Known,
+    /// `index` is the offset into the function.
+    Own,
+}
+
+/// A [`Reloc`] as [`Relocs`] keeps it: 16 bytes, the size data.md budgets a relocation, and
+/// read in place (Cranelift's `ModuleReloc` is 32, with its `i64` addend and 12-byte name).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Row {
+    offset: u32,
+    /// What `name` says the target is by.
+    index: u32,
+    /// The addend, or [`WIDE`] for one in [`Relocs::wide`].
+    addend: i32,
+    kind: binemit::Reloc,
+    name: NameTag,
+    /// The ELF type, 0 for none: `R_*_NONE` is no type a relocation is given.
+    elf: u16,
+}
+
+const _: () = assert!(size_of::<Row>() == 16);
+
+/// The addend of a [`Row`] whose own is in [`Relocs::wide`]: an addend of `i32::MIN` is
+/// kept there too, so that this means one thing.
+const WIDE: i32 = i32::MIN;
+
+/// The relocations of a function's code, as columns of 16-byte rows (data.md): offset, target
+/// by its `u32` place among the function's requests, kind and a 32-bit addend, with the few
+/// addends wider than that in a side table. One `Vec` of rows a function, no name owned by a
+/// row, and a lookup is an index (a wide addend a binary search of the few there are).
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub(super) struct Relocs {
+    rows: Vec<Row>,
+    /// The addends rows hold [`WIDE`] for, by the row's place, in the order of the rows.
+    wide: Vec<(u32, i64)>,
+}
+
+impl Relocs {
+    pub(super) fn with_capacity(capacity: usize) -> Relocs {
+        Relocs { rows: Vec::with_capacity(capacity), wide: Vec::new() }
+    }
+
+    /// Cranelift's relocations of `func`'s code.
+    pub(super) fn of_mach(
+        relocs: &[FinalizedMachReloc],
+        func: &ir::Function,
+    ) -> std::result::Result<Relocs, RelocError> {
+        let mut rows = Relocs::with_capacity(relocs.len());
+        for reloc in relocs {
+            let name = match &reloc.target {
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::User(name)) => {
+                    let name = &func.params.user_named_funcs()[*name];
+                    RelocName::user(name.namespace, name.index)?
+                }
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
+                    RelocName::LibCall(*call)
+                }
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::KnownSymbol(symbol)) => {
+                    RelocName::Known(*symbol)
+                }
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::TestCase(_)) => {
+                    return Err(RelocError::TestCase);
+                }
+                FinalizedRelocTarget::Func(offset) => RelocName::Own(*offset),
+            };
+            let (offset, kind, addend) = (reloc.offset, reloc.kind, reloc.addend);
+            rows.push(Reloc { offset, kind, name, addend, elf_type: None })?;
+        }
+        Ok(rows)
+    }
+
+    /// `relocs`, with the ELF types of `elf_types` (by offset, in the order of `relocs`) given
+    /// to the ones at those offsets.
+    pub(super) fn of_module(
+        relocs: &[ModuleReloc],
+        elf_types: &[(u32, u32)],
+    ) -> std::result::Result<Relocs, RelocError> {
+        let mut rows = Relocs::with_capacity(relocs.len());
+        let mut typed = elf_types.iter().peekable();
+        for reloc in relocs {
+            let elf_type = typed.next_if(|it| it.0 == reloc.offset).map(|it| it.1);
+            rows.push_module(reloc, elf_type)?;
+        }
+        match typed.next() {
+            Some(&(offset, _)) => Err(RelocError::Unmatched(offset)),
+            None => Ok(rows),
+        }
+    }
+
+    pub(super) fn push_module(
+        &mut self,
+        reloc: &ModuleReloc,
+        elf_type: Option<u32>,
+    ) -> std::result::Result<(), RelocError> {
+        let name = RelocName::of_module(&reloc.name)?;
+        let (offset, kind, addend) = (reloc.offset, reloc.kind, reloc.addend);
+        self.push(Reloc { offset, kind, name, addend, elf_type })
+    }
+
+    pub(super) fn push(&mut self, reloc: Reloc) -> std::result::Result<(), RelocError> {
+        let (name, index) = Self::encode(reloc.name)?;
+        let elf = match reloc.elf_type {
+            None => 0,
+            Some(elf) => u16::try_from(elf)
+                .ok()
+                .filter(|it| *it != 0)
+                .ok_or(RelocError::ElfType(elf))?,
+        };
+        let addend = match i32::try_from(reloc.addend) {
+            Ok(addend) if addend != WIDE => addend,
+            _ => {
+                self.wide.push((self.rows.len() as u32, reloc.addend));
+                WIDE
+            }
+        };
+        self.rows.push(Row { offset: reloc.offset, index, addend, kind: reloc.kind, name, elf });
+        Ok(())
+    }
+
+    fn encode(name: RelocName) -> std::result::Result<(NameTag, u32), RelocError> {
+        Ok(match name {
+            RelocName::Func(index) => (NameTag::Func, index),
+            RelocName::Data(index) => (NameTag::Data, index),
+            RelocName::LibCall(call) => {
+                let all = ir::LibCall::all_libcalls();
+                let at = all.iter().position(|it| *it == call).ok_or(RelocError::LibCall(call))?;
+                (NameTag::LibCall, at as u32)
+            }
+            RelocName::Known(symbol) => (NameTag::Known, match symbol {
+                ir::KnownSymbol::ElfGlobalOffsetTable => 0,
+                ir::KnownSymbol::CoffTlsIndex => 1,
+            }),
+            RelocName::Own(offset) => (NameTag::Own, offset),
+        })
+    }
+
+    fn name(row: &Row) -> RelocName {
+        match row.name {
+            NameTag::Func => RelocName::Func(row.index),
+            NameTag::Data => RelocName::Data(row.index),
+            NameTag::LibCall => RelocName::LibCall(ir::LibCall::all_libcalls()[row.index as usize]),
+            NameTag::Known => RelocName::Known(match row.index {
+                0 => ir::KnownSymbol::ElfGlobalOffsetTable,
+                _ => ir::KnownSymbol::CoffTlsIndex,
+            }),
+            NameTag::Own => RelocName::Own(row.index),
+        }
+    }
+
+    fn decode(&self, at: usize, row: &Row) -> Reloc {
+        let addend = match row.addend {
+            WIDE => {
+                let found = self.wide.binary_search_by_key(&(at as u32), |it| it.0);
+                self.wide[found.expect("a wide addend is kept for its row")].1
+            }
+            addend => i64::from(addend),
+        };
+        Reloc {
+            offset: row.offset,
+            kind: row.kind,
+            name: Self::name(row),
+            addend,
+            elf_type: (row.elf != 0).then_some(u32::from(row.elf)),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(super) fn get(&self, at: usize) -> Reloc {
+        self.decode(at, &self.rows[at])
+    }
+
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = Reloc> + Clone + '_ {
+        self.rows.iter().enumerate().map(|(at, row)| self.decode(at, row))
+    }
+
+    /// Whether any has an ELF type, which Cranelift's module can't be given.
+    pub(super) fn any_elf_type(&self) -> bool {
+        self.rows.iter().any(|it| it.elf != 0)
+    }
+
+    /// Gives each against a function or a data object the number `funcs` or `datas` has for
+    /// the one it was against, in place.
+    pub(super) fn renumber(
+        &mut self,
+        mut funcs: impl FnMut(u32) -> u32,
+        mut datas: impl FnMut(u32) -> u32,
+    ) {
+        for row in &mut self.rows {
+            match row.name {
+                NameTag::Func => row.index = funcs(row.index),
+                NameTag::Data => row.index = datas(row.index),
+                NameTag::LibCall | NameTag::Known | NameTag::Own => {}
+            }
+        }
+    }
+
+    /// Moves every one `by` bytes further into the code.
+    pub(super) fn shift(&mut self, by: u32) {
+        self.rows.iter_mut().for_each(|it| it.offset += by);
+    }
+
+    /// The ELF types, as `Code` hashed them when they were a `Vec<(u32, u32)>` of their own:
+    /// the hashes of code in the store are unchanged.
+    pub(super) fn hash_elf_types<H: Hasher>(&self, state: &mut H) {
+        let typed = self.rows.iter().filter(|it| it.elf != 0);
+        typed.clone().count().hash(state);
+        for row in typed {
+            (row.offset, u32::from(row.elf)).hash(state);
+        }
+    }
+
+    /// The relocations, as `Code` hashed them when they were `ModuleReloc`s.
+    pub(super) fn hash_as_module<H: Hasher>(&self, state: &mut H) {
+        self.rows.len().hash(state);
+        for reloc in self.iter() {
+            let reloc = reloc.module(unstitched());
+            // No kind of relocation holds anything.
+            (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(state);
+            std::mem::discriminant(&reloc.name).hash(state);
+            match &reloc.name {
+                ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(state),
+                ModuleRelocTarget::LibCall(call) => call.hash(state),
+                ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(state),
+                ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(state),
+            }
+        }
     }
 }
 
@@ -187,26 +537,16 @@ impl Hash for Code {
 impl Code {
     /// Its [`Hash`], leaving out where the named locals are unless `slots`.
     pub(super) fn hash_with<H: Hasher>(&self, state: &mut H, slots: bool) {
-        let Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots: places } =
-            self;
-        (signature, bytes, align, elf_types, lines).hash(state);
+        let Code { signature, bytes, align, relocs, unwind, lines, slots: places } = self;
+        (signature, bytes, align).hash(state);
+        relocs.hash_elf_types(state);
+        lines.hash(state);
         if slots {
             places.hash(state);
         }
         // Cranelift's unwind rules have no `Hash`: what they print is all of them.
         format!("{unwind:?}").hash(state);
-        relocs.len().hash(state);
-        for reloc in relocs {
-            // No kind of relocation holds anything.
-            (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(state);
-            std::mem::discriminant(&reloc.name).hash(state);
-            match &reloc.name {
-                ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(state),
-                ModuleRelocTarget::LibCall(call) => call.hash(state),
-                ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(state),
-                ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(state),
-            }
-        }
+        relocs.hash_as_module(state);
     }
 }
 
@@ -267,6 +607,10 @@ pub(super) struct Inlinable {
     pub(super) seen: Vec<Seen>,
     /// The instances whose bodies it has in it, as [`Recorder::built_in`].
     pub(super) built_in: Vec<Instance>,
+    /// Every data object it asks for is one object per function however often it is asked
+    /// for (a shared blob, a vtable, a static), so that a caller that builds it in at a
+    /// second call gets the very body it got at the first ([`Recorder::declare_inlined`]).
+    reusable: bool,
 }
 
 impl Inlinable {
@@ -286,12 +630,21 @@ impl Inlinable {
             }
             _ => false,
         });
+        let reusable = requests.datas.iter().all(|it| match it {
+            DataRequest::Blob { identity, .. } => *identity == DataIdentity::Shared,
+            DataRequest::Vtable { .. } | DataRequest::Static(_) => true,
+            DataRequest::Location(_)
+            | DataRequest::Declaration(_)
+            | DataRequest::FilePath(_)
+            | DataRequest::Text(_) => false,
+        });
         (requests.ordered() && !hashed_later).then_some(Inlinable {
             func,
             requests,
             pointees,
             seen,
             built_in,
+            reusable,
         })
     }
 }
@@ -349,7 +702,9 @@ pub(super) struct Recorder<'db> {
     pub(super) unit: Option<super::v2::build::Build>,
     /// What it asks for, which is all a producer of its code needs of this.
     pub(super) wants: Wants,
-    vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
+    /// The places in `wants.requests.datas` of the vtables, by the hash of their key
+    /// ([`vtable_hash`]): looked up without cloning a key, whose types clone by refcount.
+    vtables: HashTable<Slot>,
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     /// With `layouts`: each `async fn`'s future as rustc names it, with the offsets of what
@@ -372,6 +727,11 @@ pub(super) struct Recorder<'db> {
     /// The instances whose bodies are in [`Self::inlined`], and the ones those have in them,
     /// each once: a change to the code of one is a change to this function's.
     pub(super) built_in: Vec<Instance>,
+    /// The places in [`Self::built_in`], by the hash of the instance there.
+    built_in_at: HashTable<Slot>,
+    /// The bodies of [`Self::inlined`] that a second call of the same callee is given again:
+    /// one clone and one renaming of a callee's body a function, not one a call.
+    reused: HashTable<Reused>,
     /// The function is built to be put in its callers, whose statements its instructions
     /// are then of: it marks none with a statement of its own.
     pub(super) unlocated: bool,
@@ -386,8 +746,12 @@ pub(super) struct Recorder<'db> {
 pub(super) struct Wants {
     pub(super) isa: &'static dyn TargetIsa,
     pub(super) requests: Requests,
-    funcs: FxHashMap<FuncRequest, FuncId>,
-    shared: FxHashMap<ConstBlob, DataId>,
+    /// The places in `requests.funcs`, by the hash of the request there ([`func_hash`]): 16
+    /// bytes a request, the request itself kept once, and one hash and one probe an ask.
+    funcs: HashTable<Slot>,
+    /// The places in `requests.datas` of the [`DataIdentity::Shared`] blobs, by the hash of
+    /// the blob ([`BlobView::hash`]).
+    shared: HashTable<Slot>,
     /// The parameters of the function that are addresses of memory its signature says
     /// something of, by their place among the parameters of its IR.
     pub(super) pointees: Vec<(u32, Pointee)>,
@@ -395,13 +759,114 @@ pub(super) struct Wants {
     pub(super) seen: Vec<Seen>,
 }
 
+/// An entry of a table of places: the hash is kept so that growing the table hashes nothing
+/// again.
+#[derive(Clone, Copy)]
+struct Slot {
+    hash: u64,
+    at: u32,
+}
+
+/// A callee's body as [`Recorder::declare_inlined`] put it among [`Recorder::inlined`].
+struct Reused {
+    hash: u64,
+    instance: Instance,
+    /// The address of what it was made of. Compared, never followed: the same instance gives
+    /// the same body wherever a function asks for it, and a body at another address is only
+    /// not reused.
+    body: usize,
+    at: u32,
+}
+
+fn vtable_hash(ty: &StoredTy, trait_ref: &Option<(TraitId, StoredGenericArgs)>) -> u64 {
+    FxBuildHasher.hash_one((ty, trait_ref))
+}
+
+fn func_hash(target: TargetRef<'_>, sig: &Signature) -> u64 {
+    let mut hasher = FxHasher::default();
+    target.hash(&mut hasher);
+    sig.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A blob as it is, or as it is once its relocations are renamed ([`Recorder::moved_requests`]):
+/// what [`BlobView::hash`] hashes and [`BlobView::is`] compares, without making the blob.
+struct BlobView<'a> {
+    blob: &'a ConstBlob,
+    datas: Option<&'a [DataId]>,
+    funcs: Option<&'a [FuncId]>,
+}
+
+impl BlobView<'_> {
+    fn data(&self, id: DataId) -> u32 {
+        self.datas.map_or(id, |it| it[id.as_u32() as usize]).as_u32()
+    }
+
+    fn func(&self, id: FuncId) -> u32 {
+        self.funcs.map_or(id, |it| it[id.as_u32() as usize]).as_u32()
+    }
+
+    fn hash(&self) -> u64 {
+        let blob = self.blob;
+        let mut hasher = FxHasher::default();
+        (&blob.bytes, blob.align, &blob.type_ids).hash(&mut hasher);
+        blob.relocs.len().hash(&mut hasher);
+        for &(at, to, addend) in &blob.relocs {
+            (at, self.data(to), addend).hash(&mut hasher);
+        }
+        blob.fn_relocs.len().hash(&mut hasher);
+        for &(at, to) in &blob.fn_relocs {
+            (at, self.func(to)).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Whether `other`, a blob as it is, is this one.
+    fn is(&self, other: &ConstBlob) -> bool {
+        let blob = self.blob;
+        blob.bytes == other.bytes
+            && blob.align == other.align
+            && blob.type_ids == other.type_ids
+            && blob.relocs.len() == other.relocs.len()
+            && blob.fn_relocs.len() == other.fn_relocs.len()
+            && iter::zip(&blob.relocs, &other.relocs).all(|(&(at, to, addend), theirs)| {
+                (at, self.data(to), addend) == (theirs.0, theirs.1.as_u32(), theirs.2)
+            })
+            && iter::zip(&blob.fn_relocs, &other.fn_relocs)
+                .all(|(&(at, to), theirs)| (at, self.func(to)) == (theirs.0, theirs.1.as_u32()))
+    }
+
+    /// The blob, renamed.
+    fn made(&self) -> ConstBlob {
+        let blob = self.blob;
+        if self.datas.is_none() && self.funcs.is_none() {
+            return blob.clone();
+        }
+        ConstBlob {
+            bytes: blob.bytes.clone(),
+            relocs: blob
+                .relocs
+                .iter()
+                .map(|&(at, to, addend)| (at, DataId::from_u32(self.data(to)), addend))
+                .collect(),
+            fn_relocs: blob
+                .fn_relocs
+                .iter()
+                .map(|&(at, to)| (at, FuncId::from_u32(self.func(to))))
+                .collect(),
+            align: blob.align,
+            type_ids: blob.type_ids.clone(),
+        }
+    }
+}
+
 impl Wants {
     pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
         Wants {
             isa,
             requests: Requests::default(),
-            funcs: FxHashMap::default(),
-            shared: FxHashMap::default(),
+            funcs: HashTable::new(),
+            shared: HashTable::new(),
             pointees: Vec::new(),
             seen: Vec::new(),
         }
@@ -508,10 +973,10 @@ impl Wants {
         let mut funcs = vec![false; requests.funcs.len()];
         let mut datas = vec![false; requests.datas.len()];
         let mut reached = Vec::new();
-        for reloc in &code.relocs {
+        for reloc in code.relocs.iter() {
             match reloc.name {
-                ModuleRelocTarget::User { namespace: 0, index } => funcs[index as usize] = true,
-                ModuleRelocTarget::User { namespace: 1, index } => reached.push(index as usize),
+                RelocName::Func(index) => funcs[index as usize] = true,
+                RelocName::Data(index) => reached.push(index as usize),
                 _ => {}
             }
         }
@@ -541,15 +1006,10 @@ impl Wants {
             numbers.collect::<Vec<Option<u32>>>()
         };
         let kept = Kept { funcs: numbered(&funcs), datas: numbered(&datas) };
-        for reloc in &mut code.relocs {
-            if let ModuleRelocTarget::User { namespace, index } = &mut reloc.name {
-                *index = match *namespace {
-                    0 => kept.funcs[*index as usize].unwrap(),
-                    1 => kept.datas[*index as usize].unwrap(),
-                    _ => *index,
-                };
-            }
-        }
+        code.relocs.renumber(
+            |index| kept.funcs[index as usize].unwrap(),
+            |index| kept.datas[index as usize].unwrap(),
+        );
         Some(kept)
     }
 
@@ -576,14 +1036,49 @@ impl Wants {
     }
 
     pub(super) fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
-        let request = FuncRequest { target, sig: sig.clone() };
-        if let Some(&id) = self.funcs.get(&request) {
-            return id;
+        let hash = func_hash(target.as_ref(), sig);
+        self.func_with(
+            hash,
+            target,
+            |target, it| it.target == *target && it.sig == *sig,
+            |target| FuncRequest { target, sig: sig.clone() },
+        )
+    }
+
+    /// [`Self::func`] of a target that is cloned only when it was not asked for before.
+    fn func_ref(&mut self, target: TargetRef<'_>, sig: &Signature) -> FuncId {
+        self.func_with(
+            func_hash(target, sig),
+            target,
+            |target, it| it.target.as_ref() == *target && it.sig == *sig,
+            |target| FuncRequest { target: target.to_owned(), sig: sig.clone() },
+        )
+    }
+
+    /// The request `same` says `key` is, hashed to `hash` ([`func_hash`]): the one asked for
+    /// before, or a new one `make` makes of `key`, which is all that is cloned.
+    fn func_with<K>(
+        &mut self,
+        hash: u64,
+        key: K,
+        same: impl Fn(&K, &FuncRequest) -> bool,
+        make: impl FnOnce(K) -> FuncRequest,
+    ) -> FuncId {
+        let funcs = &mut self.requests.funcs;
+        let entry = self.funcs.entry(
+            hash,
+            |it| it.hash == hash && same(&key, &funcs[it.at as usize]),
+            |it| it.hash,
+        );
+        match entry {
+            Entry::Occupied(it) => FuncId::from_u32(it.get().at),
+            Entry::Vacant(it) => {
+                let at = funcs.len() as u32;
+                it.insert(Slot { hash, at });
+                funcs.push(make(key));
+                FuncId::from_u32(at)
+            }
         }
-        let id = FuncId::from_u32(self.requests.funcs.len() as u32);
-        self.requests.funcs.push(request.clone());
-        self.funcs.insert(request, id);
-        id
     }
 
     fn data(&mut self, request: DataRequest) -> DataId {
@@ -593,11 +1088,11 @@ impl Wants {
     }
 
     pub(super) fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
-        Ok(self.func(FuncTarget::Symbol(symbol.to_owned()), sig))
+        Ok(self.func_ref(TargetRef::Symbol(symbol), sig))
     }
 
     pub(super) fn import_path(&mut self, path: &str, sig: &Signature) -> FuncId {
-        self.func(FuncTarget::Path(path.to_owned()), sig)
+        self.func_ref(TargetRef::Path(path), sig)
     }
 
     /// A function of assembly. The text is assembled here, on the thread compiling the caller,
@@ -622,12 +1117,51 @@ impl Wants {
         if identity != DataIdentity::Shared {
             return self.data(DataRequest::Blob { blob, identity });
         }
-        if let Some(&id) = self.shared.get(&blob) {
-            return id;
+        let hash = BlobView { blob: &blob, datas: None, funcs: None }.hash();
+        self.shared_with(
+            hash,
+            blob,
+            |blob, it| BlobView { blob, datas: None, funcs: None }.is(it),
+            |blob| blob,
+        )
+    }
+
+    /// [`Self::define_data_as`] of `view` as it is renamed, made only when it was not
+    /// asked for before.
+    fn define_view_as(&mut self, view: BlobView<'_>, identity: DataIdentity) -> DataId {
+        if identity != DataIdentity::Shared {
+            return self.data(DataRequest::Blob { blob: view.made(), identity });
         }
-        let id = self.data(DataRequest::Blob { blob: blob.clone(), identity });
-        self.shared.insert(blob, id);
-        id
+        self.shared_with(view.hash(), view, |view, it| view.is(it), |view| view.made())
+    }
+
+    /// The shared blob `same` says `key` is, hashed to `hash` ([`BlobView::hash`]): the one
+    /// asked for before, or a new one `make` makes of `key`.
+    fn shared_with<K>(
+        &mut self,
+        hash: u64,
+        key: K,
+        same: impl Fn(&K, &ConstBlob) -> bool,
+        make: impl FnOnce(K) -> ConstBlob,
+    ) -> DataId {
+        let datas = &mut self.requests.datas;
+        let entry = self.shared.entry(
+            hash,
+            |it| {
+                it.hash == hash
+                    && matches!(&datas[it.at as usize], DataRequest::Blob { blob, .. } if same(&key, blob))
+            },
+            |it| it.hash,
+        );
+        match entry {
+            Entry::Occupied(it) => DataId::from_u32(it.get().at),
+            Entry::Vacant(it) => {
+                let at = datas.len() as u32;
+                it.insert(Slot { hash, at });
+                datas.push(DataRequest::Blob { blob: make(key), identity: DataIdentity::Shared });
+                DataId::from_u32(at)
+            }
+        }
     }
 
     pub(super) fn make_signature(&self) -> Signature {
@@ -688,6 +1222,9 @@ impl<'db> std::ops::DerefMut for Recorder<'db> {
     }
 }
 
+/// `BLAZE_LAYOUTS`, read once: the environment's lock is not taken for each function.
+static LAYOUTS: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_LAYOUTS").is_some());
+
 impl<'db> Recorder<'db> {
     /// The stack slots that hold a local written with a name.
     pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
@@ -707,9 +1244,9 @@ impl<'db> Recorder<'db> {
             checked,
             unit: super::v2::build::building(),
             wants: Wants::new(isa),
-            vtables: FxHashMap::default(),
+            vtables: HashTable::new(),
             statics: FxHashMap::default(),
-            layouts: std::env::var_os("BLAZE_LAYOUTS").map(|_| Default::default()),
+            layouts: (*LAYOUTS).then(RefCell::default),
             coroutine_layouts: RefCell::default(),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
@@ -719,6 +1256,8 @@ impl<'db> Recorder<'db> {
             frame_locals: None,
             inlined: Vec::new(),
             built_in: Vec::new(),
+            built_in_at: HashTable::new(),
+            reused: HashTable::new(),
             unlocated: false,
             opaque: false,
         }
@@ -781,27 +1320,55 @@ impl<'db> Recorder<'db> {
         &self,
         key: &(StoredTy, Option<(TraitId, StoredGenericArgs)>),
     ) -> Option<DataId> {
-        self.vtables.get(key).copied()
+        self.vtable_of(vtable_hash(&key.0, &key.1), &key.0, &key.1)
     }
 
+    fn vtable_of(
+        &self,
+        hash: u64,
+        ty: &StoredTy,
+        trait_ref: &Option<(TraitId, StoredGenericArgs)>,
+    ) -> Option<DataId> {
+        let datas = &self.wants.requests.datas;
+        let found = self.vtables.find(hash, |it| {
+            it.hash == hash
+                && matches!(
+                    &datas[it.at as usize],
+                    DataRequest::Vtable { ty: theirs, trait_ref: their_ref, .. }
+                        if theirs == ty && their_ref == trait_ref
+                )
+        });
+        found.map(|it| DataId::from_u32(it.at))
+    }
+
+    /// The vtable of `key`, which [`Self::vtable`] found no vtable of.
     pub(super) fn define_vtable(
         &mut self,
         key: (StoredTy, Option<(TraitId, StoredGenericArgs)>),
         blob: ConstBlob,
     ) -> DataId {
-        let (ty, trait_ref) = key.clone();
-        let id = self.data(DataRequest::Vtable { ty, trait_ref, blob });
-        self.vtables.insert(key, id);
-        id
+        let hash = vtable_hash(&key.0, &key.1);
+        self.add_vtable(hash, key.0, key.1, blob)
+    }
+
+    fn add_vtable(
+        &mut self,
+        hash: u64,
+        ty: StoredTy,
+        trait_ref: Option<(TraitId, StoredGenericArgs)>,
+        blob: ConstBlob,
+    ) -> DataId {
+        let at = self.wants.requests.datas.len() as u32;
+        self.vtables.insert_unique(hash, Slot { hash, at }, |it| it.hash);
+        self.data(DataRequest::Vtable { ty, trait_ref, blob })
     }
 
     pub(super) fn static_data(&mut self, id: StaticId) -> DataId {
-        if let Some(&data) = self.statics.get(&id) {
-            return data;
-        }
-        let data = self.data(DataRequest::Static(id));
-        self.statics.insert(id, data);
-        data
+        let datas = &mut self.wants.requests.datas;
+        *self.statics.entry(id).or_insert_with(|| {
+            datas.push(DataRequest::Static(id));
+            DataId::from_u32(datas.len() as u32 - 1)
+        })
     }
 
     pub(super) fn location(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> DataId {
@@ -865,22 +1432,30 @@ impl<'db> Recorder<'db> {
             }
         }
         let wants = &mut self.wants;
-        wants.funcs = kept_funcs
-            .iter()
-            .enumerate()
-            .map(|(at, it)| (it.clone(), FuncId::from_u32(at as u32)))
-            .collect();
-        wants.shared = std::mem::take(&mut wants.shared)
-            .into_iter()
-            .filter_map(|(mut blob, id)| {
-                kept.data(id)?;
-                kept.renumber(&mut blob);
-                Some((blob, kept.data(id)?))
-            })
-            .collect();
-        let still = |id: &mut DataId| kept.data(*id).map(|it| *id = it).is_some();
-        self.statics.retain(|_, id| still(id));
-        self.vtables.retain(|_, id| still(id));
+        wants.funcs.clear();
+        for (at, it) in kept_funcs.iter().enumerate() {
+            let hash = func_hash(it.target.as_ref(), &it.sig);
+            wants.funcs.insert_unique(hash, Slot { hash, at: at as u32 }, |it| it.hash);
+        }
+        // A blob kept points only at what is kept, so it hashes as it did with the numbers
+        // it has now.
+        wants.shared.clear();
+        self.vtables.clear();
+        for (at, request) in kept_datas.iter().enumerate() {
+            let at = at as u32;
+            match request {
+                DataRequest::Blob { blob, identity: DataIdentity::Shared } => {
+                    let hash = BlobView { blob, datas: None, funcs: None }.hash();
+                    wants.shared.insert_unique(hash, Slot { hash, at }, |it| it.hash);
+                }
+                DataRequest::Vtable { ty, trait_ref, .. } => {
+                    let hash = vtable_hash(ty, trait_ref);
+                    self.vtables.insert_unique(hash, Slot { hash, at }, |it| it.hash);
+                }
+                _ => {}
+            }
+        }
+        self.statics.retain(|_, id| kept.data(*id).map(|it| *id = it).is_some());
         wants.requests = Requests { funcs: kept_funcs, datas: kept_datas };
     }
 
@@ -889,34 +1464,25 @@ impl<'db> Recorder<'db> {
     /// ([`Inlinable::of`]).
     pub(super) fn moved_requests(&mut self, requests: &Requests) -> (Vec<FuncId>, Vec<DataId>) {
         let funcs: Vec<FuncId> =
-            requests.funcs.iter().map(|it| self.func(it.target.clone(), &it.sig)).collect();
+            requests.funcs.iter().map(|it| self.func_ref(it.target.as_ref(), &it.sig)).collect();
         let mut datas: Vec<DataId> = Vec::with_capacity(requests.datas.len());
         for request in &requests.datas {
             // `Inlinable::of` saw to it that a blob points only at what came before it.
-            let moved = |blob: &ConstBlob| ConstBlob {
-                bytes: blob.bytes.clone(),
-                relocs: blob
-                    .relocs
-                    .iter()
-                    .map(|&(offset, target, addend)| {
-                        (offset, datas[target.as_u32() as usize], addend)
-                    })
-                    .collect(),
-                fn_relocs: blob
-                    .fn_relocs
-                    .iter()
-                    .map(|&(offset, target)| (offset, funcs[target.as_u32() as usize]))
-                    .collect(),
-                align: blob.align,
-                type_ids: blob.type_ids.clone(),
-            };
             let id = match request {
-                DataRequest::Blob { blob, identity } => self.define_data_as(moved(blob), *identity),
+                DataRequest::Blob { blob, identity } => {
+                    let view = BlobView { blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };
+                    self.wants.define_view_as(view, *identity)
+                }
                 DataRequest::Vtable { ty, trait_ref, blob } => {
-                    let key = (ty.clone(), trait_ref.clone());
-                    match self.vtable(&key) {
+                    let hash = vtable_hash(ty, trait_ref);
+                    match self.vtable_of(hash, ty, trait_ref) {
                         Some(id) => id,
-                        None => self.define_vtable(key, moved(blob)),
+                        None => {
+                            let view =
+                                BlobView { blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };
+                            let blob = view.made();
+                            self.add_vtable(hash, ty.clone(), trait_ref.clone(), blob)
+                        }
                     }
                 }
                 DataRequest::Static(id) => self.static_data(*id),
@@ -939,17 +1505,39 @@ impl<'db> Recorder<'db> {
         func: &mut ir::Function,
     ) -> ir::FuncRef {
         for it in std::iter::once(instance).chain(&body.built_in) {
-            if !self.built_in.contains(it) {
-                self.built_in.push(it.clone());
+            let hash = FxBuildHasher.hash_one(it);
+            let built_in = &mut self.built_in;
+            let entry = self.built_in_at.entry(
+                hash,
+                |slot| slot.hash == hash && built_in.get(slot.at as usize) == Some(it),
+                |slot| slot.hash,
+            );
+            if let Entry::Vacant(slot) = entry {
+                slot.insert(Slot { hash, at: built_in.len() as u32 });
+                built_in.push(it.clone());
             }
         }
-        let callee = self.moved(body);
-        let signature = func.import_signature(callee.signature.clone());
-        let name = func.declare_imported_user_function(ir::UserExternalName {
-            namespace: INLINED,
-            index: self.inlined.len() as u32,
+        let address = std::ptr::from_ref(body) as usize;
+        let hash = FxBuildHasher.hash_one(instance);
+        let reused = self.reused.find(hash, |it| {
+            it.hash == hash && it.body == address && it.instance == *instance
         });
-        self.inlined.push(callee);
+        let at = match reused {
+            Some(it) => it.at,
+            None => {
+                let at = self.inlined.len() as u32;
+                let callee = self.moved(body);
+                self.inlined.push(callee);
+                if body.reusable {
+                    let reused = Reused { hash, instance: instance.clone(), body: address, at };
+                    self.reused.insert_unique(hash, reused, |it| it.hash);
+                }
+                at
+            }
+        };
+        let signature = func.import_signature(self.inlined[at as usize].signature.clone());
+        let name = func
+            .declare_imported_user_function(ir::UserExternalName { namespace: INLINED, index: at });
         func.import_function(ir::ExtFuncData {
             name: ir::ExternalName::user(name),
             signature,
@@ -1019,17 +1607,16 @@ impl Kept {
 /// gives them.
 pub(super) fn renamed(func: &ir::Function, funcs: &[FuncId], datas: &[DataId]) -> ir::Function {
     let mut func = func.clone();
-    let names: Vec<_> =
-        func.params.user_named_funcs().iter().map(|(name, it)| (name, it.clone())).collect();
-    for (name, was) in names {
-        let index = match was.namespace {
-            0 => funcs[was.index as usize].as_u32(),
-            1 => datas[was.index as usize].as_u32(),
+    for at in 0..func.params.user_named_funcs().len() {
+        let name = ir::UserExternalNameRef::from_u32(at as u32);
+        let ir::UserExternalName { namespace, index } = func.params.user_named_funcs()[name];
+        let index = match namespace {
+            0 => funcs[index as usize].as_u32(),
+            1 => datas[index as usize].as_u32(),
             // A callee that was put in this one, which nothing calls any more.
             _ => continue,
         };
-        func.params
-            .reset_user_func_name(name, ir::UserExternalName { namespace: was.namespace, index });
+        func.params.reset_user_func_name(name, ir::UserExternalName { namespace, index });
     }
     func
 }
@@ -1037,5 +1624,253 @@ pub(super) fn renamed(func: &ir::Function, funcs: &[FuncId], datas: &[DataId]) -
 impl From<cranelift_module::ModuleError> for CodegenError {
     fn from(e: cranelift_module::ModuleError) -> Self {
         CodegenError::Backend(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::ir::{AbiParam, types};
+
+    use super::*;
+
+    /// A small deterministic generator, so that every run sees the same inputs.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const KINDS: [binemit::Reloc; 6] = [
+        binemit::Reloc::Abs8,
+        binemit::Reloc::X86PCRel4,
+        binemit::Reloc::X86CallPLTRel4,
+        binemit::Reloc::Arm64Call,
+        binemit::Reloc::Aarch64AdrPrelPgHi21,
+        binemit::Reloc::Aarch64AddAbsLo12Nc,
+    ];
+
+    fn module_relocs(seed: u64, count: usize) -> (Vec<ModuleReloc>, Vec<(u32, u32)>) {
+        let mut random = Seeded(seed);
+        let mut relocs = Vec::new();
+        let mut elf_types = Vec::new();
+        for at in 0..count {
+            let offset = at as u32 * 4;
+            let name = match random.below(5) {
+                0 => ModuleRelocTarget::user(0, random.below(40) as u32),
+                1 => ModuleRelocTarget::user(1, random.below(40) as u32),
+                2 => {
+                    let all = ir::LibCall::all_libcalls();
+                    ModuleRelocTarget::LibCall(all[random.below(all.len() as u64) as usize])
+                }
+                3 => ModuleRelocTarget::KnownSymbol(match random.below(2) {
+                    0 => ir::KnownSymbol::ElfGlobalOffsetTable,
+                    _ => ir::KnownSymbol::CoffTlsIndex,
+                }),
+                _ => ModuleRelocTarget::FunctionOffset(unstitched(), random.below(4096) as u32),
+            };
+            let addend = match random.below(6) {
+                0 => i64::from(i32::MIN),
+                1 => i64::from(i32::MAX) + 1 + random.below(1 << 20) as i64,
+                2 => -(1 << 40),
+                _ => random.below(64) as i64 - 32,
+            };
+            let kind = KINDS[random.below(KINDS.len() as u64) as usize];
+            if random.below(4) == 0 {
+                elf_types.push((offset, 278 + random.below(4) as u32));
+            }
+            relocs.push(ModuleReloc { offset, kind, name, addend });
+        }
+        (relocs, elf_types)
+    }
+
+    fn same_module(a: &ModuleReloc, b: &ModuleReloc) -> bool {
+        let names = match (&a.name, &b.name) {
+            (
+                ModuleRelocTarget::User { namespace, index },
+                ModuleRelocTarget::User { namespace: theirs, index: their_index },
+            ) => namespace == theirs && index == their_index,
+            (ModuleRelocTarget::LibCall(a), ModuleRelocTarget::LibCall(b)) => a == b,
+            (ModuleRelocTarget::KnownSymbol(a), ModuleRelocTarget::KnownSymbol(b)) => a == b,
+            (ModuleRelocTarget::FunctionOffset(a, x), ModuleRelocTarget::FunctionOffset(b, y)) => {
+                a == b && x == y
+            }
+            _ => false,
+        };
+        names && a.offset == b.offset && a.kind == b.kind && a.addend == b.addend
+    }
+
+    /// How `Code` hashed its relocations and ELF types when it kept them as `ModuleReloc`s and
+    /// a `Vec<(u32, u32)>`, which code in the store is keyed by.
+    fn old_hash(relocs: &[ModuleReloc], elf_types: &Vec<(u32, u32)>) -> u64 {
+        let mut state = FxHasher::default();
+        elf_types.hash(&mut state);
+        relocs.len().hash(&mut state);
+        for reloc in relocs {
+            (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(&mut state);
+            std::mem::discriminant(&reloc.name).hash(&mut state);
+            match &reloc.name {
+                ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(&mut state),
+                ModuleRelocTarget::LibCall(call) => call.hash(&mut state),
+                ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(&mut state),
+                ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(&mut state),
+            }
+        }
+        state.finish()
+    }
+
+    #[test]
+    fn a_relocation_is_sixteen_bytes() {
+        assert_eq!(size_of::<Row>(), 16);
+        assert_eq!(size_of::<binemit::Reloc>(), 1);
+    }
+
+    #[test]
+    fn relocations_give_back_what_they_were_given_and_hash_as_before() {
+        for seed in 0..64 {
+            let (relocs, elf_types) = module_relocs(seed, seed as usize * 3);
+            let rows = Relocs::of_module(&relocs, &elf_types).unwrap();
+            assert_eq!(rows.len(), relocs.len());
+            for (at, (row, was)) in iter::zip(rows.iter(), &relocs).enumerate() {
+                assert!(same_module(&row.module(unstitched()), was), "seed {seed}, at {at}");
+                assert_eq!(rows.get(at), row);
+                let typed = elf_types.iter().find(|it| it.0 == was.offset).map(|it| it.1);
+                assert_eq!(row.elf_type, typed);
+            }
+            let mut state = FxHasher::default();
+            rows.hash_elf_types(&mut state);
+            rows.hash_as_module(&mut state);
+            assert_eq!(state.finish(), old_hash(&relocs, &elf_types), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn relocations_are_renumbered_and_shifted_in_place() {
+        let (relocs, elf_types) = module_relocs(7, 50);
+        let mut rows = Relocs::of_module(&relocs, &elf_types).unwrap();
+        rows.renumber(|it| it + 1000, |it| it * 2);
+        rows.shift(16);
+        for (row, was) in iter::zip(rows.iter(), &relocs) {
+            let name = match was.name {
+                ModuleRelocTarget::User { namespace: 0, index } => RelocName::Func(index + 1000),
+                ModuleRelocTarget::User { namespace: 1, index } => RelocName::Data(index * 2),
+                ref other => RelocName::of_module(other).unwrap(),
+            };
+            assert_eq!((row.offset, row.name, row.addend), (was.offset + 16, name, was.addend));
+        }
+    }
+
+    #[test]
+    fn what_a_row_cannot_hold_is_an_error() {
+        let reloc = |name| ModuleReloc { offset: 0, kind: KINDS[0], name, addend: 0 };
+        let other = reloc(ModuleRelocTarget::user(INLINED, 0));
+        assert_eq!(Relocs::of_module(&[other], &[]), Err(RelocError::Namespace(INLINED)));
+        let plain = reloc(ModuleRelocTarget::user(0, 0));
+        let wide = [(0, 1 << 16)];
+        assert_eq!(Relocs::of_module(&[plain.clone()], &wide), Err(RelocError::ElfType(1 << 16)));
+        let elsewhere = [(4, 278)];
+        assert_eq!(Relocs::of_module(&[plain], &elsewhere), Err(RelocError::Unmatched(4)));
+    }
+
+    fn signature(params: usize) -> Signature {
+        let mut sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        sig.params.extend((0..params).map(|_| AbiParam::new(types::I64)));
+        sig
+    }
+
+    fn target(which: u64) -> FuncTarget {
+        match which % 3 {
+            0 => FuncTarget::Symbol(format!("s{}", which / 3)),
+            1 => FuncTarget::Path(format!("p{}", which / 3)),
+            _ => FuncTarget::Asm(format!("a{}", which / 3)),
+        }
+    }
+
+    /// The tables of [`Wants`] give every request the number a search of the requests made
+    /// before gives it, as the map of whole requests to numbers did.
+    #[test]
+    fn requests_are_numbered_as_a_search_of_those_before_numbers_them() {
+        let isa = &**crate::target().unwrap();
+        let mut random = Seeded(11);
+        let mut wants = Wants::new(isa);
+        let mut model: Vec<(FuncTarget, Signature)> = Vec::new();
+        for _ in 0..2000 {
+            let (target, sig) = (target(random.below(60)), signature(random.below(3) as usize));
+            let expected = match model.iter().position(|it| it.0 == target && it.1 == sig) {
+                Some(at) => at,
+                None => {
+                    model.push((target.clone(), sig.clone()));
+                    model.len() - 1
+                }
+            };
+            let by_name = random.below(2) == 0;
+            let id = match target {
+                FuncTarget::Symbol(name) if by_name => wants.import(&name, &sig).unwrap(),
+                FuncTarget::Path(path) if by_name => wants.import_path(&path, &sig),
+                target => wants.func(target, &sig),
+            };
+            assert_eq!(id.as_u32() as usize, expected);
+        }
+        assert_eq!(wants.requests.funcs.len(), model.len());
+
+        let blob = |random: &mut Seeded| ConstBlob {
+            bytes: vec![random.below(4) as u8; 1 + random.below(3) as usize],
+            relocs: (0..random.below(2)).map(|_| (0, DataId::from_u32(0), 8)).collect(),
+            align: 1 << random.below(2),
+            ..ConstBlob::default()
+        };
+        let mut shared: Vec<(ConstBlob, usize)> = Vec::new();
+        wants.define_data_as(ConstBlob::default(), DataIdentity::Own);
+        for _ in 0..500 {
+            let (blob, own) = (blob(&mut random), random.below(5) == 0);
+            let before = wants.requests.datas.len();
+            if own {
+                let id = wants.define_data_as(blob, DataIdentity::Own);
+                assert_eq!(id.as_u32() as usize, before);
+                continue;
+            }
+            let expected = match shared.iter().find(|it| it.0 == blob) {
+                Some(it) => it.1,
+                None => {
+                    shared.push((blob.clone(), before));
+                    before
+                }
+            };
+            assert_eq!(wants.define_data_as(blob, DataIdentity::Shared).as_u32() as usize, expected);
+        }
+    }
+
+    /// A blob renamed in place hashes and compares as the blob it is made into.
+    #[test]
+    fn a_renamed_blob_is_the_blob_it_is_made_into() {
+        let mut random = Seeded(3);
+        for _ in 0..200 {
+            let blob = ConstBlob {
+                bytes: (0..random.below(16)).map(|_| random.below(256) as u8).collect(),
+                relocs: (0..random.below(4))
+                    .map(|_| (random.below(8) as u32, DataId::from_u32(random.below(4) as u32), 0))
+                    .collect(),
+                fn_relocs: (0..random.below(3))
+                    .map(|_| (random.below(8) as u32, FuncId::from_u32(random.below(4) as u32)))
+                    .collect(),
+                align: 8,
+                type_ids: Vec::new(),
+            };
+            let datas: Vec<DataId> = (0..4).map(|_| DataId::from_u32(random.below(9) as u32)).collect();
+            let funcs: Vec<FuncId> = (0..4).map(|_| FuncId::from_u32(random.below(9) as u32)).collect();
+            let view = BlobView { blob: &blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };
+            let made = view.made();
+            let plain = BlobView { blob: &made, datas: None, funcs: None };
+            assert_eq!(view.hash(), plain.hash());
+            assert!(view.is(&made) && plain.is(&made));
+            let unrenamed = BlobView { blob: &blob, datas: None, funcs: None };
+            assert_eq!(unrenamed.is(&made), blob == made);
+        }
     }
 }

@@ -30,8 +30,12 @@ pub(crate) struct Ctx {
     pub tls: Option<Tls>,
 }
 
-/// The [`Apply`] a codegen relocation is written as, by the kind of target it has.
-pub(crate) fn of_kind(kind: RelocKind, arch: Arch) -> Result<Apply, String> {
+/// The [`Apply`] a codegen relocation is written as, by the kind of target it has and
+/// whether it is in a function's code (`in_code`) or in data.
+pub(crate) fn of_kind(kind: RelocKind, arch: Arch, in_code: bool) -> Result<Apply, String> {
+    if arch == Arch::Wasm32 {
+        return crate::wasm::codegen_apply(kind, in_code);
+    }
     Ok(match (kind, arch) {
         (RelocKind::Abs64, _) => Apply::Abs64,
         (RelocKind::PcRel32, Arch::X86_64) => Apply::X86Branch32,
@@ -43,19 +47,17 @@ pub(crate) fn of_kind(kind: RelocKind, arch: Arch) -> Result<Apply, String> {
         (RelocKind::GotPage21, Arch::Aarch64) => Apply::A64GotPage21,
         (RelocKind::GotPageOffset12, Arch::Aarch64) => Apply::A64GotLo12,
         (RelocKind::TlsOffset, _) => Apply::TlsOffset,
-        (RelocKind::WasmFunction, Arch::Wasm32) => Apply::Native(WASM_FUNCTION),
-        (RelocKind::WasmTable, Arch::Wasm32) => Apply::Native(WASM_TABLE),
-        (RelocKind::WasmMemory, Arch::Wasm32) => Apply::Native(WASM_MEMORY),
         (kind, arch) => return Err(format!("a {kind:?} relocation in {arch:?} code")),
     })
 }
 
-/// The `Apply::Native` types codegen's wasm relocations are handed to the wasm writer as:
-/// the wasm object format's own numbers (`R_WASM_FUNCTION_INDEX_LEB`,
-/// `R_WASM_TABLE_INDEX_SLEB`, `R_WASM_MEMORY_ADDR_LEB`).
-pub(crate) const WASM_FUNCTION: u32 = 0;
-pub(crate) const WASM_TABLE: u32 = 1;
-pub(crate) const WASM_MEMORY: u32 = 3;
+/// The wasm relocation types whose value the core computes before the writer encodes it:
+/// a function's index (`R_WASM_FUNCTION_INDEX_LEB`, `_I32`) or its table slot, the index
+/// + 1 (`R_WASM_TABLE_INDEX_SLEB`, `_I32`).
+pub(crate) const WASM_FUNCTION_INDEX_LEB: u32 = 0;
+pub(crate) const WASM_TABLE_INDEX_SLEB: u32 = 1;
+pub(crate) const WASM_TABLE_INDEX_I32: u32 = 2;
+pub(crate) const WASM_FUNCTION_INDEX_I32: u32 = 26;
 
 /// How many bytes from the place an [`Apply`] writes.
 pub(crate) fn width(apply: Apply) -> usize {

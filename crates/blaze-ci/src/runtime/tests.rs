@@ -36,19 +36,19 @@ fn cost(op: &Op) -> usize {
 
 #[test]
 fn no_ops_are_one_empty_batch_and_small_ops_one_batch() {
-    assert_eq!(batches(&[], 1000).unwrap(), vec![Vec::<Op>::new()]);
+    assert_eq!(batches(Vec::new(), 1000).unwrap(), vec![Vec::<Op>::new()]);
     let ops = vec![
         Op::Write { path: "a".to_owned(), bytes: vec![1; 10], mode: Mode::Regular },
         Op::Delete { path: "b".to_owned() },
         Op::Rename { from: "c".to_owned(), to: "d".to_owned() },
     ];
-    assert_eq!(batches(&ops, 1000).unwrap(), vec![ops]);
+    assert_eq!(batches(ops.clone(), 1000).unwrap(), vec![ops]);
 }
 
 #[test]
 fn batches_stay_under_the_bound_and_keep_the_order() {
     let ops: Vec<Op> = (0..50).map(|n| Op::Write { path: format!("f{n:02}"), bytes: vec![n; 100], mode: Mode::Regular }).collect();
-    let cut = batches(&ops, 500).unwrap();
+    let cut = batches(ops.clone(), 500).unwrap();
     assert!(cut.len() > 1);
     for batch in &cut {
         assert!(!batch.is_empty());
@@ -65,7 +65,7 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
         Op::Write { path: "big".to_owned(), bytes: bytes.clone(), mode: Mode::Executable },
         Op::Write { path: "small".to_owned(), bytes: vec![7], mode: Mode::Regular },
     ];
-    let cut = batches(&ops, 1000).unwrap();
+    let cut = batches(ops.clone(), 1000).unwrap();
     let flat = cut.concat();
     assert_eq!(flat[0], Op::Delete { path: "gone".to_owned() });
     let mut rebuilt = Vec::new();
@@ -95,7 +95,7 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
 #[test]
 fn a_path_longer_than_a_request_is_refused_naming_it() {
     let ops = vec![Op::Write { path: "p".repeat(2000), bytes: vec![0; 10], mode: Mode::Regular }];
-    assert!(batches(&ops, 1000).unwrap_err().contains("ppp"));
+    assert!(batches(ops.clone(), 1000).unwrap_err().contains("ppp"));
 }
 
 #[test]
@@ -170,6 +170,70 @@ fn github_errors_are_retried_five_times() {
         }
         assert_eq!(github.lock().unwrap().calls, (failing + 1).min(6));
     }
+}
+
+/// Records every call, and gives each creation the next id from 100.
+#[derive(Default)]
+struct Recorded {
+    created: Vec<String>,
+    updated: Vec<(u64, CheckStatus)>,
+}
+
+impl Checks for Recorded {
+    fn create(&mut self, run: &CheckRun) -> Result<u64, GitHubError> {
+        self.created.push(run.name.clone());
+        Ok(100 + self.created.len() as u64)
+    }
+
+    fn update(&mut self, id: u64, run: &CheckRun) -> Result<(), GitHubError> {
+        self.updated.push((id, run.status));
+        Ok(())
+    }
+}
+
+fn update(run: u64, id: u64, status: CheckStatus) -> Post {
+    Post::Update { run: RunId(run), id, check: CheckRun { status, ..run_check() } }
+}
+
+#[test]
+fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
+    let github = Arc::new(Mutex::new(Recorded::default()));
+    let (posts, receive) = mpsc::channel();
+    let (service, inputs) = mpsc::channel();
+    posts.send(update(1, 11, CheckStatus::Queued)).unwrap();
+    posts.send(update(1, 11, CheckStatus::InProgress)).unwrap();
+    posts.send(Post::Create { run: RunId(2), check: run_check() }).unwrap();
+    posts.send(update(3, 33, CheckStatus::InProgress)).unwrap();
+    posts.send(update(1, 11, CheckStatus::Success)).unwrap();
+    drop(posts);
+    post(github.clone(), receive, service, Duration::ZERO);
+    let recorded = github.lock().unwrap();
+    assert_eq!(recorded.created, ["blaze/check"]);
+    assert_eq!(recorded.updated, [(33, CheckStatus::InProgress), (11, CheckStatus::Success)]);
+    assert!(matches!(inputs.recv(), Ok(Input::Created { run: RunId(2), result: Ok(101) })));
+}
+
+#[test]
+fn updates_of_different_runs_are_all_sent_in_order() {
+    let github = Arc::new(Mutex::new(Recorded::default()));
+    let (posts, receive) = mpsc::channel();
+    let (service, _inputs) = mpsc::channel();
+    for id in [5, 4, 6] {
+        posts.send(update(id, id, CheckStatus::Failure)).unwrap();
+    }
+    drop(posts);
+    post(github.clone(), receive, service, Duration::ZERO);
+    let statuses = [(5, CheckStatus::Failure), (4, CheckStatus::Failure), (6, CheckStatus::Failure)];
+    assert_eq!(github.lock().unwrap().updated, statuses);
+}
+
+#[test]
+fn a_large_file_keeps_its_buffer_for_the_first_piece() {
+    let bytes = vec![3u8; 2500];
+    let pointer = bytes.as_ptr();
+    let cut = batches(vec![Op::Write { path: "big".to_owned(), bytes, mode: Mode::Regular }], 1000).unwrap();
+    let Some(Op::Write { bytes, .. }) = cut.into_iter().flatten().next() else { panic!("no write first") };
+    assert_eq!(bytes.as_ptr(), pointer, "the first piece is the file's own buffer, not a copy");
 }
 
 fn sign(secret: &[u8], body: &[u8]) -> String {

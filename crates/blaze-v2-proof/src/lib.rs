@@ -77,12 +77,24 @@ pub struct Trace {
 
 /// An edge costs its two columns and nothing more.
 const _: () = assert!(size_of::<u32>() + size_of::<Fingerprint>() == 20);
+/// A key costs 34 bytes in `keys`; looking one up is a binary search, a merge join between
+/// two traces' sorted columns ([`seek`]) costs amortized one comparison per key.
+const _: () = assert!(size_of::<QueryKey>() == 34);
+
+/// One insert into a [`TraceBuilder`]: its edges are `from..from + len` of the builder's.
+struct Row {
+    key: QueryKey,
+    fingerprint: Fingerprint,
+    from: u32,
+    len: u32,
+    ran: bool,
+}
 
 /// The results of a build as they are found, in any order, made a [`Trace`] by
 /// [`TraceBuilder::finish`]. A key inserted twice keeps the last.
 #[derive(Default)]
 pub struct TraceBuilder {
-    results: BTreeMap<QueryKey, (Fingerprint, bool, u32, u32)>,
+    rows: Vec<Row>,
     edges: Vec<Edge>,
 }
 
@@ -91,53 +103,157 @@ impl TraceBuilder {
         let from = u32::try_from(self.edges.len()).expect("a trace has fewer than 2^32 edges");
         self.edges.extend_from_slice(edges);
         let len = u32::try_from(edges.len()).expect("a result has fewer than 2^32 edges");
-        self.results.insert(key, (fingerprint, ran, from, len));
+        self.rows.push(Row { key, fingerprint, from, len, ran });
     }
 
     pub fn record(&mut self, memo: &Memo, ran: bool) {
         self.insert(memo.key, memo.fingerprint, &memo.edges, ran);
     }
 
+    /// Every key named once through a table indexed by the key's own content hash (one probe
+    /// per edge, not a binary search), then only the distinct keys sorted.
     pub fn finish(self) -> Trace {
-        let mut keys: Vec<QueryKey> = self.results.keys().copied().collect();
-        for &(_, _, from, len) in self.results.values() {
-            keys.extend(self.edges[from as usize..(from + len) as usize].iter().map(|e| e.read));
+        const NONE: u32 = u32::MAX;
+        let mut table = KeyTable::with_capacity(self.rows.len() + self.edges.len() / 4);
+        let mut row_of: Vec<u32> = Vec::with_capacity(self.rows.len());
+        for (r, row) in self.rows.iter().enumerate() {
+            let id = table.intern(&row.key) as usize;
+            if id == row_of.len() {
+                row_of.push(NONE);
+            }
+            row_of[id] = r as u32;
         }
-        keys.sort_unstable();
-        keys.dedup();
-        let n = keys.len();
+        // Only the kept row of each key names its reads; a row inserted over is gone.
+        let mut read_ids = vec![NONE; self.edges.len()];
+        for &r in &row_of {
+            let row = &self.rows[r as usize];
+            let edges = row.from as usize..(row.from + row.len) as usize;
+            for (id, edge) in read_ids[edges.clone()].iter_mut().zip(&self.edges[edges]) {
+                *id = table.intern(&edge.read);
+            }
+        }
+        let distinct = table.keys;
+        row_of.resize(distinct.len(), NONE);
+        let mut order: Vec<u32> = (0..distinct.len() as u32).collect();
+        order.sort_unstable_by(|&x, &y| distinct[x as usize].cmp(&distinct[y as usize]));
+        let mut rank = vec![0u32; distinct.len()];
+        for (at, &id) in order.iter().enumerate() {
+            rank[id as usize] = at as u32;
+        }
+        let n = distinct.len();
         let mut trace = Trace {
+            keys: order.iter().map(|&id| distinct[id as usize]).collect(),
             has: Bits::with_len(n),
             ran: Bits::with_len(n),
             fingerprints: vec![Fingerprint(0); n],
             edges_from: Vec::with_capacity(n + 1),
-            ..Trace::default()
+            reads: Vec::with_capacity(self.edges.len()),
+            saw: Vec::with_capacity(self.edges.len()),
         };
-        let index = |key: &QueryKey| keys.binary_search(key).expect("every read is a key") as u32;
         trace.edges_from.push(0);
-        for (i, key) in keys.iter().enumerate() {
-            if let Some(&(fingerprint, ran, from, len)) = self.results.get(key) {
+        for (i, &id) in order.iter().enumerate() {
+            let r = row_of[id as usize];
+            if r != NONE {
+                let row = &self.rows[r as usize];
                 let i = i as u32;
                 trace.has.set(i);
-                if ran {
+                if row.ran {
                     trace.ran.set(i);
                 }
-                trace.fingerprints[i as usize] = fingerprint;
-                for edge in &self.edges[from as usize..(from + len) as usize] {
-                    trace.reads.push(index(&edge.read));
-                    trace.saw.push(edge.saw);
-                }
+                trace.fingerprints[i as usize] = row.fingerprint;
+                let edges = row.from as usize..(row.from + row.len) as usize;
+                trace.reads.extend(read_ids[edges.clone()].iter().map(|&read| rank[read as usize]));
+                trace.saw.extend(self.edges[edges].iter().map(|e| e.saw));
             }
             trace.edges_from.push(u32::try_from(trace.reads.len()).expect("a trace has fewer than 2^32 edges"));
         }
-        trace.keys = keys;
         trace
     }
+}
+
+/// Distinct keys in first-seen order, found through open-addressed slots (linear probing,
+/// at most half full) holding indices into `keys`: 4 bytes a slot, about 1.5 probes a hit.
+/// A key's content ID is a BLAKE3 hash already, so its first word is the slot after one
+/// multiply that also mixes in the kind; nothing hashes the 34 bytes again.
+struct KeyTable {
+    keys: Vec<QueryKey>,
+    slots: Vec<u32>,
+    shift: u32,
+}
+
+impl KeyTable {
+    const EMPTY: u32 = u32::MAX;
+
+    fn with_capacity(n: usize) -> KeyTable {
+        let slots = (2 * n).next_power_of_two().max(16);
+        KeyTable { keys: Vec::with_capacity(n), slots: vec![Self::EMPTY; slots], shift: 64 - slots.trailing_zeros() }
+    }
+
+    fn slot(&self, key: &QueryKey) -> usize {
+        let word = u64::from_le_bytes(key.input.0[..8].try_into().expect("8 bytes"));
+        ((word ^ u64::from(key.kind.0)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    /// The index of `key`, added if it is new.
+    fn intern(&mut self, key: &QueryKey) -> u32 {
+        let mask = self.slots.len() - 1;
+        let mut at = self.slot(key);
+        loop {
+            match self.slots[at] {
+                Self::EMPTY => break,
+                id if self.keys[id as usize] == *key => return id,
+                _ => at = (at + 1) & mask,
+            }
+        }
+        let id = u32::try_from(self.keys.len()).expect("a trace has fewer than 2^32 keys");
+        self.keys.push(*key);
+        self.slots[at] = id;
+        if 2 * self.keys.len() > self.slots.len() {
+            self.grow();
+        }
+        id
+    }
+
+    fn grow(&mut self) {
+        let len = 2 * self.slots.len();
+        self.slots.clear();
+        self.slots.resize(len, Self::EMPTY);
+        self.shift -= 1;
+        let mask = len - 1;
+        for (id, key) in self.keys.iter().enumerate() {
+            let mut at = self.slot(key);
+            while self.slots[at] != Self::EMPTY {
+                at = (at + 1) & mask;
+            }
+            self.slots[at] = id as u32;
+        }
+    }
+}
+
+/// The first index at or after `from` whose key is not below `key`, in sorted `keys`: a gallop
+/// (1, 2, 4, … ahead) then a binary search in the last step, so walking one sorted column
+/// against another costs amortized O(1) a key when the two are alike and O(log gap) when one
+/// skips far ahead.
+fn seek(keys: &[QueryKey], from: usize, key: &QueryKey) -> usize {
+    let (mut lo, mut step) = (from, 1);
+    while lo + step <= keys.len() && keys[lo + step - 1] < *key {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step).min(keys.len());
+    lo + keys[lo..hi].partition_point(|k| k < key)
 }
 
 impl Trace {
     pub fn index(&self, key: &QueryKey) -> Option<u32> {
         self.keys.binary_search(key).ok().map(|i| i as u32)
+    }
+
+    /// [`Trace::index`] for keys asked in ascending order: `cursor` carries where the last one
+    /// was found, so a join over every key of another trace is one pass over this one.
+    fn index_from(&self, cursor: &mut usize, key: &QueryKey) -> Option<u32> {
+        *cursor = seek(&self.keys, *cursor, key);
+        (self.keys.get(*cursor) == Some(key)).then_some(*cursor as u32)
     }
 
     /// Key `i`'s fingerprint, `None` when the build has no result for it.
@@ -234,10 +350,12 @@ impl Stale {
 pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<Stale> {
     let reached = scratch.reachable(roots);
     let mut stale = Vec::new();
+    let mut cursor = 0;
     for i in 0..scratch.keys.len() as u32 {
         let Some(theirs) = scratch.result(i).filter(|_| reached.get(i)) else { continue };
         let query = scratch.keys[i as usize];
-        let Some((j, ours)) = incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?))) else {
+        let found = incremental.index_from(&mut cursor, &query);
+        let Some((j, ours)) = found.and_then(|j| Some((j, incremental.result(j)?))) else {
             stale.push(Stale::Absent { query });
             continue;
         };
@@ -278,11 +396,12 @@ pub struct Work {
 pub fn over(before: &Trace, after: &Trace) -> (Work, Vec<QueryKey>) {
     let mut work = Work::default();
     let mut needless = Vec::new();
+    let mut cursor = 0;
     for i in 0..after.keys.len() as u32 {
         let Some(now) = after.result(i).filter(|_| after.ran.get(i)) else { continue };
         work.ran += 1;
         let key = after.keys[i as usize];
-        match before.index(&key).and_then(|j| Some((j, before.result(j)?))) {
+        match before.index_from(&mut cursor, &key).and_then(|j| Some((j, before.result(j)?))) {
             None => work.new += 1,
             // Same edges and another result is an input that changed (a file read), not waste.
             Some((j, was)) if was == now && same_edges(before, j, after, i) => {
@@ -304,35 +423,41 @@ pub enum Apart<K, V> {
     Differ { key: K, first: V, second: V },
 }
 
-/// Every key where `first` and `second` differ, in key order.
+/// Every key where `first` and `second` differ, in key order: one merge of the two sorted
+/// maps, no lookup per key and no sort.
 pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
     first: &BTreeMap<K, V>,
     second: &BTreeMap<K, V>,
 ) -> Vec<Apart<K, V>> {
+    use std::cmp::Ordering;
     let mut out = Vec::new();
-    for (key, value) in first {
-        match second.get(key) {
-            None => out.push(Apart::OnlyFirst { key: key.clone(), value: value.clone() }),
-            Some(other) if other != value => out.push(Apart::Differ {
-                key: key.clone(),
-                first: value.clone(),
-                second: other.clone(),
-            }),
-            Some(_) => {}
+    let (mut x, mut y) = (first.iter().peekable(), second.iter().peekable());
+    loop {
+        let (a, b) = (x.peek().copied(), y.peek().copied());
+        let order = match (a, b) {
+            (None, None) => return out,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some((ka, _)), Some((kb, _))) => ka.cmp(kb),
+        };
+        match (order, a, b) {
+            (Ordering::Less, Some((key, value)), _) => {
+                out.push(Apart::OnlyFirst { key: key.clone(), value: value.clone() });
+                x.next();
+            }
+            (Ordering::Greater, _, Some((key, value))) => {
+                out.push(Apart::OnlySecond { key: key.clone(), value: value.clone() });
+                y.next();
+            }
+            (Ordering::Equal, Some((key, va)), Some((_, vb))) => {
+                if va != vb {
+                    out.push(Apart::Differ { key: key.clone(), first: va.clone(), second: vb.clone() });
+                }
+                x.next();
+                y.next();
+            }
+            _ => unreachable!("the order names a side that has a key"),
         }
-    }
-    for (key, value) in second {
-        if !first.contains_key(key) {
-            out.push(Apart::OnlySecond { key: key.clone(), value: value.clone() });
-        }
-    }
-    out.sort_by(|a, b| key_of(a).cmp(key_of(b)));
-    out
-}
-
-fn key_of<K, V>(apart: &Apart<K, V>) -> &K {
-    match apart {
-        Apart::OnlyFirst { key, .. } | Apart::OnlySecond { key, .. } | Apart::Differ { key, .. } => key,
     }
 }
 

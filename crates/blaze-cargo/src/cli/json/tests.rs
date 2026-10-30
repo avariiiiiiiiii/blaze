@@ -20,8 +20,8 @@ const TARGET: &str = r#"{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_
 
 #[test]
 fn build_finished() {
-    assert_eq!(build_finished(true), r#"{"reason":"build-finished","success":true}"#);
-    assert_eq!(build_finished(false), r#"{"reason":"build-finished","success":false}"#);
+    assert_eq!(line(|out| build_finished(out, true)), r#"{"reason":"build-finished","success":true}"#);
+    assert_eq!(line(|out| build_finished(out, false)), r#"{"reason":"build-finished","success":false}"#);
 }
 
 #[test]
@@ -51,9 +51,9 @@ fn compiler_artifact() {
     let expected = format!(
         r#"{{"reason":"compiler-artifact","package_id":"path+file:///w/foo#0.1.0","manifest_path":"/w/foo/Cargo.toml","target":{TARGET},"profile":{{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false}},"features":["default"],"filenames":["/w/foo/target/debug/foo"],"executable":"/w/foo/target/debug/foo","fresh":false}}"#
     );
-    assert_eq!(super::artifact(&artifact), expected);
+    assert_eq!(line(|out| super::artifact(out, &artifact)), expected);
     let lib = Artifact { executable: None, fresh: true, ..artifact };
-    assert!(super::artifact(&lib).ends_with(r#""executable":null,"fresh":true}"#));
+    assert!(line(|out| super::artifact(out, &lib)).ends_with(r#""executable":null,"fresh":true}"#));
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn build_script_executed() {
         out_dir: "/w/foo/target/debug/build/foo-1/out".to_owned(),
     };
     assert_eq!(
-        build_script(&ran),
+        line(|out| build_script(out, &ran)),
         r#"{"reason":"build-script-executed","package_id":"path+file:///w/foo#0.1.0","linked_libs":["static=z"],"linked_paths":["native=/w/foo/target/debug/build/foo-1/out"],"cfgs":["has_z"],"env":[["Z_VERSION","1.3"]],"out_dir":"/w/foo/target/debug/build/foo-1/out"}"#
     );
 }
@@ -75,7 +75,7 @@ fn build_script_executed() {
 #[test]
 fn strings_as_serde_json_writes_them() {
     let text = "a\"b\\c\nd\te\u{1b}[0m\u{7f}é/";
-    assert_eq!(J::str(text).line(), serde_json::to_string(text).unwrap());
+    assert_eq!(line(|out| quote(out, text)), serde_json::to_string(text).unwrap());
 }
 
 fn span(file: &str, (line, column): (u32, u32), (end_line, end_column): (u32, u32), bytes: (u32, u32)) -> Span {
@@ -142,7 +142,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
     };
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
-    let said = compiler_message(&unit, &unused(rendered), false, &mut sources);
+    let said = line(|out| compiler_message(out, &unit, &unused(rendered), false, &mut sources));
     let target = format!(
         r#"{{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_path":"{root}/src/main.rs","edition":"2021","doc":true,"doctest":false,"test":true}}"#
     );
@@ -174,7 +174,7 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
     };
     let rendered = "\u{1b}[33mwarning\u{1b}[0m\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
-    let said = compiler_message(&unit, &unused(rendered), true, &mut sources);
+    let said = line(|out| compiler_message(out, &unit, &unused(rendered), true, &mut sources));
     let message = said.split_once(r#""message":"#).unwrap().1;
     let text = r#"[{"text":"    let x = 1;","highlight_start":9,"highlight_end":10}]"#;
     let expected = format!(
@@ -193,15 +193,50 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
 #[test]
 fn a_span_over_lines_and_one_of_no_file() {
     let (_dir, root) = checkout();
-    let manifest = format!("{root}/Cargo.toml");
     let mut sources = Sources::new(std::path::Path::new(&root));
-    let lines = sources.lines("src/main.rs", std::path::Path::new(&manifest)).unwrap().to_vec();
+    let file = sources.file("src/main.rs", &root);
+    assert!(file.is_some());
+    assert_eq!(sources.file("src/main.rs", &root), file, "a name seen is not looked for again");
     let over = span("src/main.rs", (1, 11), (3, 2), (10, 28));
     assert_eq!(
-        J::Arr(span_text(&over, &lines)).line(),
+        line(|out| span_text(out, &over, Order::Rustc, &sources, file)),
         r#"[{"text":"fn main() {","highlight_start":11,"highlight_end":12},{"text":"    let x = 1;","highlight_start":1,"highlight_end":15},{"text":"}","highlight_start":1,"highlight_end":2}]"#
     );
-    assert!(sources.lines("src/gone.rs", std::path::Path::new(&manifest)).is_none());
+    let beyond = span("src/main.rs", (4, 1), (9, 1), (0, 0));
+    assert_eq!(line(|out| span_text(out, &beyond, Order::Rustc, &sources, file)), "[]");
+    assert_eq!(sources.file("src/gone.rs", &root), None);
     let absolute = format!("{root}/src/main.rs");
-    assert_eq!(sources.lines(&absolute, std::path::Path::new("/elsewhere/Cargo.toml")).unwrap()[0], "fn main() {");
+    let same = sources.file(&absolute, "/elsewhere");
+    assert_eq!(same, file, "one file read once under two names");
+    assert_eq!(sources.line(same.unwrap(), 1), "fn main() {");
+    assert_eq!(sources.line_count(same.unwrap()), 4);
+}
+
+#[test]
+fn lines_without_bom_and_carriage_returns() {
+    let source = Source::new(b"\xef\xbb\xbfa\r\nb\n\nc".to_vec());
+    let lines: Vec<&str> = (1..=source.starts.len()).map(|it| source.line(it)).collect();
+    assert_eq!(lines, ["a", "b", "", "c"]);
+}
+
+/// The escape's stripping of colors against the reference: `say::strip_ansi`, then serde_json.
+#[test]
+fn colors_stripped_while_escaping() {
+    for text in [
+        "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused `x`\n",
+        "a\u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{1b}\\b",
+        "\u{1b}(é\t\"q\"\\",
+        "unterminated \u{1b}[38;5",
+        "\u{1b}",
+        "plain",
+    ] {
+        let reference = serde_json::to_string(&crate::cli::say::strip_ansi(text)).unwrap();
+        assert_eq!(line(|out| quote_with(out, text, true)), reference, "{text:?}");
+    }
+}
+
+fn line(write: impl FnOnce(&mut String)) -> String {
+    let mut out = String::new();
+    write(&mut out);
+    out
 }

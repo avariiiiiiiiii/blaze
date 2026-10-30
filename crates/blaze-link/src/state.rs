@@ -133,6 +133,9 @@ pub(crate) struct Resolved {
     pub frames: FxHashSet<(Obj, u32, u32)>,
     /// The commons, by name: size and alignment.
     pub commons: BTreeMap<Box<str>, (u64, u64)>,
+    /// What the objects' `/EXPORT` directives export: the name, the symbol, and whether it
+    /// is data.
+    pub exports: Vec<(String, String, bool)>,
 }
 
 #[derive(Clone)]
@@ -152,6 +155,8 @@ pub(crate) struct State {
     /// Every name a piece has referred to: what resolution looks at.
     pub seen: Arc<BTreeSet<Sym>>,
     pub debug_names: Arc<FxHashMap<InstanceKey, Arc<str>>>,
+    /// wasm: what codegen's functions and statics say each name is imported as.
+    pub wasm_imports: Arc<BTreeMap<Box<str>, blaze_codegen::wasm::Import>>,
     pub spans: Arc<FxHashMap<ContentId, Arc<SpanTable>>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
@@ -181,6 +186,7 @@ impl State {
             names: Arc::default(),
             seen: Arc::default(),
             debug_names: Arc::default(),
+            wasm_imports: Arc::default(),
             spans: Arc::default(),
             inputs: Arc::default(),
             resolved: Arc::default(),

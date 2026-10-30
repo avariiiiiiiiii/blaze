@@ -30,6 +30,7 @@
 //! completions are dropped.
 
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
@@ -45,7 +46,7 @@ use blaze_ids::ContentId;
 use super::wire::{self, End, Frame, Frames};
 use crate::{
     confine,
-    trace::{self, Inputs, Line, Seen},
+    trace::{self, BadRecord, Inputs, Line, Seen},
 };
 
 /// How a binary's tests run.
@@ -170,6 +171,10 @@ pub struct Finished {
 const CHUNK: usize = 1 << 20;
 /// The job of a binary run whole, in the order.
 const WHOLE: usize = usize::MAX;
+/// The least a receive from a fork server asks for; more when a longer frame is coming.
+const RECV: usize = 1 << 16;
+/// A job its server's hello did not name.
+const NO_TEST: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum For {
@@ -220,13 +225,28 @@ struct Server {
     /// Why it is being killed, said to the tests it loses.
     lost: Option<String>,
     frames: Frames,
-    index: HashMap<String, u32>,
+    /// Each job's index in the server's hello, [`NO_TEST`] for one it did not name: what a
+    /// run is sent with, by direct index.
+    job_index: Vec<u32>,
+    /// The job each test name of the hello is, for the scope of a record's line: one hash of
+    /// the borrowed scope per line, nothing allocated for it.
+    by_scope: HashMap<String, u32>,
     running: BTreeSet<u64>,
     /// How far the record has been read, and a last line not yet whole.
     at: u64,
     partial: Vec<u8>,
-    scoped: HashMap<String, Vec<Line>>,
+    /// The lines of each job's scope, by job, taken by its last attempt's result.
+    scoped: Vec<Vec<Line>>,
+    /// The lines of every scope, each once (in the order first seen), with the kinds of
+    /// [`Seen`] each `what` has among them as bits: a line every test is given is kept, and
+    /// so cloned into each result, only once however often the server repeats it.
     common: Vec<Line>,
+    common_seen: HashMap<String, u16>,
+    /// Frames for the server not yet given to the driver, and the timers that go after them:
+    /// what one call to the queue says to a server goes as one send.
+    outbox: Vec<u8>,
+    timers: Vec<Effect>,
+    dirty: bool,
     reading: bool,
     waiting: Vec<Ended>,
     next: Vec<Ended>,
@@ -269,6 +289,12 @@ pub struct Queue {
     bins: Vec<Bin>,
     /// Not started: the longest expected first, then by binary and job.
     pending: BTreeSet<(Reverse<Duration>, usize, usize)>,
+    /// What of `pending` can start now (its server said hello, or it is a binary run
+    /// whole), in the same order: the next test is its first, with no scan past those of
+    /// servers still starting.
+    ready: BTreeSet<(Reverse<Duration>, usize, usize)>,
+    /// Servers with frames or timers in `outbox` and `timers`.
+    dirty: Vec<usize>,
     attempts: BTreeMap<u64, Attempt>,
     tries: HashMap<(usize, usize), Tries>,
     tags: BTreeMap<Tag, For>,
@@ -288,6 +314,8 @@ impl Queue {
             config,
             bins: Vec::new(),
             pending: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            dirty: Vec::new(),
             attempts: BTreeMap::new(),
             tries: HashMap::new(),
             tags: BTreeMap::new(),
@@ -312,6 +340,7 @@ impl Queue {
                 Mode::Threads { .. } => {
                     let expected = queue.bins[b].plan.jobs.iter().map(|it| it.expected).sum();
                     queue.pending.insert((Reverse(expected), b, WHOLE));
+                    queue.ready.insert((Reverse(expected), b, WHOLE));
                 }
                 Mode::Process if !cfg!(unix) => {
                     let why = format!(
@@ -331,6 +360,7 @@ impl Queue {
             }
         }
         queue.schedule(effects);
+        queue.flush(effects);
         queue
     }
 
@@ -369,10 +399,16 @@ impl Queue {
             }
             self.kill_server(b, "the run was cancelled".to_owned(), effects);
         }
+        self.flush(effects);
     }
 
     /// Takes a completion of one of its tags.
     pub fn complete(&mut self, completion: Completion, now: Duration, effects: &mut Vec<Effect>) {
+        self.completed(completion, now, effects);
+        self.flush(effects);
+    }
+
+    fn completed(&mut self, completion: Completion, now: Duration, effects: &mut Vec<Effect>) {
         self.now = now;
         let tag = completion.tag;
         let Some(&purpose) = self.tags.get(&tag) else { return };
@@ -414,9 +450,9 @@ impl Queue {
                     return;
                 }
                 attempt.timed_out = true;
-                self.send(b, &Frame::Kill { id }, effects);
+                self.send(b, &Frame::Kill { id });
                 let grace = self.tag(For::Grace(id));
-                effects.push(Effect::Timer { after: self.config.kill_grace, tag: grace });
+                self.timer(b, self.config.kill_grace, grace);
             }
             For::Grace(id) => {
                 let Some(attempt) = self.attempts.get(&id) else { return };
@@ -476,12 +512,17 @@ impl Queue {
             hung_up: false,
             lost: None,
             frames: Frames::new(),
-            index: HashMap::new(),
+            job_index: Vec::new(),
+            by_scope: HashMap::new(),
             running: BTreeSet::new(),
             at: 0,
             partial: Vec::new(),
-            scoped: HashMap::new(),
+            scoped: Vec::new(),
             common: Vec::new(),
+            common_seen: HashMap::new(),
+            outbox: Vec::new(),
+            timers: Vec::new(),
+            dirty: false,
             reading: false,
             waiting: Vec::new(),
             next: Vec::new(),
@@ -542,7 +583,7 @@ impl Queue {
                 }
                 server.conn = Some(conn);
                 let recv = self.tag(For::Recv(b));
-                effects.push(Effect::Recv { conn, most: 1 << 16, tag: recv });
+                effects.push(Effect::Recv { conn, most: RECV, tag: recv });
                 effects.push(Effect::Unlisten { tag });
             }
             Done::Unlistened => {
@@ -578,7 +619,7 @@ impl Queue {
             }
             return;
         }
-        self.server(b).frames.push(&bytes);
+        self.server(b).frames.push_owned(bytes);
         loop {
             let frame = match self.server(b).frames.pop() {
                 Ok(Some(frame)) => frame,
@@ -597,8 +638,9 @@ impl Queue {
         if let Some(conn) = server.conn
             && server.phase != Phase::Ended
         {
+            let most = server.frames.needed().max(RECV);
             let recv = self.tag(For::Recv(b));
-            effects.push(Effect::Recv { conn, most: 1 << 16, tag: recv });
+            effects.push(Effect::Recv { conn, most, tag: recv });
         }
     }
 
@@ -611,15 +653,26 @@ impl Queue {
                 if version != wire::VERSION {
                     return Err(format!("its version is {version}, and blaze speaks {}", wire::VERSION));
                 }
-                let server = self.server(b);
-                server.index = tests.into_iter().enumerate().map(|(at, name)| (name, at as u32)).collect();
+                let bin = &mut self.bins[b];
+                let jobs: HashMap<&str, u32> =
+                    bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect();
+                let server = bin.server.as_mut().expect("a server");
+                server.job_index = vec![NO_TEST; bin.plan.jobs.len()];
+                server.scoped = vec![Vec::new(); bin.plan.jobs.len()];
+                for (at, name) in tests.into_iter().enumerate() {
+                    if let Some(&j) = jobs.get(name.as_str()) {
+                        server.job_index[j as usize] = at as u32;
+                        server.by_scope.insert(name, j);
+                    }
+                }
                 server.phase = Phase::Ready;
-                let missing: Vec<(Reverse<Duration>, usize, usize)> = self
-                    .pending
-                    .iter()
-                    .filter(|it| it.1 == b && !self.bins[b].server.as_ref().expect("a server").index.contains_key(&self.bins[b].plan.jobs[it.2].name))
-                    .copied()
-                    .collect();
+                let mut missing = Vec::new();
+                for entry in self.pending.iter().filter(|it| it.1 == b) {
+                    match self.bins[b].server.as_ref().expect("a server").job_index[entry.2] {
+                        NO_TEST => missing.push(*entry),
+                        _ => _ = self.ready.insert(*entry),
+                    }
+                }
                 for entry in missing {
                     self.pending.remove(&entry);
                     let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[entry.2].name);
@@ -647,7 +700,11 @@ impl Queue {
                         tries.done = number;
                         tries.output.extend_from_slice(format!("--- attempt {number} ---\n").as_bytes());
                         tries.output.extend_from_slice(&output);
-                        self.pending.insert((Reverse(self.bins[b].plan.jobs[j].expected), b, j));
+                        let entry = (Reverse(self.bins[b].plan.jobs[j].expected), b, j);
+                        self.pending.insert(entry);
+                        if self.server(b).phase == Phase::Ready {
+                            self.ready.insert(entry);
+                        }
                         return Ok(());
                     }
                     if self.config.fail_fast {
@@ -687,27 +744,21 @@ impl Queue {
         server.reading = false;
         match done {
             Done::Read(bytes) => {
-                server.at += bytes.len() as u64;
-                server.partial.extend_from_slice(&bytes);
-                if let Some(end) = server.partial.iter().rposition(|it| *it == b'\n') {
-                    let whole: Vec<u8> = server.partial.drain(..=end).collect();
-                    let text = String::from_utf8_lossy(&whole);
-                    match trace::parse(&text) {
-                        Ok((lines, _)) => {
-                            for line in lines {
-                                if ours(server, &line) {
-                                    continue;
-                                }
-                                match line.scope.is_empty() {
-                                    true => server.common.push(line),
-                                    false => server.scoped.entry(line.scope.clone()).or_default().push(line),
-                                }
-                            }
-                        }
-                        Err(bad) => server.broken = Some(format!("the sandbox's record {}: {bad}", server.record)),
-                    }
+                let len = bytes.len();
+                server.at += len as u64;
+                match server.partial.is_empty() {
+                    true => server.partial = bytes,
+                    false => server.partial.extend_from_slice(&bytes),
                 }
-                if bytes.len() == CHUNK && server.broken.is_none() {
+                if let Some(end) = server.partial.iter().rposition(|it| *it == b'\n') {
+                    let partial = std::mem::take(&mut server.partial);
+                    if let Err(bad) = take_lines(server, &partial[..=end]) {
+                        server.broken = Some(format!("the sandbox's record {}: {bad}", server.record));
+                    }
+                    server.partial = partial;
+                    server.partial.drain(..=end);
+                }
+                if len == CHUNK && server.broken.is_none() {
                     self.start_read(b, effects);
                     return;
                 }
@@ -720,10 +771,10 @@ impl Queue {
         let broken = self.server(b).broken.clone();
         let waiting = std::mem::take(&mut self.server(b).waiting);
         for ended in waiting {
-            let Some(attempt) = self.attempts.get(&ended.id) else { continue };
+            let Some(j) = self.attempts.get(&ended.id).map(|it| it.job) else { continue };
             let trace = match &broken {
                 Some(why) => Trace::Unknown(why.clone()),
-                None => Trace::Lines(self.lines(b, attempt.job)),
+                None => Trace::Lines(self.lines(b, j)),
             };
             self.attempt_ended(b, ended, trace, effects);
         }
@@ -734,11 +785,14 @@ impl Queue {
         }
     }
 
-    /// The lines of the record a test of `b` read: those of every scope, then its own.
-    fn lines(&self, b: usize, j: usize) -> Vec<Line> {
-        let server = self.bins[b].server.as_ref().expect("a server");
-        let mut lines = server.common.clone();
-        lines.extend(server.scoped.get(&self.bins[b].plan.jobs[j].name).into_iter().flatten().cloned());
+    /// The lines of the record a test of `b` read: those of every scope, then its own, which
+    /// are moved out (only its last attempt's result asks).
+    fn lines(&mut self, b: usize, j: usize) -> Vec<Line> {
+        let server = self.server(b);
+        let own = server.scoped.get_mut(j).map(std::mem::take).unwrap_or_default();
+        let mut lines = Vec::with_capacity(server.common.len() + own.len());
+        lines.extend_from_slice(&server.common);
+        lines.extend(own);
         lines
     }
 
@@ -813,6 +867,7 @@ impl Queue {
             return;
         }
         self.stopping = true;
+        self.ready.clear();
         for (_, b, j) in std::mem::take(&mut self.pending) {
             let job = (j != WHOLE).then_some(j);
             let tries = self.tries.remove(&(b, j)).unwrap_or_default();
@@ -829,7 +884,7 @@ impl Queue {
         let Some(server) = &self.bins[b].server else { return };
         match server.phase {
             Phase::Ready => {
-                self.send(b, &Frame::Quit, effects);
+                self.send(b, &Frame::Quit);
                 self.server(b).phase = Phase::Quitting;
             }
             Phase::Starting if server.lost.is_none() => {
@@ -843,14 +898,50 @@ impl Queue {
         }
     }
 
-    fn send(&mut self, b: usize, frame: &Frame, effects: &mut Vec<Effect>) {
+    /// `frame` to the server, in its outbox until the call ends ([`Queue::flush`]).
+    fn send(&mut self, b: usize, frame: &Frame) {
         let server = self.server(b);
-        let Some(conn) = server.conn else { return };
-        if server.hung_up {
+        if server.conn.is_none() || server.hung_up {
             return;
         }
-        let tag = self.tag(For::Send(b));
-        effects.push(Effect::Send { conn, bytes: frame.to_bytes(), tag });
+        frame.encode(&mut server.outbox);
+        self.dirty(b);
+    }
+
+    /// A timer that goes to the driver after the frames sent to `b` so far.
+    fn timer(&mut self, b: usize, after: Duration, tag: Tag) {
+        self.server(b).timers.push(Effect::Timer { after, tag });
+        self.dirty(b);
+    }
+
+    fn dirty(&mut self, b: usize) {
+        let server = self.server(b);
+        if !server.dirty {
+            server.dirty = true;
+            self.dirty.push(b);
+        }
+    }
+
+    /// What this call said to each server, as one send of all its frames, then its timers.
+    fn flush(&mut self, effects: &mut Vec<Effect>) {
+        for b in std::mem::take(&mut self.dirty) {
+            self.flush_server(b, effects);
+        }
+    }
+
+    fn flush_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
+        let Some(server) = self.bins[b].server.as_mut() else { return };
+        server.dirty = false;
+        let bytes = std::mem::take(&mut server.outbox);
+        let timers = std::mem::take(&mut server.timers);
+        let conn = server.conn.filter(|_| !server.hung_up);
+        if let Some(conn) = conn
+            && !bytes.is_empty()
+        {
+            let tag = self.tag(For::Send(b));
+            effects.push(Effect::Send { conn, bytes, tag });
+        }
+        effects.extend(timers);
     }
 
     /// Kills the server, so its tests are lost with `why` once its spawn ends.
@@ -873,6 +964,8 @@ impl Queue {
     /// The server's process ended (or never started): what it ran and what was left for it
     /// are lost with `why`.
     fn server_ended(&mut self, b: usize, why: String, output: Vec<u8>, effects: &mut Vec<Effect>) {
+        // What was said to it goes before the hang-up, as it was said.
+        self.flush_server(b, effects);
         let server = self.server(b);
         let was = server.phase;
         server.phase = Phase::Ended;
@@ -905,6 +998,7 @@ impl Queue {
         let left: Vec<(Reverse<Duration>, usize, usize)> = self.pending.iter().filter(|it| it.1 == b).copied().collect();
         for entry in left {
             self.pending.remove(&entry);
+            self.ready.remove(&entry);
             let earlier = self.tries.remove(&(b, entry.2)).map(|it| it.output).unwrap_or_default();
             self.finish(b, Some(entry.2), Outcome::Failed(Failure::Lost(why.clone())), [earlier, output.clone()].concat(), Duration::ZERO, Trace::Unknown(why.clone()));
         }
@@ -914,15 +1008,12 @@ impl Queue {
     /// Servers with nothing left to run are let go.
     fn schedule(&mut self, effects: &mut Vec<Effect>) {
         while !self.stopping && self.busy < self.config.jobs.max(1) {
-            let next = self.pending.iter().copied().find(|&(_, b, j)| {
-                j == WHOLE || self.bins[b].server.as_ref().is_some_and(|it| it.phase == Phase::Ready)
-            });
-            let Some(entry) = next else { break };
+            let Some(entry) = self.ready.pop_first() else { break };
             self.pending.remove(&entry);
             let (_, b, j) = entry;
             match j {
                 WHOLE => self.start_whole(b, effects),
-                _ => self.start_job(b, j, effects),
+                _ => self.start_job(b, j),
             }
         }
         for b in 0..self.bins.len() {
@@ -930,19 +1021,18 @@ impl Queue {
         }
     }
 
-    fn start_job(&mut self, b: usize, j: usize, effects: &mut Vec<Effect>) {
+    fn start_job(&mut self, b: usize, j: usize) {
         let id = self.next_id;
         self.next_id += 1;
         let number = self.tries.get(&(b, j)).map_or(1, |it| it.done + 1);
-        let job = &self.bins[b].plan.jobs[j];
-        let timeout = job.timeout;
-        let index = self.bins[b].server.as_ref().expect("a server").index[&job.name];
+        let timeout = self.bins[b].plan.jobs[j].timeout;
+        let index = self.server(b).job_index[j];
         self.attempts.insert(id, Attempt { binary: b, job: j, number, started: self.now, timed_out: false });
         self.server(b).running.insert(id);
         self.busy += 1;
-        self.send(b, &Frame::Run { id, index }, effects);
+        self.send(b, &Frame::Run { id, index });
         let deadline = self.tag(For::Deadline(id));
-        effects.push(Effect::Timer { after: timeout, tag: deadline });
+        self.timer(b, timeout, deadline);
     }
 
     fn start_whole(&mut self, b: usize, effects: &mut Vec<Effect>) {
@@ -1013,14 +1103,54 @@ impl Queue {
 
 /// Whether a line of the record is of blaze's own doing, not the tests': its socket, its
 /// record, the variables it set for the server.
-fn ours(server: &Server, line: &Line) -> bool {
-    match line.seen {
-        Seen::Env => line.what == wire::SOCKET || line.what == confine::LIVE,
-        Seen::Read | Seen::Looked | Seen::Listed => {
-            line.what == server.socket_path || line.what == server.record_path
-        }
+fn ours(server: &Server, seen: Seen, what: &str) -> bool {
+    match seen {
+        Seen::Env => what == wire::SOCKET || what == confine::LIVE,
+        Seen::Read | Seen::Looked | Seen::Listed => what == server.socket_path || what == server.record_path,
         _ => false,
     }
+}
+
+/// A line of the record without its line break, borrowed: the parts [`Line::parse`] reads.
+fn record_line(text: &str) -> Option<(Seen, &str, &str)> {
+    let mut parts = text.splitn(3, '\t');
+    let seen = Seen::of(parts.next()?)?;
+    Some((seen, parts.next()?, parts.next()?))
+}
+
+/// The whole lines of `text` (which ends with a line break) into the server's lines, as
+/// [`trace::parse`] of its lossy text reads them, but in place: each line is read borrowed,
+/// and only one that is kept is made a [`Line`]. A line not UTF-8 is read lossily alone,
+/// which is the same: a replaced sequence never spans a line break.
+fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), BadRecord> {
+    for (number, piece) in text.split_inclusive(|it| *it == b'\n').enumerate() {
+        let Some(piece) = piece.strip_suffix(b"\n") else { break };
+        let piece = match std::str::from_utf8(piece) {
+            Ok(it) => Cow::Borrowed(it),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(piece).into_owned()),
+        };
+        let Some((seen, scope, what)) = record_line(&piece) else {
+            return Err(BadRecord { line: number + 1, text: piece.chars().take(200).collect() });
+        };
+        if ours(server, seen, what) {
+            continue;
+        }
+        if scope.is_empty() {
+            let bit = 1u16 << seen as u16;
+            match server.common_seen.get_mut(what) {
+                Some(kinds) if *kinds & bit != 0 => continue,
+                Some(kinds) => *kinds |= bit,
+                None => _ = server.common_seen.insert(what.to_owned(), bit),
+            }
+            server.common.push(Line { seen, scope: String::new(), what: what.to_owned() });
+            continue;
+        }
+        // A scope no job of this server has is no test's to be given.
+        if let Some(&j) = server.by_scope.get(scope) {
+            server.scoped[j as usize].push(Line { seen, scope: scope.to_owned(), what: what.to_owned() });
+        }
+    }
+    Ok(())
 }
 
 /// How a server's process ended, for the tests it loses.

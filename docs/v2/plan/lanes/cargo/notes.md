@@ -155,3 +155,21 @@ print what cargo prints, on the stream cargo prints it, with cargo's exit codes:
 - exit codes: 0, 101 for a failed build or test (cargo's), 1 for cargo's usage errors.
 
 The CLI reads no manifest itself: the daemon's load is the one load.
+
+Fast: the CLI is a thin client, as buck2's and Bazel's clients are: what it does before the
+request is parse the words, stat up from the directory for `Cargo.toml` and `.git` (one stat per
+directory, `cargo.toml` looked for only on failure), stat `.cargo` once per directory outside the
+checkout and read the config files without a stat, and connect (polling a just-started daemon's
+socket every millisecond). Responses are handed over owned, so the build's artifacts are moved,
+never copied. Each response is printed with one write, from one buffer the printer reuses. The
+JSON messages are written straight into it in cargo's field order, with no `serde_json::Value`
+tree between. Strings are escaped as serde_json escapes them: a 256-entry table, with runs that
+need no escape copied whole, and with rustc's color codes stripped in the same pass for
+`rendered`. sonic-rs's SIMD escaping is faster on long strings, but a cargo message is short and
+mostly plain ASCII, so the table copy is the right tool. A source file a span points into is read
+once, with its lines indexed as 4-byte offsets found by `memchr` (core's `match_indices('\n')`).
+It is not mmapped, because a file edited while the build runs would fault (SIGBUS). A name seen
+before costs two Fx lookups by `&str` and allocates nothing. Diagnostics are deduplicated by a
+64-bit Fx hash of their text, as cargo's `DiagDedupe` does, and units are indexed by package.
+`--reached` groups its results in one Fx pass, and libtest's text is built in one preallocated
+`String`.

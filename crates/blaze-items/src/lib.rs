@@ -27,6 +27,8 @@
 //! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]). Each is computed by `#[salsa::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 
+#![forbid(unsafe_code)]
+
 mod facts;
 mod form;
 pub mod hash;

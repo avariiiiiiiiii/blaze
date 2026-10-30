@@ -10,10 +10,11 @@ mod shared;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
 use object::Endianness;
+use rustc_hash::FxHashMap;
 use object::elf;
 use object::read::elf::{FileHeader as _, Rela as _, SectionHeader as _, SectionTable, Sym as _};
 
@@ -70,17 +71,19 @@ pub(super) fn read(
     }
 }
 
-/// `object`'s ELF reader takes its structures in place, so it needs them aligned; an archive
-/// member is only 2-aligned.
+/// `object`'s ELF reader takes its structures in place, so it needs them as aligned as its
+/// `U64`: 8 bytes, or 1 with its `unaligned` feature, when nothing is ever copied. An archive
+/// member is only 2-aligned. The copy is one allocation and one `memcpy`, nothing zeroed.
 fn aligned<'a>(bytes: &'a [u8], copy: &'a mut Vec<u8>) -> &'a [u8] {
-    if bytes.as_ptr().align_offset(8) == 0 {
+    let align = align_of::<Header>();
+    if bytes.as_ptr().align_offset(align) == 0 {
         return bytes;
     }
-    *copy = vec![0; bytes.len() + 7];
-    let start = copy.as_ptr().align_offset(8);
-    let copy = &mut copy[start..start + bytes.len()];
-    copy.copy_from_slice(bytes);
-    copy
+    *copy = Vec::with_capacity(bytes.len() + align - 1);
+    let start = copy.as_ptr().align_offset(align);
+    copy.resize(start, 0);
+    copy.extend_from_slice(bytes);
+    &copy[start..]
 }
 
 fn taken(kind: &NativeKind) -> &'static str {
@@ -129,7 +132,7 @@ fn machine_name(machine: u16) -> &'static str {
 }
 
 fn utf8(name: &str, what: &str, bytes: &[u8]) -> Result<String, String> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| {
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
         format!("{name}: {what} {} is not UTF-8", String::from_utf8_lossy(bytes))
     })
 }
@@ -321,11 +324,11 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         if applied.what == SectionKind::Dropped {
             continue;
         }
-        let section_name = applied.name.clone();
         if sh_type != elf::SHT_RELA {
             return Err(format!(
-                "{name}: section {section_name} has {} relocations ({relocations}): x86-64 and \
-                 AArch64 objects carry their addends (SHT_RELA)",
+                "{name}: section {} has {} relocations ({relocations}): x86-64 and AArch64 \
+                 objects carry their addends (SHT_RELA)",
+                applied.name,
                 if sh_type == elf::SHT_REL { "SHT_REL" } else { "SHT_CREL" }
             ));
         }
@@ -337,15 +340,20 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         let Some((relas, _)) = section.rela(ENDIAN, data).map_err(error)? else {
             continue;
         };
-        let mut fixups = Vec::with_capacity(relas.len());
+        // Taken out while the relocations are read, so the added symbols can be pushed and
+        // an error can still name the section, without a copy of either.
+        let mut fixups = std::mem::take(&mut object.sections[target].fixups);
+        fixups.reserve_exact(relas.len());
         for rela in relas {
             let at = rela.r_offset(ENDIAN);
             let r_type = rela.r_type(ENDIAN, false);
             let symbol = rela.r_sym(ENDIAN, false);
             let addend = rela.r_addend(ENDIAN);
+            let sections = &object.sections;
             let place = || {
                 format!(
-                    "{name}: section {section_name}: relocation {} ({r_type}) at {at:#x}",
+                    "{name}: section {}: relocation {} ({r_type}) at {at:#x}",
+                    sections[target].name,
                     relocation_name(arch, r_type)
                 )
             };
@@ -376,7 +384,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                 }
             });
         }
-        object.sections[target].fixups.extend(fixups);
+        object.sections[target].fixups = fixups;
     }
     Ok(object)
 }
@@ -579,7 +587,7 @@ struct Added {
     module: Option<u32>,
     got: Option<u32>,
     /// By the ELF symbol whose size each holds.
-    sizes: BTreeMap<u32, u32>,
+    sizes: FxHashMap<u32, u32>,
 }
 
 impl Added {
@@ -620,9 +628,10 @@ impl Added {
         sizes: &[u64],
         target: u32,
     ) -> Result<u32, String> {
-        if let Some(&symbol) = self.sizes.get(&target) {
-            return Ok(symbol);
-        }
+        let entry = match self.sizes.entry(target) {
+            Entry::Occupied(it) => return Ok(*it.get()),
+            Entry::Vacant(it) => it,
+        };
         let of = &symbols[target as usize];
         match (of.def, of.binding) {
             (SymbolDef::Undefined, _) => {
@@ -652,8 +661,7 @@ impl Added {
             kind: SymbolKind::Other,
             hidden: true,
         });
-        self.sizes.insert(target, symbol);
-        Ok(symbol)
+        Ok(*entry.insert(symbol))
     }
 }
 

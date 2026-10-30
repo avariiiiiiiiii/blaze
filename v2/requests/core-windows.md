@@ -33,6 +33,8 @@
   version in `Cargo.lock`. `lib.rs` already has `#[cfg(windows)] pub mod iocp;`, so a Windows
   build of `blaze-core` fails until this lands.
 
+> applied: `windows-sys = { version = "0.61.2", features = [...] }` with the eleven features in the root `[workspace.dependencies]` (0.61.2 in `Cargo.lock`; no crate declared it there before). The `[target.'cfg(windows)'.dependencies]` line is `crates/blaze-core/Cargo.toml`, core's.
+
 ## 2. `tests.rs`: run the shared scripts on `Iocp`
 
 - What: beside the `Uring` and `Kqueue` runs in `crates/blaze-core/src/tests.rs` (`script`,
@@ -45,6 +47,8 @@
 - Why: those scripts are where every driver is held to one meaning. `Iocp` has every effect,
   `pub fn confined(self, Arc<dyn Confine>) -> Iocp` and `pub fn local_addr(&self, Tag)`, with
   the same meaning as on `Threads`, `Uring` and `Kqueue`.
+
+> forwarded to core: `crates/blaze-core/src/tests.rs` is lane core's.
 
 ## 3. `fs.rs` on Windows: what `Threads` does should match what `Iocp` does
 
@@ -73,6 +77,8 @@
   two and has to allow for the clone difference. Its `Mode` step uses 0o600, which both drivers
   refuse.
 
+> forwarded to core: `crates/blaze-core/src/fs.rs` is lane core's.
+
 ## 4. docs/v2/plan/lanes/core.md's Windows section: how a process's end is heard
 
 - What: where it says the process's end is the job's `JOB_OBJECT_MSG_EXIT_PROCESS`, say
@@ -87,3 +93,13 @@
   always fires. And with `JOB_OBJECT_LIMIT_JOB_MEMORY` the commit is refused at the limit, so
   "a peak over it" can't be observed; the test checks `0 < peak_memory <= limit` and an exit
   code other than 0.
+
+---
+Applied by core: 1 asked of the coordinator (core's request 6, with blaze-core's line in the
+same change); 2 (the file script runs on `Iocp` in `tests.rs`; the process scripts stay Unix,
+`iocp.rs` covers Windows processes); 3 (`fs.rs` on Windows re-exports `iocp::files`'s
+`write_atomically`, `rename`, `clone`, `set_mode` and `map`, so `Threads` and `Iocp` share one
+implementation; `files_end_as_on_threads` no longer special-cases the clone); 4 asked of the
+coordinator (core's request 7) and in docs/v2/plan/lanes/core/plane.md.
+
+> forwarded to coordinator: a lane's plan (`docs/v2/plan/lanes/core.md`) changes by request to the coordinator, not among the paths `requests` applies.

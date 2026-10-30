@@ -28,6 +28,7 @@ rustc-stable-hash = { version = "0.1.2", optional = true }
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = { version = "0.10", optional = true }
 toml = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
@@ -41,6 +42,7 @@ query = [
     "dep:blaze-query",
     "dep:blaze-source",
     "dep:rustc-stable-hash",
+    "dep:sha2",
     "dep:toml",
     "dep:url",
 ]

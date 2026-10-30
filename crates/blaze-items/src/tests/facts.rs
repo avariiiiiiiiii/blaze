@@ -256,7 +256,7 @@ fn closure(db: &TestDB, path: &str) -> InternedClosureId<'_> {
         .filter_map(|(expr, it)| match it {
             Expr::Closure { closure_kind, .. } => Some(InternedClosureId::new(
                 db,
-                InternedClosure { owner: owner.into(), expr, kind: *closure_kind },
+                InternedClosure { owner: owner.into(), expr, kind: closure_kind },
             )),
             _ => None,
         })

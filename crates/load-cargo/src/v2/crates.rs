@@ -2,6 +2,8 @@
 //! kind, origin and dependencies, as cargo passes them to rustc; and the workspace's root and
 //! `[workspace.metadata.blaze]`, read from its manifest through the mounts.
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 
 use base_db::{

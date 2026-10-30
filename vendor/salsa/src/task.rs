@@ -11,7 +11,10 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::sync::Mutex;
 use crate::sync::thread::{self, ThreadId};
+use crate::table::{PageIndex, Table};
+use crate::zalsa::IngredientIndex;
 use crate::zalsa_local::ZalsaLocal;
 
 static TASK_DEPTH: OnceLock<fn() -> usize> = OnceLock::new();
@@ -77,15 +80,37 @@ static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 /// [`Storage`](crate::Storage).
 pub(crate) struct TaskLocals {
     database: u64,
-    /// Cleared when the database is dropped, so other threads drop its entries.
-    alive: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 }
+
+/// What a database's entries on every thread share with it.
+#[derive(Default)]
+struct Shared {
+    /// Cleared when the database is dropped, so other threads drop its entries.
+    dropped: AtomicBool,
+    /// Pages that entries dropped with their thread allocated in and did not fill, for the
+    /// database to hand to its table at the next write.
+    unfilled: Mutex<Vec<(IngredientIndex, PageIndex)>>,
+}
+
+// A panic can't leave `unfilled` inconsistent: it is only extended and taken whole.
+impl std::panic::RefUnwindSafe for Shared {}
 
 struct Entry {
     database: u64,
     depth: u32,
-    alive: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     local: Box<ZalsaLocal>,
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if self.shared.dropped.load(Ordering::Acquire) {
+            return;
+        }
+        let mut unfilled = self.shared.unfilled.lock();
+        unfilled.extend(self.local.take_unfilled_pages());
+    }
 }
 
 crate::sync::thread_local! {
@@ -97,7 +122,15 @@ impl TaskLocals {
     pub(crate) fn new() -> Self {
         Self {
             database: NEXT_DATABASE.fetch_add(1, Ordering::Relaxed),
-            alive: Arc::new(AtomicBool::new(true)),
+            shared: Arc::default(),
+        }
+    }
+
+    /// Hands the pages of tasks whose thread ended to `table`, so later allocations fill them.
+    pub(crate) fn return_unfilled_pages(&mut self, table: &Table) {
+        let unfilled = std::mem::take(&mut *self.shared.unfilled.lock());
+        for (ingredient, page) in unfilled {
+            table.record_unfilled_page(ingredient, page);
         }
     }
 
@@ -117,7 +150,7 @@ impl TaskLocals {
         });
         // SAFETY: The `ZalsaLocal` is boxed, so it stays where it is while `ENTRIES` changes. It
         // is freed only when its database was dropped (`Drop for TaskLocals`, or the pruning in
-        // `insert` of entries whose `alive` is cleared), which needs `&mut` to the storage and so
+        // `insert` of entries whose `dropped` is set), which needs ownership of the storage and so
         // ends every `&self` borrow and every reference returned from it, or when this thread's
         // thread-locals are destroyed, after the thread ran its code. `ZalsaLocal` is `!Sync`, so
         // the reference does not leave this thread.
@@ -127,11 +160,11 @@ impl TaskLocals {
     #[cold]
     #[inline(never)]
     fn insert(&self, entries: &mut Vec<Entry>, depth: u32) -> *const ZalsaLocal {
-        entries.retain(|entry| entry.alive.load(Ordering::Acquire));
+        entries.retain(|entry| !entry.shared.dropped.load(Ordering::Acquire));
         entries.push(Entry {
             database: self.database,
             depth,
-            alive: self.alive.clone(),
+            shared: self.shared.clone(),
             local: Box::new(ZalsaLocal::new()),
         });
         let entry = entries.last().expect("an entry was just pushed");
@@ -141,7 +174,7 @@ impl TaskLocals {
 
 impl Drop for TaskLocals {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
+        self.shared.dropped.store(true, Ordering::Release);
         // Entries of other threads are dropped by those threads the next time they add one.
         // `try_with` fails only while this thread's thread-locals are being destroyed, which
         // drops the entries anyway.

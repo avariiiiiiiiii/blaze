@@ -153,6 +153,39 @@ pub fn implements_trait_unique_with_infcx<'db>(
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
 
     let args = create_args(&infcx);
+    trait_ref_holds(&infcx, env, trait_, args)
+}
+
+/// For each of `traits`, what [`implements_trait_unique`] answers for `ty`, from one interner
+/// and one inference context in the same typing mode. Each check runs in its own probe, which
+/// rolls back the universe, every variable table, region constraints and obligations and
+/// opaque types, so no check sees what another left.
+pub fn implements_traits_unique<'db>(
+    ty: Ty<'db>,
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    traits: &[TraitId],
+) -> Vec<bool> {
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    traits
+        .iter()
+        .map(|&trait_| {
+            infcx.probe(|_| {
+                let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
+                trait_ref_holds(&infcx, env, trait_, args)
+            })
+        })
+        .collect()
+}
+
+fn trait_ref_holds<'db>(
+    infcx: &InferCtxt<'db>,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    args: GenericArgs<'db>,
+) -> bool {
+    let interner = infcx.interner;
     let trait_ref = rustc_type_ir::TraitRef::new_from_args(interner, trait_.into(), args);
     if trait_ref.self_ty().is_ty_error() {
         return false;

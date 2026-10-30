@@ -37,6 +37,7 @@ use crate::query::{
 };
 use crate::{Filter, Intent};
 
+pub use self::summary::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 
 /// What a load step came to: its value, what it would read that no mount covers yet, or
@@ -49,7 +50,7 @@ pub(crate) enum Staged<T> {
 
 /// cargo's error as it prints it after `error: `: the message, then each cause after a blank
 /// line and `Caused by:`, indented two spaces.
-pub(crate) fn load_error(error: &anyhow::Error, at: Option<String>) -> LoadError {
+pub fn load_error(error: &anyhow::Error, at: Option<String>) -> LoadError {
     let mut what = error.to_string();
     for cause in error.chain().skip(1) {
         what.push_str("\n\nCaused by:");
@@ -153,7 +154,7 @@ fn view_spec(asked: &Asked, mounts: &[Mount]) -> Result<Spec, LoadError> {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
         let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
         match name {
-            "unstable-options" => {}
+            "unstable-options" | "bindeps" => {}
             "build-std" => build_std = Some(list()),
             "build-std-features" => build_std_features = Some(list()),
             _ => return Err(error(&format!("blaze does not read `-Z {name}` yet"))),

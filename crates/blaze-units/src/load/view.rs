@@ -14,6 +14,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::files::{Mounts, Snapshot};
+use super::summary::Read;
 use super::invocation::Asking;
 use super::manifest::{WorkspaceQuery, replay};
 use super::{Select, Staged, unmounted_error, view_spec};
@@ -47,8 +48,8 @@ pub struct ViewResolved<'a> {
     pub cli_features: &'a CliFeatures,
     pub behavior: ResolveBehavior,
     pub unification: FeatureUnification,
-    /// Every package of the resolve: its summary, its manifest and where that is.
-    pub summaries: &'a FxHashMap<PackageId, Summary>,
+    /// What was read of every package of the resolve, and its manifest and where that is.
+    pub reads: &'a FxHashMap<PackageId, Read>,
     pub manifests: &'a FxHashMap<PackageId, (&'a Path, &'a Manifest)>,
     /// The machine the build runs on.
     pub host: &'a str,
@@ -107,8 +108,6 @@ pub fn resolve_view<R>(
         super::resolve::resolved(cx, ctx, ws, &files, &spec, |_, resolved| {
             let member_summaries: Vec<&Summary> =
                 resolved.member_ids.iter().map(|id| &resolved.reads[id].summary).collect();
-            let summaries: FxHashMap<PackageId, Summary> =
-                resolved.reads.iter().map(|(id, read)| (*id, read.summary.clone())).collect();
             let warnings: Vec<String> = read.warnings.iter().chain(&resolved.warnings).cloned().collect();
             let view = ViewResolved {
                 ws,
@@ -124,7 +123,7 @@ pub fn resolve_view<R>(
                 cli_features: &resolved.cli_features,
                 behavior: resolved.behavior,
                 unification: resolved.unification,
-                summaries: &summaries,
+                reads: &resolved.reads,
                 manifests: &resolved.manifests,
                 host: &spec.host,
                 warnings: &warnings,

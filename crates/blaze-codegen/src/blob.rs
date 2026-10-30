@@ -14,7 +14,7 @@ use crate::{
     template::{Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateReloc, TemplateUnwind},
 };
 
-const TEMPLATE_MAGIC: [u8; 4] = *b"BZT1";
+const TEMPLATE_MAGIC: [u8; 4] = *b"BZT2";
 const STATIC_MAGIC: [u8; 4] = *b"BZS1";
 
 /// Why bytes are not a template.
@@ -77,6 +77,10 @@ impl Out {
                     self.u8(2);
                     self.id(&anchor);
                     self.u32(index);
+                }
+                Ref::Extern(at) => {
+                    self.u8(3);
+                    self.u32(at);
                 }
             }
         }
@@ -198,6 +202,7 @@ impl<'a> In<'a> {
                 0 => Ref::Place(self.u32()?),
                 1 => Ref::Data(self.u32()?),
                 2 => Ref::Position(SpanRef { anchor: self.id()?, index: self.u32()? }),
+                3 => Ref::Extern(self.u32()?),
                 _ => return self.fail("no such reference"),
             };
             relocs.push(TemplateReloc { at, kind, target, addend });
@@ -296,6 +301,10 @@ pub fn encode(template: &Template) -> Vec<u8> {
     out.unwind(template.unwind.as_ref());
     out.lines(&template.lines);
     out.u32(template.refs);
+    out.len(template.externs.len());
+    for name in &template.externs {
+        out.bytes(name.as_bytes());
+    }
     out.0
 }
 
@@ -319,8 +328,16 @@ pub fn decode(bytes: &[u8]) -> Result<Template, BlobError> {
     let unwind = input.unwind()?;
     let lines = input.lines()?;
     let refs = input.u32()?;
+    let count = input.count(4)?;
+    let mut externs = Vec::with_capacity(count);
+    for _ in 0..count {
+        match String::from_utf8(input.bytes()?) {
+            Ok(name) => externs.push(name),
+            Err(_) => return input.fail("a symbol name that is not UTF-8"),
+        }
+    }
     input.end()?;
-    Ok(Template { arch, align, code, relocs, data, inlined, side, unwind, lines, refs })
+    Ok(Template { arch, align, code, relocs, data, inlined, side, unwind, lines, refs, externs })
 }
 
 pub fn encode_static(template: &StaticTemplate) -> Vec<u8> {
@@ -475,6 +492,7 @@ mod tests {
                 reloc(Ref::Place(2)),
                 reloc(Ref::Data(0)),
                 reloc(Ref::Position(SpanRef { anchor: ContentId([4; 32]), index: 9 })),
+                reloc(Ref::Extern(0)),
             ],
             data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![reloc(Ref::Place(0))] }],
             inlined: vec![CodeHash(ContentId([5; 32]))],
@@ -490,6 +508,7 @@ mod tests {
             }),
             lines: vec![Line { at: 4, span: SpanRef { anchor: ContentId([7; 32]), index: 3 } }],
             refs: 3,
+            externs: vec!["bcmp".to_owned()],
         }
     }
 

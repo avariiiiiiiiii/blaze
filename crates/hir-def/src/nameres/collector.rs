@@ -3,7 +3,12 @@
 //! `DefCollector::collect` contains the fixed-point iteration loop which
 //! resolves imports and expands macros.
 
-use std::{iter, mem, ops::Range};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, hash_map::Entry},
+    iter, mem,
+    ops::Range,
+};
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, LangCrateOrigin, SourceDatabase};
 use cfg::{CfgAtom, CfgExpr, CfgOptions};

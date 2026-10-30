@@ -108,3 +108,92 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
 "Preallocate"). The `Cargo.toml` is yours, so they can't add the lines themselves.
 
 > forwarded to codegen: `crates/hir-ty-codegen/Cargo.toml` is lane codegen's own; both are root workspace dependencies already (`bumpalo`, `smallvec`), so nothing is needed from the root.
+
+## From speed-backend-debug (per-function costs on v2's Cranelift path)
+
+1. **`v2/backend.rs` `compiled`: reuse one Cranelift `Context` per thread.** Today every unit
+   builds `cranelift_codegen::Context::for_function(func)`, so each compile allocates a fresh
+   control-flow graph, dominator tree, loop analysis, `CompiledCode` buffers and, the largest,
+   the register allocator's context (`Context::regalloc_ctx`, a `regalloc2::Ctx` that Cranelift
+   keeps across functions only when the `Context` is reused; its doc: "should be reused for
+   compiling multiple functions in order to avoid needless allocator thrashing"). Wasmtime keeps
+   one per worker. Exact change: a `thread_local!(static CONTEXT: RefCell<Context> = ...)`;
+   in `compiled`, borrow it, `ctx.clear()`, `ctx.func = func`, run what runs today
+   (`float_pair::lower`, `crate::emit`, `SlotPlaces::of_frame`, `pairs.hold`), and leave the
+   `Context` in the slot (no `clear` needed after: the next unit clears). Same bytes: a cleared
+   `Context` compiles exactly as a new one. A unit's code still comes out as an owned `Code`.
+2. **`v2/unwind.rs` `convert`/`Entry::of`: the CIE is written and parsed again for every
+   function.** For each function it calls `isa.create_systemv_cie()` (a `Vec` of instructions),
+   builds a `FrameTable`, writes a whole `.eh_frame` (CIE and FDE) through gimli, parses it back
+   and `to_vec()`s both the CIE (the same bytes for every function of the ISA) and the FDE.
+   Exact change: compute the CIE half once per process (`OnceLock<(code_align, data_align,
+   return_address, cie: Vec<u8>)>`, from one `Entry::of` with an empty FDE, as
+   `an_entry_does_not_depend_on_the_length_of_the_code` already shows is valid) and keep only
+   the FDE per function. If you want the FDE without gimli's table at all, I can add
+   `FunctionUnwind::v2_fde(&self, code_align: u32, data_align: i32, out: &mut Vec<u8>)` in
+   `unwind.rs` (mine), writing the call frame instructions directly, differential-tested
+   against gimli's bytes: say so in my window (`speed-backend-debug`) and I'll write it.
+   Also `landing_pads.map(|pads| Data::new(4, pads.to_vec(), ..))` copies the LSDA; it can
+   move out if `convert` takes the `FunctionUnwind` by value.
+3. **For your information, no action needed:** `FunctionUnwind::of` now gives no
+   `.gcc_except_table` entry (`landing_pads: None`) to a function none of whose calls has a
+   handler, as LLVM writes none for such a function of rustc's: an unwind through every call
+   goes on to the caller either way, and the personality is not asked. `convert` already makes
+   such a function's `Unwind::Dwarf { personality: None, lsda: None }`; the personality stays
+   among the refs any function may name (`refs.rs` `outside`), just unused by it. The LSDA of a
+   function that has handlers is byte-for-byte what it was (`unwind/lsda.rs`, tested against
+   the old writer).
+4. **Target features for dev builds** (hardware.md: "target features of the machine it runs
+   on for dev builds"). `check_spec` refuses Cranelift units with `toolchain.features`, which is
+   right until the ISA honors them. When the lead's plan fills `Toolchain::features` with the
+   host's for dev (filed in `v2/requests/codegen.md`, "From speed-backend-debug"), `check_spec`
+   should compare `toolchain.features` with the process's selected features (as it compares
+   `cpu`) instead of refusing them, and `crate::target()` builds its ISA with them. The
+   `target.rs` side (rustc feature names to Cranelift's `has_*` flags, with rustc's
+   implications, and an error for a `-feature` that would change the float ABI) is mine to
+   write once the plan selects them; tell me in window `speed-backend-debug`.
+
+## From speed-backend-lower (`crates/hir-ty-codegen/mod.rs`)
+
+1. **`v2/refs/intrinsics.rs:216` does not build until this lands.** `FunctionCx::layout` now
+   lends the layout (`fn layout(&self, ty: Ty<'db>) -> Result<&'cx Layout>`) out of a per-compile
+   table instead of cloning the query's `Arc` (a write to a shared refcount per place and
+   operand, concurrency.md). Exact change:
+
+   ```rust
+   fn ty_layout(&self, ty: Ty<'db>) -> Result<&'cx Layout, String> {
+       self.fx.layout(ty).map_err(told)
+   }
+   ```
+
+   and drop `use triomphe::Arc;` (line 30; nothing else in the file uses it). Every other
+   `fx.layout` caller in `v2/` already builds with the reference.
+2. **`v2/backend.rs` `compiled`: use `crate::with_context`**, the per-thread `Context` pool in
+   `crates/hir-ty-codegen/spare.rs` that `build` already draws from (item 1 of
+   speed-backend-debug's section above, written once for both). Exact change: replace
+   `let mut context = cranelift_codegen::Context::for_function(func);` and the body after it
+   with
+
+   ```rust
+   crate::with_context(func, |context| {
+       let pairs = crate::float_pair::lower(&mut context.func);
+       let mut code = crate::emit(context).map_err(|e| failed(unit, e))?;
+       if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
+           code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
+       }
+       if let Some(pairs) = pairs {
+           pairs.hold(context, &mut code).map_err(|e| failed(unit, e))?;
+       }
+       Ok(code)
+   })
+   ```
+
+   (`pairs.hold` takes `&Context`; pass `context` where it took `&context`.) Same bytes: a
+   cleared `Context` compiles as a new one (`spare.rs` and `mod.rs` tests
+   `a_kept_context_compiles_what_a_fresh_one_does`). A function larger than `SINGLE_PASS`
+   instructions drops its context instead of keeping it, so one huge function doesn't pin its
+   capacity on the thread.
+3. **For your information:** `crate::emit` is now v2's compile with no Cranelift incremental
+   cache (the v2 memo already keys the shape of the IR; the cache was a second serialization
+   and hash of the whole function and a lookup in v1's store). v1's `Backend::emit` gets
+   `emit_cached`.

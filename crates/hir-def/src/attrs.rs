@@ -14,6 +14,12 @@
 //!
 //! Documentation (doc comments and `#[doc = "..."]` attributes) is handled by the [`docs`]
 //! submodule.
+//!
+//! Reading flags costs one walk of an item's attributes, once per item (the query is cached).
+//! Each attribute's name is found in a static index ([`word`]): a hash of its length and three of
+//! its bytes, one probe on average and one byte compare, never a `String` built. A value query
+//! (`lang`, `repr`, `export_name`, ...) runs only for an item whose flag says it has the
+//! attribute.
 
 use std::{convert::Infallible, iter::Peekable, ops::ControlFlow};
 
@@ -22,7 +28,7 @@ use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
     InFile, Lookup,
-    attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
+    attrs::{AstKeyValueMetaExt, expand_cfg_attr},
     mod_path::{ModPath, PathKind},
     name::Name,
 };
@@ -62,21 +68,41 @@ fn attrs_from_ast_id_loc<N: AstNode + Into<ast::AnyHasAttrs>>(
     (source.map(|it| it.into()), krate)
 }
 
+/// The flags of a `#[doc(...)]`: the atoms [`DocAtom::parse`] reads, stepped through the same
+/// way, without building them.
 #[inline]
 fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-    for atom in DocAtom::parse(tt) {
-        match atom {
-            DocAtom::Flag(flag) => match &*flag {
+    let mut iter = TokenTreeChildren::new(&tt).peekable();
+    while let Some(child) = iter.next() {
+        let NodeOrToken::Token(name) = child else { continue };
+        if !name.kind().is_any_identifier() {
+            continue;
+        }
+        let name = name.text();
+        match iter.peek() {
+            Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
+                iter.next();
+                let Some(NodeOrToken::Token(value)) = iter.next() else { continue };
+                let flag = match name {
+                    "alias" => AttrFlags::HAS_DOC_ALIASES,
+                    "keyword" => AttrFlags::HAS_DOC_KEYWORD,
+                    _ => continue,
+                };
+                if ast::String::cast(value).is_some_and(|it| it.value().is_ok()) {
+                    attr_flags.insert(flag);
+                }
+            }
+            Some(NodeOrToken::Node(_)) => {
+                if name == "alias" {
+                    iter.next();
+                    attr_flags.insert(AttrFlags::HAS_DOC_ALIASES);
+                }
+            }
+            _ => match name {
                 "notable_trait" => attr_flags.insert(AttrFlags::IS_DOC_NOTABLE_TRAIT),
                 "hidden" => attr_flags.insert(AttrFlags::IS_DOC_HIDDEN),
                 _ => {}
             },
-            DocAtom::KeyValue { key, value: _ } => match &*key {
-                "alias" => attr_flags.insert(AttrFlags::HAS_DOC_ALIASES),
-                "keyword" => attr_flags.insert(AttrFlags::HAS_DOC_KEYWORD),
-                _ => {}
-            },
-            DocAtom::Alias(_) => attr_flags.insert(AttrFlags::HAS_DOC_ALIASES),
         }
     }
 }
@@ -133,186 +159,387 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
     match attr {
         ast::Meta::CfgMeta(_) => attr_flags.insert(AttrFlags::HAS_CFG),
         ast::Meta::KeyValueMeta(attr) => {
-            let Some(key) = attr.path().as_one_segment() else { return ControlFlow::Continue(()) };
-            match &*key {
-                "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
-                "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
-                "lang" => attr_flags.insert(AttrFlags::LANG_ITEM),
-                "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
-                "path" => attr_flags.insert(AttrFlags::HAS_PATH),
-                "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
-                "rustc_reservation_impl" => attr_flags.insert(AttrFlags::RUSTC_RESERVATION_IMPL),
-                "export_name" => {
-                    if let Some(value) = attr.value_string()
-                        && *value == *"main"
-                    {
+            let Some(key) = attr.path().and_then(|path| path.as_single_name_ref()) else {
+                return ControlFlow::Continue(());
+            };
+            let flag = match word(name_text(&key)) {
+                Some(Word::deprecated) => AttrFlags::IS_DEPRECATED,
+                Some(Word::ignore) => AttrFlags::IS_IGNORE,
+                Some(Word::lang) => AttrFlags::LANG_ITEM,
+                Some(Word::must_use) => AttrFlags::IS_MUST_USE,
+                Some(Word::path) => AttrFlags::HAS_PATH,
+                Some(Word::unstable) => AttrFlags::IS_UNSTABLE,
+                Some(Word::rustc_reservation_impl) => AttrFlags::RUSTC_RESERVATION_IMPL,
+                Some(Word::export_name) => {
+                    if string_value_is(&attr, "main") {
                         attr_flags.insert(AttrFlags::IS_EXPORT_NAME_MAIN);
                     }
+                    AttrFlags::HAS_EXPORT_NAME
                 }
-                _ => {}
-            }
+                Some(Word::link_name) => AttrFlags::HAS_LINK_NAME,
+                Some(Word::link_section) => AttrFlags::HAS_LINK_SECTION,
+                Some(Word::linkage) => AttrFlags::HAS_LINKAGE,
+                Some(Word::rustc_diagnostic_item) => AttrFlags::HAS_DIAGNOSTIC_ITEM,
+                _ => return ControlFlow::Continue(()),
+            };
+            attr_flags.insert(flag);
         }
         ast::Meta::TokenTreeMeta(attr) => {
             let (Some((first_segment, second_segment)), Some(tt)) =
-                (attr.path().as_up_to_two_segment(), attr.token_tree())
+                (attr.path().as_ref().and_then(up_to_two_segments), attr.token_tree())
             else {
                 return ControlFlow::Continue(());
             };
+            let first = word(name_text(&first_segment));
             match second_segment {
-                None => match &*first_segment {
-                    "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
-                    "used" => attr_flags.insert(AttrFlags::USED),
-                    "inline" if !tt.syntax().text().contains_char('n') => {
-                        attr_flags.insert(AttrFlags::IS_INLINE);
-                        if tt.syntax().text().to_string().contains("always") {
-                            attr_flags.insert(AttrFlags::INLINE_ALWAYS)
+                None => match first {
+                    Some(Word::deprecated) => attr_flags.insert(AttrFlags::IS_DEPRECATED),
+                    Some(Word::used) => attr_flags.insert(AttrFlags::USED),
+                    Some(Word::inline) => {
+                        if !tt.syntax().text().contains_char('n') {
+                            attr_flags.insert(AttrFlags::IS_INLINE);
+                            if tt_has_token(&tt, "always") {
+                                attr_flags.insert(AttrFlags::INLINE_ALWAYS)
+                            }
+                        } else if tt_has_token(&tt, "never") {
+                            attr_flags.insert(AttrFlags::INLINE_NEVER)
                         }
                     }
-                    "inline" if tt.syntax().text().to_string().contains("never") => {
-                        attr_flags.insert(AttrFlags::INLINE_NEVER)
+                    Some(Word::doc) => extract_doc_tt_attr(attr_flags, tt),
+                    Some(Word::repr | Word::rustc_scalable_vector) => {
+                        attr_flags.insert(AttrFlags::HAS_REPR)
                     }
-                    "doc" => extract_doc_tt_attr(attr_flags, tt),
-                    "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
-                    "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
-                    "proc_macro_derive" | "rustc_builtin_macro" => {
+                    Some(Word::target_feature) => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
+                    Some(Word::proc_macro_derive | Word::rustc_builtin_macro) => {
                         attr_flags.insert(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO)
                     }
-                    "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
-                    "rustc_layout_scalar_valid_range_start"
-                    | "rustc_layout_scalar_valid_range_end" => {
-                        attr_flags.insert(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE)
-                    }
-                    "rustc_legacy_const_generics" => {
+                    Some(Word::unstable) => attr_flags.insert(AttrFlags::IS_UNSTABLE),
+                    Some(
+                        Word::rustc_layout_scalar_valid_range_start
+                        | Word::rustc_layout_scalar_valid_range_end,
+                    ) => attr_flags.insert(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE),
+                    Some(Word::rustc_legacy_const_generics) => {
                         attr_flags.insert(AttrFlags::HAS_LEGACY_CONST_GENERICS)
                     }
-                    "rustc_skip_during_method_dispatch" => {
+                    Some(Word::rustc_skip_during_method_dispatch) => {
                         extract_rustc_skip_during_method_dispatch(attr_flags, tt)
                     }
-                    "rustc_deprecated_safe_2024" => {
+                    Some(Word::rustc_deprecated_safe_2024) => {
                         attr_flags.insert(AttrFlags::RUSTC_DEPRECATED_SAFE_2024)
                     }
-                    "rustc_must_implement_one_of" => {
+                    Some(Word::rustc_must_implement_one_of) => {
                         attr_flags.insert(AttrFlags::HAS_RUSTC_MUST_IMPLEMENT_ONE_OF)
                     }
                     _ => {}
                 },
-                Some(second_segment) => match &*first_segment {
-                    "rust_analyzer" => match &*second_segment {
-                        "completions" => extract_ra_completions(attr_flags, tt),
-                        "macro_style" => extract_ra_macro_style(attr_flags, tt),
-                        "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
-                        _ => {}
-                    },
-                    _ => {}
-                },
+                Some(second_segment) => {
+                    if first == Some(Word::rust_analyzer) {
+                        match word(name_text(&second_segment)) {
+                            Some(Word::completions) => extract_ra_completions(attr_flags, tt),
+                            Some(Word::macro_style) => extract_ra_macro_style(attr_flags, tt),
+                            Some(Word::define_opaque) => {
+                                attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         ast::Meta::PathMeta(attr) => {
-            let is_test = attr.path().is_some_and(|path| {
-                let Some(segment1) = (|| path.segment()?.name_ref())() else { return false };
-                let segment2 = path.qualifier();
-                let segment3 = segment2.as_ref().and_then(|it| it.qualifier());
+            let Some(path) = attr.path() else { return ControlFlow::Continue(()) };
+            let segment1 = path.segment().and_then(|it| it.name_ref());
+            let qualifier = path.qualifier();
+            if let Some(segment1) = &segment1
+                && segment1.text() == "test"
+            {
+                let segment3 = qualifier.as_ref().and_then(|it| it.qualifier());
                 let segment4 = segment3.as_ref().and_then(|it| it.qualifier());
                 let segment3 = segment3.and_then(|it| it.segment()?.name_ref());
                 let segment4 = segment4.and_then(|it| it.segment()?.name_ref());
-                segment1.text() == "test"
-                    && segment3.is_none_or(|it| it.text() == "prelude")
+                if segment3.is_none_or(|it| it.text() == "prelude")
                     && segment4.is_none_or(|it| matches!(it.text(), "core" | "std"))
-            });
-            if is_test {
-                attr_flags.insert(AttrFlags::IS_TEST);
+                {
+                    attr_flags.insert(AttrFlags::IS_TEST);
+                }
             }
 
-            let Some((first_segment, second_segment)) = attr.path().as_up_to_two_segment() else {
+            let Some(this) = segment1 else { return ControlFlow::Continue(()) };
+            let parent = qualifier.as_ref().and_then(|it| it.as_single_name_ref());
+            let Some(parent) = parent else {
+                // One segment, or three and more read by their last, as `as_up_to_two_segment`
+                // reads them; the flags `has_word` answers by are set for one segment only.
+                let single = qualifier.is_none();
+                let flag = match word(name_text(&this)) {
+                    Some(Word::rustc_has_incoherent_inherent_impls) => {
+                        AttrFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS
+                    }
+                    Some(Word::rustc_allow_incoherent_impl) => {
+                        AttrFlags::RUSTC_ALLOW_INCOHERENT_IMPL
+                    }
+                    Some(Word::rustc_scalable_vector) => AttrFlags::HAS_REPR,
+                    Some(Word::fundamental) => AttrFlags::FUNDAMENTAL,
+                    Some(Word::no_std) => AttrFlags::IS_NO_STD,
+                    Some(Word::may_dangle) => AttrFlags::MAY_DANGLE,
+                    Some(Word::rustc_paren_sugar) => AttrFlags::RUSTC_PAREN_SUGAR,
+                    Some(Word::rustc_coinductive) => AttrFlags::RUSTC_COINDUCTIVE,
+                    Some(Word::rustc_force_inline) => AttrFlags::RUSTC_FORCE_INLINE,
+                    Some(Word::rustc_promotable) => AttrFlags::RUSTC_PROMOTABLE,
+                    Some(Word::rustc_pass_indirectly_in_non_rustic_abis) => {
+                        AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS
+                    }
+                    Some(Word::unstable) => AttrFlags::IS_UNSTABLE,
+                    Some(Word::deprecated) => AttrFlags::IS_DEPRECATED,
+                    Some(Word::macro_export) => AttrFlags::IS_MACRO_EXPORT,
+                    Some(Word::must_use) => AttrFlags::IS_MUST_USE,
+                    Some(Word::no_mangle) => AttrFlags::NO_MANGLE,
+                    Some(Word::rustc_std_internal_symbol) => AttrFlags::LINKED_BY_NAME,
+                    Some(Word::panic_handler) if single => {
+                        AttrFlags::LINKED_BY_NAME | AttrFlags::PANIC_HANDLER
+                    }
+                    Some(Word::panic_handler) => AttrFlags::LINKED_BY_NAME,
+                    Some(Word::used) => AttrFlags::USED,
+                    Some(Word::track_caller) => AttrFlags::TRACK_CALLER,
+                    Some(Word::inline) => AttrFlags::IS_INLINE,
+                    Some(Word::rustc_inherit_overflow_checks) => {
+                        AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS
+                    }
+                    Some(Word::thread_local) => AttrFlags::THREAD_LOCAL,
+                    Some(Word::pointee) => AttrFlags::IS_POINTEE,
+                    Some(Word::non_exhaustive) => AttrFlags::NON_EXHAUSTIVE,
+                    Some(Word::ignore) => AttrFlags::IS_IGNORE,
+                    Some(Word::bench) => AttrFlags::IS_BENCH,
+                    Some(Word::rustc_const_panic_str) => AttrFlags::RUSTC_CONST_PANIC_STR,
+                    Some(Word::rustc_intrinsic) => AttrFlags::RUSTC_INTRINSIC,
+                    Some(Word::rustc_safe_intrinsic) => AttrFlags::RUSTC_SAFE_INTRINSIC,
+                    Some(Word::rustc_intrinsic_must_be_overridden) => {
+                        AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN
+                    }
+                    Some(Word::rustc_allocator) => AttrFlags::RUSTC_ALLOCATOR,
+                    Some(Word::rustc_deallocator) => AttrFlags::RUSTC_DEALLOCATOR,
+                    Some(Word::rustc_reallocator) => AttrFlags::RUSTC_REALLOCATOR,
+                    Some(Word::rustc_allocator_zeroed) => AttrFlags::RUSTC_ALLOCATOR_ZEROED,
+                    Some(Word::rustc_reservation_impl) => AttrFlags::RUSTC_RESERVATION_IMPL,
+                    Some(Word::rustc_deprecated_safe_2024) => AttrFlags::RUSTC_DEPRECATED_SAFE_2024,
+                    Some(Word::rustc_skip_array_during_method_dispatch) => {
+                        AttrFlags::RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH
+                    }
+                    Some(Word::rustc_nounwind) if single => AttrFlags::RUSTC_NOUNWIND,
+                    Some(Word::rustc_comptime) if single => AttrFlags::RUSTC_COMPTIME,
+                    _ => return ControlFlow::Continue(()),
+                };
+                attr_flags.insert(flag);
                 return ControlFlow::Continue(());
             };
-            match second_segment {
-                None => match &*first_segment {
-                    "rustc_has_incoherent_inherent_impls" => {
-                        attr_flags.insert(AttrFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
-                    }
-                    "rustc_allow_incoherent_impl" => {
-                        attr_flags.insert(AttrFlags::RUSTC_ALLOW_INCOHERENT_IMPL)
-                    }
-                    "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
-                    "fundamental" => attr_flags.insert(AttrFlags::FUNDAMENTAL),
-                    "no_std" => attr_flags.insert(AttrFlags::IS_NO_STD),
-                    "may_dangle" => attr_flags.insert(AttrFlags::MAY_DANGLE),
-                    "rustc_paren_sugar" => attr_flags.insert(AttrFlags::RUSTC_PAREN_SUGAR),
-                    "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
-                    "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
-                    "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
-                    "rustc_pass_indirectly_in_non_rustic_abis" => {
-                        attr_flags.insert(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
-                    }
-                    "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
-                    "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
-                    "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
-                    "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
-                    "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
-                    "rustc_std_internal_symbol" | "panic_handler" => {
-                        attr_flags.insert(AttrFlags::LINKED_BY_NAME)
-                    }
-                    "used" => attr_flags.insert(AttrFlags::USED),
-                    "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
-                    "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
-                    "rustc_inherit_overflow_checks" => {
-                        attr_flags.insert(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
-                    }
-                    "thread_local" => attr_flags.insert(AttrFlags::THREAD_LOCAL),
-                    "pointee" => attr_flags.insert(AttrFlags::IS_POINTEE),
-                    "non_exhaustive" => attr_flags.insert(AttrFlags::NON_EXHAUSTIVE),
-                    "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
-                    "bench" => attr_flags.insert(AttrFlags::IS_BENCH),
-                    "rustc_const_panic_str" => attr_flags.insert(AttrFlags::RUSTC_CONST_PANIC_STR),
-                    "rustc_intrinsic" => attr_flags.insert(AttrFlags::RUSTC_INTRINSIC),
-                    "rustc_safe_intrinsic" => attr_flags.insert(AttrFlags::RUSTC_SAFE_INTRINSIC),
-                    "rustc_intrinsic_must_be_overridden" => {
-                        attr_flags.insert(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN)
-                    }
-                    "rustc_allocator" => attr_flags.insert(AttrFlags::RUSTC_ALLOCATOR),
-                    "rustc_deallocator" => attr_flags.insert(AttrFlags::RUSTC_DEALLOCATOR),
-                    "rustc_reallocator" => attr_flags.insert(AttrFlags::RUSTC_REALLOCATOR),
-                    "rustc_allocator_zeroed" => {
-                        attr_flags.insert(AttrFlags::RUSTC_ALLOCATOR_ZEROED)
-                    }
-                    "rustc_reservation_impl" => {
-                        attr_flags.insert(AttrFlags::RUSTC_RESERVATION_IMPL)
-                    }
-                    "rustc_deprecated_safe_2024" => {
-                        attr_flags.insert(AttrFlags::RUSTC_DEPRECATED_SAFE_2024)
-                    }
-                    "rustc_skip_array_during_method_dispatch" => {
-                        attr_flags.insert(AttrFlags::RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH)
-                    }
-                    _ => {}
-                },
-                Some(second_segment) => match &*first_segment {
-                    "rust_analyzer" => match &*second_segment {
-                        "skip" => attr_flags.insert(AttrFlags::RUST_ANALYZER_SKIP),
-                        "prefer_underscore_import" => {
-                            attr_flags.insert(AttrFlags::PREFER_UNDERSCORE_IMPORT)
-                        }
-                        _ => {}
-                    },
-                    "diagnostic" => match &*second_segment {
-                        "do_not_recommend" => {
-                            attr_flags.insert(AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND)
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
-            }
+            let flag = match (word(name_text(&parent)), word(name_text(&this))) {
+                (Some(Word::rust_analyzer), Some(Word::skip)) => AttrFlags::RUST_ANALYZER_SKIP,
+                (Some(Word::rust_analyzer), Some(Word::prefer_underscore_import)) => {
+                    AttrFlags::PREFER_UNDERSCORE_IMPORT
+                }
+                (Some(Word::diagnostic), Some(Word::do_not_recommend)) => {
+                    AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND
+                }
+                _ => return ControlFlow::Continue(()),
+            };
+            attr_flags.insert(flag);
         }
         _ => {}
     };
     ControlFlow::Continue(())
 }
 
+/// The text of a path segment, `r#` stripped, as `AstPathExt` reads it.
+#[inline]
+fn name_text(name: &ast::NameRef) -> &str {
+    let text = name.text();
+    text.strip_prefix("r#").unwrap_or(text)
+}
+
+/// The path's last segment and, when its qualifier is one segment, that qualifier first:
+/// `AstPathExt::as_up_to_two_segment` without building a string.
+#[inline]
+fn up_to_two_segments(path: &ast::Path) -> Option<(ast::NameRef, Option<ast::NameRef>)> {
+    let parent = path.qualifier().and_then(|it| it.as_single_name_ref());
+    let this = path.segment()?.name_ref()?;
+    Some(match parent {
+        Some(parent) => (parent, Some(this)),
+        None => (this, None),
+    })
+}
+
+/// Whether the path is the one segment `name`: `AstPathExt::is1` without building a string.
+#[inline]
+fn path_is(path: Option<ast::Path>, name: &str) -> bool {
+    path.is_some_and(|it| is_one(&it, name))
+}
+
+/// [`path_is`] of a path at hand.
+#[inline]
+fn is_one(path: &ast::Path, name: &str) -> bool {
+    path.as_single_name_ref().is_some_and(|it| name_text(&it) == name)
+}
+
+/// Whether the token tree has a token `text` among its direct children.
+fn tt_has_token(tt: &ast::TokenTree, text: &str) -> bool {
+    TokenTreeChildren::new(tt).any(|it| matches!(it, NodeOrToken::Token(it) if it.text() == text))
+}
+
+/// Whether a key-value attribute's value is the string literal `text`: `value_string` without
+/// building a string.
+fn string_value_is(attr: &ast::KeyValueMeta, text: &str) -> bool {
+    if let Some(ast::Expr::Literal(value)) = attr.expr()
+        && let ast::LiteralKind::String(value) = value.kind()
+    {
+        value.value().is_ok_and(|it| *it == *text)
+    } else {
+        false
+    }
+}
+
+macro_rules! words {
+    ($($word:ident),* $(,)?) => {
+        /// An attribute name the flags or the value queries read, as a `u8` tag.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[allow(non_camel_case_types)]
+        #[repr(u8)]
+        enum Word {
+            $($word,)*
+        }
+
+        /// Each [`Word`]'s text, at its tag's index.
+        const WORDS: &[(&str, Word)] = &[$((stringify!($word), Word::$word),)*];
+    };
+}
+
+words![
+    bench,
+    completions,
+    define_opaque,
+    deprecated,
+    diagnostic,
+    do_not_recommend,
+    doc,
+    export_name,
+    fundamental,
+    ignore,
+    inline,
+    lang,
+    link_name,
+    link_section,
+    linkage,
+    macro_export,
+    macro_style,
+    may_dangle,
+    must_use,
+    no_mangle,
+    no_std,
+    non_exhaustive,
+    panic_handler,
+    path,
+    pointee,
+    prefer_underscore_import,
+    proc_macro_derive,
+    repr,
+    rust_analyzer,
+    rustc_allocator,
+    rustc_allocator_zeroed,
+    rustc_allow_incoherent_impl,
+    rustc_builtin_macro,
+    rustc_coinductive,
+    rustc_comptime,
+    rustc_const_panic_str,
+    rustc_deallocator,
+    rustc_deprecated_safe_2024,
+    rustc_diagnostic_item,
+    rustc_force_inline,
+    rustc_has_incoherent_inherent_impls,
+    rustc_inherit_overflow_checks,
+    rustc_intrinsic,
+    rustc_intrinsic_must_be_overridden,
+    rustc_layout_scalar_valid_range_end,
+    rustc_layout_scalar_valid_range_start,
+    rustc_legacy_const_generics,
+    rustc_must_implement_one_of,
+    rustc_nounwind,
+    rustc_paren_sugar,
+    rustc_pass_indirectly_in_non_rustic_abis,
+    rustc_promotable,
+    rustc_reallocator,
+    rustc_reservation_impl,
+    rustc_safe_intrinsic,
+    rustc_scalable_vector,
+    rustc_skip_array_during_method_dispatch,
+    rustc_skip_during_method_dispatch,
+    rustc_std_internal_symbol,
+    skip,
+    target_feature,
+    thread_local,
+    track_caller,
+    unstable,
+    used,
+];
+
+/// Slots of [`WORD_INDEX`]: a power of two, at least three times the words, so a probe
+/// sequence stays short.
+const WORD_SLOTS: usize = 256;
+const _: () = assert!(WORDS.len() * 3 <= WORD_SLOTS && WORDS.len() < u8::MAX as usize);
+
+/// Where a name's probe sequence in [`WORD_INDEX`] starts: a multiplicative hash of its length,
+/// its first, middle and last bytes and the one before the last. Constant time whatever the
+/// length; the names that share a `rustc_` prefix differ in the others.
+#[inline]
+const fn word_slot(name: &[u8]) -> usize {
+    let len = name.len();
+    if len == 0 {
+        return 0;
+    }
+    let key = len as u64
+        | (name[0] as u64) << 8
+        | (name[len / 2] as u64) << 16
+        | (name[len - 1] as u64) << 24
+        | (name[len.saturating_sub(2)] as u64) << 32;
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WORD_SLOTS.trailing_zeros())) as usize
+}
+
+/// An open-addressed index over [`WORDS`], built at compile time: slot `i` holds one plus the
+/// index of the word whose linear probe sequence ended there, 0 when empty. 256 bytes, one cache
+/// line pair of it read per lookup.
+static WORD_INDEX: [u8; WORD_SLOTS] = {
+    let mut index = [0u8; WORD_SLOTS];
+    let mut i = 0;
+    while i < WORDS.len() {
+        let mut slot = word_slot(WORDS[i].0.as_bytes());
+        while index[slot] != 0 {
+            slot = (slot + 1) & (WORD_SLOTS - 1);
+        }
+        index[slot] = i as u8 + 1;
+        i += 1;
+    }
+    index
+};
+
+/// The [`Word`] a name is, if any: one hash, then a length and a byte compare per probed slot.
+#[inline]
+fn word(name: &str) -> Option<Word> {
+    let name = name.as_bytes();
+    let mut slot = word_slot(name);
+    loop {
+        let entry = WORD_INDEX[slot];
+        if entry == 0 {
+            return None;
+        }
+        let (text, word) = WORDS[usize::from(entry - 1)];
+        if text.as_bytes() == name {
+            return Some(word);
+        }
+        slot = (slot + 1) & (WORD_SLOTS - 1);
+    }
+}
+
 bitflags::bitflags! {
+    /// One word per item, field or generic parameter: 16 bytes, read with one bit test.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct AttrFlags: u64 {
+    pub struct AttrFlags: u128 {
         const RUST_ANALYZER_SKIP = 1 << 0;
 
         const LANG_ITEM = 1 << 1;
@@ -397,8 +624,28 @@ bitflags::bitflags! {
         /// `#[rustc_std_internal_symbol]` or `#[panic_handler]`: a function a declaration of
         /// another crate links to by its name.
         const LINKED_BY_NAME = 1 << 63;
+
+        // The flags below gate a value query, so an item without the attribute never runs it.
+        /// `#[export_name = ..]`: [`AttrFlags::export_name`].
+        const HAS_EXPORT_NAME = 1 << 64;
+        /// `#[link_name = ..]`: [`AttrFlags::link_name`].
+        const HAS_LINK_NAME = 1 << 65;
+        /// `#[link_section = ..]`: [`AttrFlags::link_section`].
+        const HAS_LINK_SECTION = 1 << 66;
+        /// `#[linkage = ..]`: [`AttrFlags::linkage`].
+        const HAS_LINKAGE = 1 << 67;
+        /// `#[rustc_diagnostic_item = ..]`: [`AttrFlags::diagnostic_item`].
+        const HAS_DIAGNOSTIC_ITEM = 1 << 68;
+        /// `#[rustc_nounwind]`, one segment: [`AttrFlags::is_rustc_nounwind`].
+        const RUSTC_NOUNWIND = 1 << 69;
+        /// `#[rustc_comptime]`, one segment: `has_word(.., "rustc_comptime")`.
+        const RUSTC_COMPTIME = 1 << 70;
+        /// `#[panic_handler]`, one segment: `has_word(.., "panic_handler")`.
+        const PANIC_HANDLER = 1 << 71;
     }
 }
+
+const _: () = assert!(size_of::<AttrFlags>() == 16);
 
 pub fn parse_extra_crate_attrs(db: &dyn SourceDatabase, krate: Crate) -> Option<SourceFile> {
     let crate_data = krate.data(db);
@@ -435,7 +682,7 @@ pub fn parse_extra_crate_attrs(db: &dyn SourceDatabase, krate: Crate) -> Option<
 pub(crate) fn crate_supports_no_std(db: &dyn SourceDatabase, krate: Crate) -> bool {
     fn contains_no_std(meta: ast::Meta) -> bool {
         match meta {
-            ast::Meta::PathMeta(meta) => meta.path().is1("no_std"),
+            ast::Meta::PathMeta(meta) => path_is(meta.path(), "no_std"),
             ast::Meta::CfgAttrMeta(meta) => meta.metas().any(contains_no_std),
             ast::Meta::UnsafeMeta(meta) => meta.meta().is_some_and(contains_no_std),
             ast::Meta::CfgMeta(_) | ast::Meta::KeyValueMeta(_) | ast::Meta::TokenTreeMeta(_) => {
@@ -532,9 +779,21 @@ fn resolver_for_attr_def_id(db: &dyn SourceDatabase, owner: AttrDefId) -> Resolv
 fn collect_attrs<BreakValue>(
     db: &dyn SourceDatabase,
     owner: AttrDefId,
-    mut callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
+    callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
     let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
+    collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, callback)
+}
+
+/// [`collect_attrs`] over a source [`attrs_source`] already found.
+fn collect_attrs_in<BreakValue>(
+    db: &dyn SourceDatabase,
+    source: &InFile<ast::AnyHasAttrs>,
+    outer_mod_decl: Option<InFile<ast::Module>>,
+    extra_crate_attrs: Option<SourceFile>,
+    krate: Crate,
+    mut callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
+) -> Option<BreakValue> {
     let extra_attrs = extra_crate_attrs
         .into_iter()
         .flat_map(|src| src.attrs())
@@ -552,17 +811,33 @@ fn collect_attrs<BreakValue>(
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
 fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
-    let (source, _, _, krate) = attrs_source(db, owner);
-    let value = collect_attrs(db, owner, |attr| match attr {
-        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name) => match attr.expr() {
-            Some(value) => ControlFlow::Break(value),
-            None => ControlFlow::Continue(()),
+    let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
+    let value =
+        collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, |attr| match attr {
+            ast::Meta::KeyValueMeta(attr) if path_is(attr.path(), name) => match attr.expr() {
+                Some(value) => ControlFlow::Break(value),
+                None => ControlFlow::Continue(()),
+            },
+            _ => ControlFlow::Continue(()),
+        })?;
+    // A string literal, the usual value, reads as `expand_attr_value` reads it, with no
+    // resolver or span map built for it.
+    let mut literal = value.clone();
+    while let ast::Expr::ParenExpr(paren) = &literal {
+        literal = paren.expr()?;
+    }
+    match literal {
+        ast::Expr::Literal(literal) => match literal.kind() {
+            ast::LiteralKind::String(string) => Some(Symbol::intern(&string.value().ok()?)),
+            _ => None,
         },
-        _ => ControlFlow::Continue(()),
-    })?;
-    let resolver = resolver_for_attr_def_id(db, owner);
-    let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
-    Some(Symbol::intern(&value))
+        ast::Expr::MacroExpr(_) => {
+            let resolver = resolver_for_attr_def_id(db, owner);
+            let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
+            Some(Symbol::intern(&value))
+        }
+        _ => None,
+    }
 }
 
 fn collect_field_attrs<T>(
@@ -570,6 +845,24 @@ fn collect_field_attrs<T>(
     variant: VariantId,
     mut field_attrs: impl FnMut(&CfgOptions, InFile<ast::AnyHasAttrs>) -> T,
 ) -> ArenaMap<LocalFieldId, T> {
+    let mut result = ArenaMap::new();
+    for_each_field(db, variant, |idx, cfg_options, field| {
+        result.insert(
+            la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx)),
+            field_attrs(cfg_options, field),
+        );
+    });
+    result.shrink_to_fit();
+    result
+}
+
+/// Calls `each` with the index, the crate's cfg options and the syntax of every field of
+/// `variant` its cfg leaves in, in order: the indices are `0..` with no gap.
+fn for_each_field(
+    db: &dyn SourceDatabase,
+    variant: VariantId,
+    mut each: impl FnMut(u32, &CfgOptions, InFile<ast::AnyHasAttrs>),
+) {
     let (variant_syntax, krate) = match variant {
         VariantId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it),
         VariantId::StructId(it) => attrs_from_ast_id_loc(db, it),
@@ -584,19 +877,15 @@ fn collect_field_attrs<T>(
         ast::VariantDef::Variant(it) => it.field_list(),
     };
     let Some(fields) = fields else {
-        return ArenaMap::new();
+        return;
     };
 
-    let mut result = ArenaMap::new();
     let mut idx = 0;
     match fields {
         ast::FieldList::RecordFieldList(fields) => {
             for field in fields.fields() {
                 if AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok() {
-                    result.insert(
-                        la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx)),
-                        field_attrs(cfg_options, variant_syntax.with_value(field.into())),
-                    );
+                    each(idx, cfg_options, variant_syntax.with_value(field.into()));
                     idx += 1;
                 }
             }
@@ -604,17 +893,12 @@ fn collect_field_attrs<T>(
         ast::FieldList::TupleFieldList(fields) => {
             for field in fields.fields() {
                 if AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok() {
-                    result.insert(
-                        la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx)),
-                        field_attrs(cfg_options, variant_syntax.with_value(field.into())),
-                    );
+                    each(idx, cfg_options, variant_syntax.with_value(field.into()));
                     idx += 1;
                 }
             }
         }
     }
-    result.shrink_to_fit();
-    result
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -631,7 +915,7 @@ pub struct DeriveInfo {
 
 fn extract_doc_aliases(result: &mut Vec<Symbol>, attr: ast::Meta) -> ControlFlow<Infallible> {
     if let ast::Meta::TokenTreeMeta(attr) = attr
-        && attr.path().is1("doc")
+        && path_is(attr.path(), "doc")
         && let Some(tt) = attr.token_tree()
     {
         for atom in DocAtom::parse(tt) {
@@ -789,24 +1073,25 @@ impl AttrFlags {
     #[inline]
     pub fn query_field(db: &dyn SourceDatabase, field: FieldId) -> AttrFlags {
         return field_attr_flags(db, field.parent)
-            .get(field.local_id)
+            .get(u32::from(field.local_id.into_raw()) as usize)
             .copied()
             .unwrap_or_else(AttrFlags::empty);
 
+        /// The flags of each field the cfg leaves in, indexed by `LocalFieldId`: 16 bytes a
+        /// field, read by index.
         #[salsa::tracked(returns(ref))]
-        fn field_attr_flags(
-            db: &dyn SourceDatabase,
-            variant: VariantId,
-        ) -> ArenaMap<LocalFieldId, AttrFlags> {
-            collect_field_attrs(db, variant, |cfg_options, field| {
+        fn field_attr_flags(db: &dyn SourceDatabase, variant: VariantId) -> Box<[AttrFlags]> {
+            let mut result = SmallVec::<[AttrFlags; 8]>::new();
+            for_each_field(db, variant, |_, cfg_options, field| {
                 let mut attr_flags = AttrFlags::empty();
                 expand_cfg_attr(
                     field.value.attrs(),
                     || cfg_options,
                     |attr, _| match_attr_flags(&mut attr_flags, attr),
                 );
-                attr_flags
-            })
+                result.push(attr_flags);
+            });
+            result.into_boxed_slice()
         }
     }
 
@@ -918,9 +1203,32 @@ impl AttrFlags {
     }
 
     /// The symbol a foreign item is declared to link against, if it is not its own name.
-    #[salsa::tracked(returns(clone))]
+    #[inline]
     pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        symbol_attr(db, owner, "link_name")
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_NAME) {
+            return None;
+        }
+        return link_name(db, owner);
+
+        #[salsa::tracked(returns(clone))]
+        fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+            symbol_attr(db, owner, "link_name")
+        }
+    }
+
+    /// The diagnostic item `#[rustc_diagnostic_item = ".."]` names an item, rustc's
+    /// `diagnostic_items` entry for it.
+    #[inline]
+    pub fn diagnostic_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_DIAGNOSTIC_ITEM) {
+            return None;
+        }
+        return diagnostic_item(db, owner);
+
+        #[salsa::tracked(returns(clone))]
+        fn diagnostic_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+            symbol_attr(db, owner, "rustc_diagnostic_item")
+        }
     }
 
     /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
@@ -931,7 +1239,7 @@ impl AttrFlags {
         let mut libs = Vec::new();
         collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = &attr
-                && attr.path().is1("link")
+                && path_is(attr.path(), "link")
                 && let Some(tt) = attr.token_tree()
                 && let Some((lib, cfg)) = parse_link_tt(&tt)
                 && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
@@ -949,7 +1257,7 @@ impl AttrFlags {
     pub fn wasm_import_module(db: &dyn SourceDatabase, owner: ExternBlockId) -> Option<Symbol> {
         collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = &attr
-                && attr.path().is1("link")
+                && path_is(attr.path(), "link")
                 && let Some(tt) = attr.token_tree()
                 && let Some(module) = link_value(&tt, "wasm_import_module")
             {
@@ -960,27 +1268,63 @@ impl AttrFlags {
     }
 
     /// The section `#[link_section]` puts an item in.
-    #[salsa::tracked(returns(clone))]
+    #[inline]
     pub fn link_section(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        symbol_attr(db, owner, "link_section")
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_SECTION) {
+            return None;
+        }
+        return link_section(db, owner);
+
+        #[salsa::tracked(returns(clone))]
+        fn link_section(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+            symbol_attr(db, owner, "link_section")
+        }
     }
 
     /// The linkage `#[linkage]` asks of an item, as `extern_weak`.
-    #[salsa::tracked(returns(clone))]
+    #[inline]
     pub fn linkage(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        symbol_attr(db, owner, "linkage")
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINKAGE) {
+            return None;
+        }
+        return linkage(db, owner);
+
+        #[salsa::tracked(returns(clone))]
+        fn linkage(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+            symbol_attr(db, owner, "linkage")
+        }
     }
 
     /// The symbol `#[export_name]` gives an item.
-    #[salsa::tracked(returns(clone))]
+    #[inline]
     pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        symbol_attr(db, owner, "export_name")
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_EXPORT_NAME) {
+            return None;
+        }
+        return export_name(db, owner);
+
+        #[salsa::tracked(returns(clone))]
+        fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+            symbol_attr(db, owner, "export_name")
+        }
     }
 
-    /// Whether `owner` has the attribute `#[name]`, once its `cfg_attr`s are expanded.
+    /// Whether `owner` has the attribute `#[name]`, once its `cfg_attr`s are expanded. The words
+    /// the flags record are one bit test; any other name walks the attributes.
     pub fn has_word(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> bool {
+        let flag = match word(name) {
+            Some(Word::rustc_nounwind) => AttrFlags::RUSTC_NOUNWIND,
+            Some(Word::rustc_comptime) => AttrFlags::RUSTC_COMPTIME,
+            Some(Word::panic_handler) => AttrFlags::PANIC_HANDLER,
+            _ => return Self::has_word_in_source(db, owner, name),
+        };
+        AttrFlags::query(db, owner).contains(flag)
+    }
+
+    /// [`AttrFlags::has_word`] read from the source.
+    fn has_word_in_source(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> bool {
         let found = collect_attrs(db, owner, |attr| match attr {
-            ast::Meta::PathMeta(attr) if attr.path().is1(name) => ControlFlow::Break(()),
+            ast::Meta::PathMeta(attr) if path_is(attr.path(), name) => ControlFlow::Break(()),
             _ => ControlFlow::Continue(()),
         });
         found.is_some()
@@ -999,7 +1343,7 @@ impl AttrFlags {
         fn lang_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
-                    && attr.path().is1("lang")
+                    && path_is(attr.path(), "lang")
                     && let Some(value) = attr.value_string()
                 {
                     ControlFlow::Break(Symbol::intern(&value))
@@ -1033,11 +1377,11 @@ impl AttrFlags {
                 && let Some(path) = attr.path()
                 && let Some(tt) = attr.token_tree()
             {
-                if path.is1("repr")
+                if is_one(&path, "repr")
                     && let Some(repr) = parse_repr_tt(&tt)
                 {
                     current = Some(repr);
-                } else if path.is1("rustc_scalable_vector")
+                } else if is_one(&path, "rustc_scalable_vector")
                     && let mut tt = TokenTreeChildren::new(&tt)
                     && let Some(NodeOrToken::Token(scalable)) = tt.next()
                     && let Some(scalable) = ast::IntNumber::cast(scalable)
@@ -1050,7 +1394,7 @@ impl AttrFlags {
                     });
                 }
             } else if let ast::Meta::PathMeta(attr) = &attr
-                && attr.path().is1("rustc_scalable_vector")
+                && path_is(attr.path(), "rustc_scalable_vector")
             {
                 current = Some(ReprOptions {
                     scalable: Some(rustc_abi::ScalableElt::Container),
@@ -1077,7 +1421,7 @@ impl AttrFlags {
     ) -> Option<Box<[u32]>> {
         let result = collect_attrs(db, owner.into(), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = attr
-                && attr.path().is1("rustc_legacy_const_generics")
+                && path_is(attr.path(), "rustc_legacy_const_generics")
                 && let Some(tt) = attr.token_tree()
             {
                 let result = parse_rustc_legacy_const_generics(tt);
@@ -1103,7 +1447,7 @@ impl AttrFlags {
             || cfg_options.get_or_insert(krate.cfg_options(db)),
             |attr, _| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr.path().is1("doc")
+                    && path_is(attr.path(), "doc")
                     && let Some(tt) = attr.token_tree()
                     && let Some(result) = DocAtom::parse(tt).into_iter().find_map(|atom| {
                         if let DocAtom::KeyValue { key, value } = atom
@@ -1136,7 +1480,7 @@ impl AttrFlags {
             let mut result = FxHashSet::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr.path().is1("target_feature")
+                    && path_is(attr.path(), "target_feature")
                     && let Some(tt) = attr.token_tree()
                 {
                     let mut tt = TokenTreeChildren::new(&tt);
@@ -1175,7 +1519,7 @@ impl AttrFlags {
         let mut result = Vec::new();
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = attr
-                && attr.path().is1("target_feature")
+                && path_is(attr.path(), "target_feature")
                 && let Some(tt) = attr.token_tree()
             {
                 let mut tt = TokenTreeChildren::new(&tt);
@@ -1204,14 +1548,9 @@ impl AttrFlags {
 
     /// Whether the function is `#[rustc_nounwind]`, which rustc's `fn_can_unwind` takes as
     /// never unwinding.
+    #[inline]
     pub fn is_rustc_nounwind(db: &dyn SourceDatabase, owner: FunctionId) -> bool {
-        collect_attrs(db, owner.into(), |attr| match attr {
-            ast::Meta::PathMeta(attr) if attr.path().is1("rustc_nounwind") => {
-                ControlFlow::Break(())
-            }
-            _ => ControlFlow::Continue(()),
-        })
-        .is_some()
+        AttrFlags::query(db, owner.into()).contains(AttrFlags::RUSTC_NOUNWIND)
     }
 
     #[inline]
@@ -1234,16 +1573,16 @@ impl AttrFlags {
             let mut result = RustcLayoutScalarValidRange::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && let path = attr.path()
-                    && (path.is1("rustc_layout_scalar_valid_range_start")
-                        || path.is1("rustc_layout_scalar_valid_range_end"))
+                    && let Some(path) = attr.path()
+                    && (is_one(&path, "rustc_layout_scalar_valid_range_start")
+                        || is_one(&path, "rustc_layout_scalar_valid_range_end"))
                     && let Some(tt) = attr.token_tree()
                     && let tt = TokenTreeChildren::new(&tt)
                     && let Ok(NodeOrToken::Token(value)) = Itertools::exactly_one(tt)
                     && let Some(value) = ast::IntNumber::cast(value)
                     && let Ok(value) = value.value()
                 {
-                    if path.is1("rustc_layout_scalar_valid_range_start") {
+                    if is_one(&path, "rustc_layout_scalar_valid_range_start") {
                         result.start = Some(value)
                     } else {
                         result.end = Some(value);
@@ -1357,7 +1696,7 @@ impl AttrFlags {
         fn doc_keyword(db: &dyn SourceDatabase, owner: ModuleId) -> Option<Symbol> {
             collect_attrs(db, AttrDefId::ModuleId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr.path().is1("doc")
+                    && path_is(attr.path(), "doc")
                     && let Some(tt) = attr.token_tree()
                 {
                     for atom in DocAtom::parse(tt) {
@@ -1377,7 +1716,7 @@ impl AttrFlags {
     #[salsa::tracked(returns(as_deref), lru = 250)]
     pub fn docs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<Docs>> {
         let (source, outer_mod_decl, _extra_crate_attrs, krate) = attrs_source(db, owner);
-        let inner_attrs_node = source.value.inner_attributes_node();
+        let inner_attrs_node = docs::inner_docs_node(&source.value);
         // Note: we don't have to pass down `_extra_crate_attrs` here, since `extract_docs`
         // does not handle crate-level attributes related to docs.
         // See: https://doc.rust-lang.org/rustdoc/write-documentation/the-doc-attribute.html#at-the-crate-level
@@ -1429,8 +1768,8 @@ impl AttrFlags {
         fn derive_info(db: &dyn SourceDatabase, owner: MacroId) -> Option<DeriveInfo> {
             collect_attrs(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && (attr.path().is1("proc_macro_derive")
-                        || attr.path().is1("rustc_builtin_macro"))
+                    && (path_is(attr.path(), "proc_macro_derive")
+                        || path_is(attr.path(), "rustc_builtin_macro"))
                     && let Some(tt) = attr.token_tree()
                     && let mut tt = TokenTreeChildren::new(&tt)
                     && let Some(NodeOrToken::Token(trait_name)) = tt.next()
@@ -1474,8 +1813,7 @@ impl AttrFlags {
         fn unstable_feature(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && let path = attr.path()
-                    && path.is1("unstable")
+                    && path_is(attr.path(), "unstable")
                     && let Some(tt) = attr.token_tree()
                 {
                     let mut tt = TokenTreeChildren::new(&tt);
@@ -1510,7 +1848,7 @@ impl AttrFlags {
         fn must_use_message(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<str>> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
-                    && attr.path().is1("must_use")
+                    && path_is(attr.path(), "must_use")
                     && let Some(message) = attr.value_string()
                 {
                     return ControlFlow::Break(Box::from(&*message));
@@ -1533,10 +1871,9 @@ impl AttrFlags {
             let mut result = Vec::new();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr
-                        .path()
-                        .as_up_to_two_segment()
-                        .is_some_and(|(_, tool)| tool.is_some_and(|it| it == "define_opaque"))
+                    && attr.path().as_ref().and_then(up_to_two_segments).is_some_and(|(_, tool)| {
+                        tool.is_some_and(|it| name_text(&it) == "define_opaque")
+                    })
                     && let Some(tt) = attr.token_tree()
                 {
                     let tokens = TokenTreeChildren::new(&tt)
@@ -1585,7 +1922,7 @@ impl AttrFlags {
         ) -> Option<Box<[Name]>> {
             collect_attrs(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr.path().is1("rustc_must_implement_one_of")
+                    && path_is(attr.path(), "rustc_must_implement_one_of")
                     && let Some(tt) = attr.token_tree()
                     && let names = tt
                         .token_trees_and_tokens()
@@ -1778,21 +2115,4 @@ fn next_doc_expr(it: &mut Peekable<TokenTreeChildren>) -> Option<DocAtom> {
 }
 
 #[cfg(test)]
-mod tests {
-    use test_fixture::WithFixture;
-
-    use crate::AttrDefId;
-    use crate::attrs::AttrFlags;
-    use crate::test_db::TestDB;
-
-    #[test]
-    fn crate_attrs() {
-        let fixture = r#"
-//- /lib.rs crate:foo crate-attr:no_std crate-attr:cfg(target_arch="x86")
-        "#;
-        let (db, file_id) = TestDB::with_single_file(fixture);
-        let module = db.module_for_file(file_id.file_id(&db));
-        let attrs = AttrFlags::query(&db, AttrDefId::ModuleId(module));
-        assert!(attrs.contains(AttrFlags::IS_NO_STD | AttrFlags::HAS_CFG));
-    }
-}
+mod tests;

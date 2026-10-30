@@ -1744,6 +1744,8 @@ impl<T: ?Sized> Clone for Lowered<'_, T> {
 
 impl<T: ?Sized> Copy for Lowered<'_, T> {}
 
+const _: () = assert!(size_of::<Lowered<'static, ()>>() == 8 + 2 * 16);
+
 impl<'db, T: ?Sized> Lowered<'db, T> {
     pub(crate) fn new(
         value: &'db T,
@@ -2402,6 +2404,21 @@ impl std::ops::Index<LocalFieldId> for FieldTypes {
     }
 }
 
+impl<'a> IntoIterator for &'a FieldTypes {
+    type Item = (LocalFieldId, &'a FieldType);
+    type IntoIter = std::iter::Map<
+        std::iter::Enumerate<std::slice::Iter<'a, FieldType>>,
+        fn((usize, &'a FieldType)) -> (LocalFieldId, &'a FieldType),
+    >;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        let entry: fn((usize, &'a FieldType)) -> (LocalFieldId, &'a FieldType) =
+            |(index, field)| (LocalFieldId::from_raw(la_arena::RawIdx::from_u32(index as u32)), field);
+        self.0.iter().enumerate().map(entry)
+    }
+}
+
 pub(crate) fn field_types_query(db: &dyn HirDatabase, variant_id: VariantId) -> &FieldTypes {
     field_types_with_diagnostics(db, variant_id).value
 }
@@ -2496,40 +2513,49 @@ pub(crate) fn lower_field_types<'db>(
 
 #[derive(Debug, PartialEq, Eq, Default, Hash)]
 pub(crate) struct SupertraitsInfo {
-    /// Every supertrait, the trait itself included, in one column: the direct supertraits first,
-    /// then the others, each part in ascending order.
+    /// Every supertrait, the trait itself first and the rest depth first in the order their
+    /// bounds are written, then the direct supertraits in the order they are written: one
+    /// column, the direct ones from `direct_start`. The order is the source's, never an id's or
+    /// a hash's, so a hash over the list is the same in every run.
     supertraits: Box<[TraitId]>,
-    direct_len: u32,
+    direct_start: u32,
+    /// The associated types of the trait and its supertraits, the trait's own first.
     pub(crate) defined_assoc_types: Box<[(Name, TypeAliasId)]>,
+}
+
+const _: () = assert!(size_of::<SupertraitsInfo>() <= 40);
+
+/// Appends `it` unless `list` has it: a trait has a few supertraits and associated types, so a
+/// scan beats hashing.
+fn push_new<T: PartialEq>(list: &mut Vec<T>, it: T) {
+    if !list.contains(&it) {
+        list.push(it);
+    }
 }
 
 impl SupertraitsInfo {
     /// Every supertrait, the trait itself included.
     #[inline]
     pub(crate) fn all_supertraits(&self) -> &[TraitId] {
-        &self.supertraits
+        &self.supertraits[..self.direct_start as usize]
     }
 
     #[inline]
     pub(crate) fn direct_supertraits(&self) -> &[TraitId] {
-        &self.supertraits[..self.direct_len as usize]
+        &self.supertraits[self.direct_start as usize..]
     }
 
     fn new(
-        all: FxHashSet<TraitId>,
-        direct: FxHashSet<TraitId>,
-        defined_assoc_types: FxHashSet<(Name, TypeAliasId)>,
+        mut all: Vec<TraitId>,
+        direct: Vec<TraitId>,
+        defined_assoc_types: Vec<(Name, TypeAliasId)>,
     ) -> SupertraitsInfo {
-        let mut supertraits: Vec<TraitId> = direct.iter().copied().collect();
-        supertraits.sort_unstable();
-        let mut others: Vec<TraitId> = all.into_iter().filter(|it| !direct.contains(it)).collect();
-        others.sort_unstable();
-        let direct_len = supertraits.len() as u32;
-        supertraits.extend(others);
+        let direct_start = u32::try_from(all.len()).expect("2^32 supertraits");
+        all.extend(direct);
         SupertraitsInfo {
-            supertraits: supertraits.into_boxed_slice(),
-            direct_len,
-            defined_assoc_types: Box::from_iter(defined_assoc_types),
+            supertraits: all.into_boxed_slice(),
+            direct_start,
+            defined_assoc_types: defined_assoc_types.into_boxed_slice(),
         }
     }
 
@@ -2539,17 +2565,17 @@ impl SupertraitsInfo {
 
         #[salsa::tracked(returns(ref), cycle_result = supertraits_info_cycle)]
         fn supertraits_info(db: &dyn HirDatabase, trait_: TraitId) -> SupertraitsInfo {
-            let mut all_supertraits = FxHashSet::default();
-            let mut direct_supertraits = FxHashSet::default();
-            let mut defined_assoc_types = FxHashSet::default();
-
-            all_supertraits.insert(trait_);
-            defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
-                |(name, id)| match *id {
+            let mut all_supertraits = vec![trait_];
+            let mut direct_supertraits = Vec::new();
+            let mut defined_assoc_types: Vec<(Name, TypeAliasId)> = trait_
+                .trait_items(db)
+                .items
+                .iter()
+                .filter_map(|(name, id)| match *id {
                     AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
                     _ => None,
-                },
-            ));
+                })
+                .collect();
 
             let resolver = trait_.resolver(db);
             let signature = TraitSignature::of(db, trait_);
@@ -2580,9 +2606,13 @@ impl SupertraitsInfo {
                     continue;
                 };
                 let bounded = SupertraitsInfo::query(db, bounded_trait);
-                all_supertraits.extend(bounded.all_supertraits());
-                direct_supertraits.insert(bounded_trait);
-                defined_assoc_types.extend(bounded.defined_assoc_types.iter().cloned());
+                for &it in bounded.all_supertraits() {
+                    push_new(&mut all_supertraits, it);
+                }
+                push_new(&mut direct_supertraits, bounded_trait);
+                for it in &bounded.defined_assoc_types {
+                    push_new(&mut defined_assoc_types, it.clone());
+                }
             }
 
             SupertraitsInfo::new(all_supertraits, direct_supertraits, defined_assoc_types)
@@ -4110,4 +4140,76 @@ pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db
         assoc_type,
         EarlyBinder::bind(trait_args).instantiate(interner, trait_ref.args).skip_norm_wip(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use hir_def::type_ref::TypeRefId;
+    use salsa::plumbing::FromId;
+
+    use super::*;
+    use crate::lower::diagnostics::{GenericArgsProhibitedReason, PathLoweringDiagnostic};
+
+    fn trait_id(index: u32) -> TraitId {
+        TraitId::from_id(salsa::Id::from_bits(u64::from(index)))
+    }
+
+    #[test]
+    fn supertraits_keep_the_order_they_are_written_in() {
+        let all = vec![trait_id(9), trait_id(4), trait_id(7), trait_id(2)];
+        let direct = vec![trait_id(4), trait_id(2)];
+        let info = SupertraitsInfo::new(all.clone(), direct.clone(), Vec::new());
+        assert_eq!(info.all_supertraits(), &all[..]);
+        assert_eq!(info.direct_supertraits(), &direct[..]);
+    }
+
+    #[test]
+    fn a_direct_supertrait_a_cycle_left_out_of_all_stays_out() {
+        let info = SupertraitsInfo::new(vec![trait_id(1)], vec![trait_id(3)], Vec::new());
+        assert_eq!(info.all_supertraits(), &[trait_id(1)]);
+        assert_eq!(info.direct_supertraits(), &[trait_id(3)]);
+        assert!(SupertraitsInfo::default().all_supertraits().is_empty());
+    }
+
+    #[test]
+    fn push_new_keeps_the_first_of_each() {
+        let mut list = Vec::new();
+        for it in [3, 1, 3, 2, 1] {
+            push_new(&mut list, it);
+        }
+        assert_eq!(list, [3, 1, 2]);
+    }
+
+    fn diagnostic(segment: u32) -> TyLoweringDiagnostic {
+        TyLoweringDiagnostic::PathDiagnostic {
+            source: TypeRefId::from_raw(la_arena::RawIdx::from_u32(segment)),
+            diag: PathLoweringDiagnostic::GenericArgsProhibited {
+                segment,
+                reason: GenericArgsProhibitedReason::Module,
+            },
+        }
+    }
+
+    #[test]
+    fn a_lowering_result_without_findings_allocates_nothing() {
+        let result = TyLoweringResult::<'static, u32>::new(7, ThinVec::new(), ThinVec::new());
+        assert_eq!(result.value, 7);
+        assert_eq!(result.diagnostics.capacity(), 0);
+        assert_eq!(result.anon_consts.capacity(), 0);
+        assert_eq!(result, TyLoweringResult::empty(7));
+    }
+
+    #[test]
+    fn a_lowered_view_reads_what_the_result_holds() {
+        let mut diagnostics = ThinVec::with_capacity(8);
+        diagnostics.extend([diagnostic(1), diagnostic(2)]);
+        let result = TyLoweringResult::<'static, u32>::new(3, diagnostics, ThinVec::new());
+        assert_eq!(result.diagnostics.capacity(), 2, "a result keeps no spare capacity");
+        let lowered = result.as_lowered();
+        assert_eq!(*lowered.value, 3);
+        assert_eq!(lowered.diagnostics(), &[diagnostic(1), diagnostic(2)]);
+        assert!(lowered.defined_anon_consts().is_empty());
+        let (value, diagnostics, anon_consts) = result.clone().into_parts();
+        assert_eq!((value, diagnostics.len(), anon_consts.len()), (3, 2, 0));
+    }
 }

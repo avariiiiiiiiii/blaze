@@ -32,7 +32,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypeMustBeKnown<'_>) -> Vec<Found>
     let at = d.at_point.map(|it| it.syntax_node_ptr());
     let failure = cx.span_of(at);
     let node = cx.syntax(at);
-    let diag = match (let_source(cx, &node), &d.top_term) {
+    let mut diag = match (let_source(cx, &node), &d.top_term) {
         (_, Some(Either::Right(konst))) => {
             let mut diag = Diag::error(Some("E0282"), "type annotations needed", failure.clone());
             diag.span_label(failure, format!("cannot infer the value of the constant `{konst}`"));
@@ -75,7 +75,6 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypeMustBeKnown<'_>) -> Vec<Found>
             diag
         }
     };
-    let mut diag = diag;
     code_fact(cx, &mut diag, at);
     vec![Found::new(diag, Phase::Bodies)]
 }

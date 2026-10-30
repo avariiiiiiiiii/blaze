@@ -1,9 +1,15 @@
 //! The borrow checker: rustc's `rustc_borrowck` over the bodies MIR lowering builds.
 //!
 //! Each body is checked on its own, closures and coroutines with it, as rustc checks a body
-//! and the closures in it together, and the result is a query of the body's owner, so an edit checks again
-//! only the bodies it changes. What it reports carries rustc's error codes and the span rustc
-//! points at; `docs/borrowck.md` in the repository describes what is checked and how.
+//! and the closures in it together, and the result is a query of the body's owner, so an edit
+//! checks again only the bodies it changes. What it reports carries rustc's error codes and the
+//! span rustc points at; `docs/borrowck.md` in the repository describes what is checked and how.
+//!
+//! The analyses run on dense columns: a CFG and every relation as a CSR (one start array, one
+//! item array, built by an in-place counting sort), `u64`-word bitsets and bit matrices with a
+//! row per block, gen/kill transfer functions composed once per block and iterated to a fixed
+//! point over a worklist seeded in reverse postorder, move paths numbered in preorder so a
+//! subtree is a range of words, and region inference over the SCCs of the outlives graph.
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate rustc_type_ir;

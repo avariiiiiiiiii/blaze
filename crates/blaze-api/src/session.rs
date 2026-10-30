@@ -206,7 +206,27 @@ impl Session {
         error: Option<ApiError>,
         out: &mut Vec<Reply>,
     ) {
-        let Some((serial, candidate)) = self.jobs.remove(&job) else { return };
+        self.finish_in(cx, job, ok, error, None, out);
+    }
+
+    /// [`Session::finish`] of a job whose build ran in a database view of its own, `queries`,
+    /// handed over: the session keeps that view for [`Request::Why`] in place of the one it
+    /// opened, and closes it when it lets it go (at once when the job's view is not kept).
+    pub fn finish_in(
+        &mut self,
+        cx: &mut Daemon<'_>,
+        job: JobId,
+        ok: bool,
+        error: Option<ApiError>,
+        mut queries: Option<ViewId>,
+        out: &mut Vec<Reply>,
+    ) {
+        let Some((serial, candidate)) = self.jobs.remove(&job) else {
+            if let Some(queries) = queries {
+                cx.db.close(queries);
+            }
+            return;
+        };
         let pending = self.pending.get_mut(&serial).expect("a job's request is pending");
         let sink = pending.sink;
         let ok = ok && error.is_none();
@@ -216,6 +236,7 @@ impl Session {
                 match best.finish(candidate, ok, ran) {
                     Some(opened) if ran => {
                         cx.vfs.close(opened.files);
+                        let opened = built_in(cx.db, opened, queries.take());
                         keep(&mut self.kept, cx.db, opened);
                     }
                     Some(opened) => close(cx, opened),
@@ -249,6 +270,7 @@ impl Session {
                 for opened in views.drain(..) {
                     if error.is_none() && *kept == Some(opened) {
                         cx.vfs.close(opened.files);
+                        let opened = built_in(cx.db, opened, queries.take());
                         keep(&mut self.kept, cx.db, opened);
                     } else {
                         close(cx, opened);
@@ -262,6 +284,9 @@ impl Session {
             }
             _ => unreachable!("job {job:?}'s candidate does not match its request"),
         };
+        if let Some(queries) = queries {
+            cx.db.close(queries);
+        }
         if over {
             self.end(serial);
         }
@@ -337,6 +362,7 @@ impl Session {
                 self.start(cx, req, Some(to), vec![from, to], Work::Reach { from, changes, targets });
             }
             Request::Snapshot => self.start(cx, req, None, Vec::new(), Work::Snapshot),
+            Request::Stop => out.push(Reply { to: req, response: Response::Done { ok: true } }),
             Request::BestOf { base, candidates, targets, test, filter } => {
                 let base = resolve(cx.vfs, &base)?;
                 if candidates.is_empty() {
@@ -617,6 +643,18 @@ fn incremental(work: &Work) -> bool {
         | Work::CodegenInputs(_)
         | Work::Trace(_) => true,
         Work::Reach { .. } | Work::Verify(_) | Work::Snapshot | Work::Tables => false,
+    }
+}
+
+/// `opened` with the database view its build ran in, when the daemon handed one over: the
+/// session's own is closed for it.
+fn built_in(db: &blaze_query::Database, opened: Opened, queries: Option<ViewId>) -> Opened {
+    match queries {
+        Some(queries) => {
+            db.close(opened.queries);
+            Opened { queries, ..opened }
+        }
+        None => opened,
     }
 }
 

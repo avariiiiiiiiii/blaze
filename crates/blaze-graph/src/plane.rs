@@ -30,11 +30,27 @@
 //! A request may be cancelled ([`Plane::cancel`]): what of it has not started is skipped, what
 //! runs is let finish, and it finishes failed. A plane lives as long as the daemon: a request
 //! [`Plane::release`]d gives its nodes' room back once it finishes.
+//!
+//! **Layout** (docs/v2/plan/design/data.md). Nodes and tasks are `u32` slots into columns, a
+//! hot row of what scheduling reads (64 bytes a node, 32 a task) beside colder ones, reused
+//! through free lists. A request's edges are one flat array: a node's deps a range of it, the
+//! nodes that wait for a node a list threaded through it. A task's members are a list threaded
+//! through the node rows. A request's ready nodes of a pool are a 4-ary heap of 24-byte entries
+//! that each node knows its place in, so a start, a raise and a leave are `O(log n)` with no
+//! allocation. A key is its own hash: the flight table indexes by its first eight bytes. What a
+//! step needs for a moment (a batch's order, the requests touched, the tasks passed over) is a
+//! buffer kept on the plane, so in steady state a task costs the plane no allocation:
+//! [`Plane::step_into`] appends to the caller's buffer of outputs.
 
-use std::{cmp::Reverse, collections::BTreeSet, fmt};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, hash_map::Entry},
+    fmt,
+    hash::{BuildHasherDefault, Hash, Hasher},
+};
 
 use blaze_protocol::events::{Event, Level, NodeState, Record};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::machine::{Error, NodeId, Outcome, Pool, Spec};
@@ -52,9 +68,23 @@ impl fmt::Display for RequestId {
 
 /// The hash of everything a node's value depends on: two nodes with one key are one piece of
 /// work.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct Key(pub [u8; 32]);
+
+/// A key is already a content hash: its first eight bytes are its hash, for any hasher.
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.prefix());
+    }
+}
+
+impl Key {
+    fn prefix(&self) -> u64 {
+        let [a, b, c, d, e, f, g, h, ..] = self.0;
+        u64::from_le_bytes([a, b, c, d, e, f, g, h])
+    }
+}
 
 /// What the query database has of a key: the one memo of results (docs/v2/plan/lanes/core.md, "One memo,
 /// the database's"). `Some` settles a node of the key at once, running nothing: `Built` as
@@ -172,47 +202,122 @@ pub struct RequestStats {
     pub critical_path_ns: u64,
 }
 
-/// A ready node's place among its request's: the first runs first. `seq` breaks ties by the
-/// order nodes were added, whatever room they were put in.
-type Entry = (Reverse<u64>, u64, usize);
+/// No node, task, edge or place: the end of a list, a node of no task or in no ready heap.
+const NONE: u32 = u32::MAX;
 
-struct Node {
-    request: usize,
-    /// Its place in the order nodes were added to the plane.
-    seq: u64,
-    spec: Spec,
-    state: NodeState,
-    /// How many of its deps are not done.
-    waiting: usize,
-    dependents: Vec<usize>,
+/// In the index while a batch is checked: the id is of the batch, at the place in the low
+/// bits. Slots are below it.
+const NEW: u32 = 1 << 31;
+
+/// [`NodeCold::flags`]: it has a key; it settled (`done_at` holds); its task started as it
+/// (`started_at` holds); its task ran on a thread group (`group` holds).
+const KEYED: u8 = 1;
+const DONE: u8 = 2;
+const STARTED: u8 = 4;
+const GROUP: u8 = 8;
+
+/// What adding, readying, starting and settling a node read: 64 bytes, one cache line, found
+/// by its slot.
+#[derive(Clone, Copy)]
+struct NodeRow {
     /// The longest path of expected cost from it to the end of its request, its own included.
     priority: u64,
-    done_at: Option<u64>,
-    /// When its task started, if it ran it.
-    started_at: Option<u64>,
+    /// Its place in the order nodes were added to the plane.
+    seq: u64,
+    cost: u64,
     /// The longest chain of measured run times through its request's nodes to it, its own
     /// included, once it settled ([`RequestStats::critical_path_ns`]).
     path_ns: u64,
-    /// The dep that was done last when it became ready.
-    blocker: Option<usize>,
-    task: Option<usize>,
-    /// The thread group its task ran on.
-    group: Option<u32>,
+    id: NodeId,
+    request: u32,
+    /// How many of its deps are not done.
+    waiting: u32,
+    task: u32,
+    /// Its place in its request's ready heap of its task's pool.
+    heap_at: u32,
+    /// The member of its task that joined after it.
+    next_member: u32,
+    /// The first and last of its request's edges whose dep it is: the nodes that wait for it,
+    /// in the order they were added.
+    first_out: u32,
+    last_out: u32,
 }
 
-struct Task {
-    key: Option<Key>,
+const _: () = assert!(size_of::<NodeRow>() == 64);
+
+/// What a node needs now and then: as it becomes ready, as its task starts, as its request
+/// ends. 56 bytes, found by its slot.
+#[derive(Clone, Copy)]
+struct NodeCold {
+    memory: u64,
+    done_at: u64,
+    started_at: u64,
+    /// Its deps: `deps` edges of its request from `deps_at`.
+    deps_at: u32,
+    deps: u32,
+    /// The dep that was done last when it became ready.
+    blocker: u32,
+    /// The thread group its task ran on.
+    group: u32,
+    /// Its name: a range of its request's `names`.
+    name_at: u32,
+    name_len: u32,
     pool: Pool,
+    flags: u8,
+}
+
+const _: () = assert!(size_of::<NodeCold>() == 56);
+
+/// A dep of a node in its request's edges: the dep, the node that waits for it (`owner`), and
+/// the next edge of the same dep. A node's deps are one range of edges (CSR); the nodes that
+/// wait for one are a list through `next`. 12 bytes an edge.
+#[derive(Clone, Copy)]
+struct Edge {
+    dep: u32,
+    owner: u32,
+    next: u32,
+}
+
+const _: () = assert!(size_of::<Edge>() == 12);
+
+/// A task: 32 bytes, found by its slot; its key, if `keyed`, in a column beside.
+#[derive(Clone, Copy)]
+struct TaskRow {
     memory: u64,
     /// The node whose id the task runs as, and whose request it counts against: the member
     /// that started it, once it runs.
-    runner: usize,
-    /// Every node that settles when it does. While it is not running, each is ready in its own
-    /// request.
-    members: Vec<usize>,
-    running: bool,
+    runner: u32,
+    /// Every node that settles when it does, a list through [`NodeRow::next_member`] in the
+    /// order they joined. While it is not running, each is ready in its own request.
+    first: u32,
+    last: u32,
     /// How many times a task with memory started while it did not fit.
     passed: u32,
+    /// The last pass over it counted ([`Plane::pass`]), so a pass counts it once.
+    stamp: u32,
+    pool: Pool,
+    running: bool,
+    keyed: bool,
+}
+
+const _: () = assert!(size_of::<TaskRow>() == 32);
+
+/// A ready node in its request's heap: the least `(rank, seq)` runs first, `rank` being the
+/// complement of its priority, so the longest path goes first and ties to the node added
+/// first. 24 bytes.
+#[derive(Clone, Copy)]
+struct Ready {
+    rank: u64,
+    seq: u64,
+    node: u32,
+}
+
+const _: () = assert!(size_of::<Ready>() == 24);
+
+impl Ready {
+    fn before(&self, other: &Ready) -> bool {
+        (self.rank, self.seq) < (other.rank, other.seq)
+    }
 }
 
 struct Request {
@@ -220,6 +325,8 @@ struct Request {
     /// Its place in the order requests were opened.
     seq: u64,
     weight: u32,
+    /// What a start moves its virtual time on by: [`SHARE`] over its weight.
+    stride: u128,
     keep_going: bool,
     closed: bool,
     cancelled: bool,
@@ -227,43 +334,226 @@ struct Request {
     /// Whether its room is given back once it finishes.
     release: bool,
     /// How many of its nodes are not settled.
-    open: usize,
-    failed: Option<usize>,
-    /// Its ready nodes of each pool, each one of a task not running: the first to run first.
-    ready: [BTreeSet<Entry>; 2],
+    open: u32,
+    /// Its first node that failed.
+    failed: u32,
+    /// Its ready nodes of each pool, each one of a task not running, as a 4-ary heap: the
+    /// first to run first.
+    ready: [Vec<Ready>; 2],
+    /// Its place in the plane's `active` requests of each pool, while its heap of it is not
+    /// empty.
+    active_at: [u32; 2],
     /// Its virtual time in each pool, for fair share.
     vtime: [u128; 2],
-    nodes: Vec<usize>,
+    nodes: Vec<u32>,
+    edges: Vec<Edge>,
+    names: String,
     stats: RequestStats,
+}
+
+impl Request {
+    fn empty() -> Request {
+        Request {
+            id: RequestId(0),
+            seq: 0,
+            weight: 1,
+            stride: SHARE,
+            keep_going: false,
+            closed: false,
+            cancelled: false,
+            finished: false,
+            release: false,
+            open: 0,
+            failed: NONE,
+            ready: [Vec::new(), Vec::new()],
+            active_at: [NONE; 2],
+            vtime: [0; 2],
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            names: String::new(),
+            stats: RequestStats::default(),
+        }
+    }
+
+    /// Opens it in its room, keeping what its buffers hold room for.
+    fn open(&mut self, id: RequestId, seq: u64, weight: u32, keep_going: bool, vclock: [u128; 2]) {
+        debug_assert!(self.nodes.is_empty() && self.edges.is_empty() && self.names.is_empty());
+        debug_assert!(self.ready.iter().all(Vec::is_empty));
+        self.id = id;
+        self.seq = seq;
+        self.weight = weight;
+        self.stride = SHARE / u128::from(weight);
+        self.keep_going = keep_going;
+        self.closed = false;
+        self.cancelled = false;
+        self.finished = false;
+        self.release = false;
+        self.open = 0;
+        self.failed = NONE;
+        self.active_at = [NONE; 2];
+        self.vtime = vclock;
+        self.stats = RequestStats::default();
+    }
+
+    fn deps(&self, cold: &NodeCold) -> &[Edge] {
+        &self.edges[cold.deps_at as usize..(cold.deps_at + cold.deps) as usize]
+    }
+
+    fn name(&self, cold: &NodeCold) -> &str {
+        &self.names[cold.name_at as usize..(cold.name_at + cold.name_len) as usize]
+    }
+}
+
+/// What [`Plane::check`] found of a batch of nodes, for [`Plane::add`]; its buffers are kept
+/// for the next batch.
+#[derive(Default)]
+struct Batch {
+    /// Each node's deps, by its place in the batch: a slot, or [`NEW`] and the place of a node
+    /// of the batch.
+    deps: Vec<u32>,
+    /// Where each place's deps begin in `deps`, and the end.
+    deps_at: Vec<u32>,
+    /// The places in the order they are added, when that is not the order given.
+    order: Vec<u32>,
+    /// The slot each place took, once added.
+    slots: Vec<u32>,
+    /// For Kahn's order: each place's deps of the batch not yet placed; the places that wait
+    /// for each, as CSR; the places that can go, least first.
+    waiting: Vec<u32>,
+    then_at: Vec<u32>,
+    then: Vec<u32>,
+    can: BinaryHeap<Reverse<u32>>,
+}
+
+impl Batch {
+    /// Kahn's order over a batch with a dep on a later node of it, into `order`, the first
+    /// given first among those that can go; or the ids of the nodes in a cycle, sorted.
+    fn sort(&mut self, nodes: &[Spec]) -> Result<(), Vec<NodeId>> {
+        let len = nodes.len();
+        self.waiting.clear();
+        self.waiting.resize(len, 0);
+        self.then_at.clear();
+        self.then_at.resize(len + 1, 0);
+        for at in 0..len {
+            for &dep in &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize] {
+                if dep & NEW != 0 {
+                    self.waiting[at] += 1;
+                    self.then_at[(dep & !NEW) as usize + 1] += 1;
+                }
+            }
+        }
+        for at in 0..len {
+            self.then_at[at + 1] += self.then_at[at];
+        }
+        self.then.clear();
+        self.then.resize(self.then_at[len] as usize, 0);
+        for at in 0..len {
+            for &dep in &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize] {
+                if dep & NEW != 0 {
+                    let fill = &mut self.then_at[(dep & !NEW) as usize];
+                    self.then[*fill as usize] = at as u32;
+                    *fill += 1;
+                }
+            }
+        }
+        for at in (1..=len).rev() {
+            self.then_at[at] = self.then_at[at - 1];
+        }
+        self.then_at[0] = 0;
+        self.can.clear();
+        self.can.extend((0..len as u32).filter(|&at| self.waiting[at as usize] == 0).map(Reverse));
+        self.order.clear();
+        while let Some(Reverse(at)) = self.can.pop() {
+            self.order.push(at);
+            let at = at as usize;
+            for then in self.then_at[at]..self.then_at[at + 1] {
+                let next = self.then[then as usize] as usize;
+                self.waiting[next] -= 1;
+                if self.waiting[next] == 0 {
+                    self.can.push(Reverse(next as u32));
+                }
+            }
+        }
+        if self.order.len() < len {
+            let mut cycle: Vec<NodeId> =
+                (0..len).filter(|&at| self.waiting[at] > 0).map(|at| nodes[at].id).collect();
+            cycle.sort();
+            self.order.clear();
+            return Err(cycle);
+        }
+        Ok(())
+    }
+}
+
+/// Keys of tasks, by the key's own bits.
+type ByKey<V> = HashMap<Key, V, BuildHasherDefault<KeyHasher>>;
+
+/// The hash of a [`Key`] is the `u64` it hashes as: a content hash is hashed again by nothing.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = word;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
 }
 
 pub struct Plane {
     config: PlaneConfig,
-    nodes: Vec<Node>,
-    index: FxHashMap<NodeId, usize>,
-    tasks: Vec<Task>,
+    /// The node columns, by slot.
+    rows: Vec<NodeRow>,
+    cold: Vec<NodeCold>,
+    states: Vec<NodeState>,
+    keys: Vec<Key>,
+    index: FxHashMap<NodeId, u32>,
+    /// The task columns, by slot.
+    tasks: Vec<TaskRow>,
+    task_keys: Vec<Key>,
     requests: Vec<Request>,
-    request_index: FxHashMap<RequestId, usize>,
-    /// Rooms of `nodes`, `tasks` and `requests` given back, taken again first.
-    free_nodes: Vec<usize>,
-    free_tasks: Vec<usize>,
-    free_requests: Vec<usize>,
+    request_index: FxHashMap<RequestId, u32>,
+    /// Slots of `rows`, `tasks` and `requests` given back, taken again first.
+    free_nodes: Vec<u32>,
+    free_tasks: Vec<u32>,
+    free_requests: Vec<u32>,
     next_seq: u64,
     memo: Option<Box<dyn Memo + Send>>,
     /// Keys of tasks not yet settled.
-    flight: FxHashMap<Key, usize>,
+    flight: ByKey<u32>,
     running: [usize; 2],
     granted: u64,
     held: u64,
     /// The virtual time of each pool: that of the request that started a task last.
     vclock: [u128; 2],
+    /// The requests whose ready heap of each pool is not empty, in no order.
+    active: [Vec<u32>; 2],
     /// The task passed over for memory long enough that it holds back the others.
-    hold: Option<usize>,
+    hold: Option<u32>,
+    /// The count of passes over tasks ([`TaskRow::stamp`]).
+    passes: u32,
     /// Nodes to settle once the move under way is done, as the memo or the budget says, in
     /// order: settling them where they are found would nest without bound.
-    deferred: Vec<(usize, NodeState)>,
+    deferred: Vec<(u32, NodeState)>,
     last_ns: u64,
     counts: Counts,
+    /// Buffers of one step, kept for the next.
+    batch: Batch,
+    touched: Vec<u32>,
+    added: Vec<u32>,
+    rising: Vec<(u32, u64)>,
+    skipping: Vec<u32>,
+    order: Vec<u32>,
+    passed: Vec<u32>,
+    scan: BinaryHeap<Reverse<(u64, u64, u32)>>,
 }
 
 fn pool_at(pool: Pool) -> usize {
@@ -297,9 +587,13 @@ impl Plane {
         }
         Ok(Plane {
             config,
-            nodes: Vec::new(),
+            rows: Vec::new(),
+            cold: Vec::new(),
+            states: Vec::new(),
+            keys: Vec::new(),
             index: FxHashMap::default(),
             tasks: Vec::new(),
+            task_keys: Vec::new(),
             requests: Vec::new(),
             request_index: FxHashMap::default(),
             free_nodes: Vec::new(),
@@ -307,15 +601,25 @@ impl Plane {
             free_requests: Vec::new(),
             next_seq: 0,
             memo,
-            flight: FxHashMap::default(),
+            flight: ByKey::default(),
             running: [0; 2],
             granted: 0,
             held: 0,
             vclock: [0; 2],
+            active: [Vec::new(), Vec::new()],
             hold: None,
+            passes: 0,
             deferred: Vec::new(),
             last_ns: 0,
             counts: Counts::default(),
+            batch: Batch::default(),
+            touched: Vec::new(),
+            added: Vec::new(),
+            rising: Vec::new(),
+            skipping: Vec::new(),
+            order: Vec::new(),
+            passed: Vec::new(),
+            scan: BinaryHeap::new(),
         })
     }
 
@@ -334,22 +638,28 @@ impl Plane {
 
     /// The state of `id`, if it was added.
     pub fn state(&self, id: NodeId) -> Option<&NodeState> {
-        Some(&self.nodes[*self.index.get(&id)?].state)
+        Some(&self.states[*self.index.get(&id)? as usize])
     }
 
     /// What `request` did so far, if it is known: open, or finished and not released.
     pub fn stats(&self, request: RequestId) -> Option<RequestStats> {
-        Some(self.requests[*self.request_index.get(&request)?].stats)
+        Some(self.requests[*self.request_index.get(&request)? as usize].stats)
+    }
+
+    /// How many node, task and request slots the plane has made, free or not.
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> (usize, usize, usize) {
+        (self.rows.len(), self.tasks.len(), self.requests.len())
     }
 
     /// A node of the task that holds back every other task with memory until it fits, if one
     /// does.
     pub fn holding(&self) -> Option<NodeId> {
-        let task = &self.tasks[self.hold?];
-        if task.running {
+        let task = &self.tasks[self.hold? as usize];
+        if task.running || task.first == NONE {
             return None;
         }
-        Some(self.nodes[*task.members.first()?].spec.id)
+        Some(self.rows[task.first as usize].id)
     }
 
     /// Gives back the room of `request` once it has finished (now, if it has): its nodes are
@@ -357,33 +667,33 @@ impl Plane {
     /// opened again. What a long-lived plane holds is then what its open requests hold.
     pub fn release(&mut self, request: RequestId) -> Result<(), Error> {
         let &r = self.request_index.get(&request).ok_or(Error::UnknownRequest(request.0))?;
-        self.requests[r].release = true;
-        if self.requests[r].finished {
+        self.requests[r as usize].release = true;
+        if self.requests[r as usize].finished {
             self.free_request(r);
         }
         Ok(())
     }
 
     /// The room of finished request `r` and its nodes, for the next to take. Each of its
-    /// nodes is settled, so no task, ready set or node of another request points at them.
-    fn free_request(&mut self, r: usize) {
-        let request = &mut self.requests[r];
+    /// nodes is settled, so no task, ready heap or node of another request points at them.
+    fn free_request(&mut self, r: u32) {
+        let request = &mut self.requests[r as usize];
         debug_assert!(request.finished && request.open == 0);
         self.request_index.remove(&request.id);
-        let nodes = std::mem::take(&mut request.nodes);
-        for &me in &nodes {
-            let node = &mut self.nodes[me];
-            debug_assert!(node.state.settled() && node.task.is_none());
-            self.index.remove(&node.spec.id);
-            node.spec.name = String::new();
-            node.spec.deps = Vec::new();
-            node.dependents = Vec::new();
+        for &me in &request.nodes {
+            let me = me as usize;
+            debug_assert!(self.states[me].settled() && self.rows[me].task == NONE);
+            self.index.remove(&self.rows[me].id);
+            self.states[me] = NodeState::Waiting;
         }
-        self.free_nodes.extend(nodes);
+        self.free_nodes.extend_from_slice(&request.nodes);
+        request.nodes.clear();
+        request.edges.clear();
+        request.names.clear();
         self.free_requests.push(r);
     }
 
-    fn free_task(&mut self, task: usize) {
+    fn free_task(&mut self, task: u32) {
         if self.hold == Some(task) {
             self.hold = None;
         }
@@ -396,10 +706,34 @@ impl Plane {
     }
 
     pub fn step(&mut self, input: PlaneInput) -> Result<Vec<PlaneOutput>, Error> {
+        let mut out = Vec::new();
+        self.step_into(input, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Plane::step`], with its outputs appended to `out`: a caller that keeps one buffer and
+    /// drains it gets them with no allocation of its own per step. An input refused appends
+    /// nothing and changes nothing.
+    pub fn step_into(&mut self, input: PlaneInput, out: &mut Vec<PlaneOutput>) -> Result<(), Error> {
         // A time before the last is the last: completions race the clock that stamps them.
         let at = input.at_ns().max(self.last_ns);
-        let mut out = Vec::new();
-        let mut touched: Vec<usize> = Vec::new();
+        let mut touched = std::mem::take(&mut self.touched);
+        let taken = self.take(at, input, out, &mut touched);
+        if taken.is_ok() {
+            self.after(at, out, &mut touched);
+        }
+        touched.clear();
+        self.touched = touched;
+        taken
+    }
+
+    fn take(
+        &mut self,
+        at: u64,
+        input: PlaneInput,
+        out: &mut Vec<PlaneOutput>,
+        touched: &mut Vec<u32>,
+    ) -> Result<(), Error> {
         match input {
             PlaneInput::Open { request, weight, keep_going, .. } => {
                 if self.request_index.contains_key(&request) {
@@ -408,73 +742,56 @@ impl Plane {
                 if weight == 0 {
                     return Err(Error::NoWeight(request.0));
                 }
-                let opened = Request {
-                    id: request,
-                    seq: self.seq(),
-                    weight,
-                    keep_going,
-                    closed: false,
-                    cancelled: false,
-                    finished: false,
-                    release: false,
-                    open: 0,
-                    failed: None,
-                    ready: [BTreeSet::new(), BTreeSet::new()],
-                    vtime: self.vclock,
-                    nodes: Vec::new(),
-                    stats: RequestStats::default(),
-                };
+                let seq = self.seq();
                 let r = match self.free_requests.pop() {
-                    Some(r) => {
-                        self.requests[r] = opened;
-                        r
-                    }
+                    Some(r) => r,
                     None => {
-                        self.requests.push(opened);
-                        self.requests.len() - 1
+                        self.requests.push(Request::empty());
+                        (self.requests.len() - 1) as u32
                     }
                 };
+                self.requests[r as usize].open(request, seq, weight, keep_going, self.vclock);
                 self.request_index.insert(request, r);
             }
             PlaneInput::Add { request, nodes, .. } => {
                 let r = self.open_request(request)?;
-                if self.requests[r].closed {
+                if self.requests[r as usize].closed {
                     return Err(Error::Closed);
                 }
-                let nodes = self.check(r, nodes)?;
-                self.add(at, r, nodes, &mut out);
+                self.check(r, &nodes)?;
+                self.add(at, r, nodes, out);
                 touched.push(r);
             }
             PlaneInput::Close { request, .. } => {
                 let r = self.open_request(request)?;
-                if self.requests[r].closed {
+                if self.requests[r as usize].closed {
                     return Err(Error::Closed);
                 }
-                self.requests[r].closed = true;
+                self.requests[r as usize].closed = true;
                 touched.push(r);
             }
             PlaneInput::Done { id, outcome, added, group, .. } => {
                 let task = match self.index.get(&id) {
-                    Some(&node)
-                        if self.nodes[node].state == NodeState::Running
-                            && self.nodes[node].task.is_some_and(|it| {
-                                self.tasks[it].running && self.tasks[it].runner == node
-                            }) =>
-                    {
-                        self.nodes[node].task.expect("a running node's task")
+                    Some(&node) if matches!(self.states[node as usize], NodeState::Running) => {
+                        let task = self.rows[node as usize].task;
+                        let t = &self.tasks[task as usize];
+                        if !(t.running && t.runner == node) {
+                            return Err(Error::NotRunning(id));
+                        }
+                        task
                     }
                     _ => return Err(Error::NotRunning(id)),
                 };
-                let runner = self.tasks[task].runner;
-                let r = self.nodes[runner].request;
-                let added = self.check(r, added)?;
-                self.finish_task(at, task, outcome, group, &mut out, &mut touched);
-                self.add(at, r, added, &mut out);
+                let runner = self.tasks[task as usize].runner;
+                let r = self.rows[runner as usize].request;
+                self.check(r, &added)?;
+                self.finish_task(at, task, outcome, group, out, touched);
+                self.add(at, r, added, out);
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
         }
-        self.after(at, out, touched)
+        Ok(())
     }
 
     /// Cancels `request`: each of its nodes not started is skipped, because of the request's
@@ -486,298 +803,438 @@ impl Plane {
     /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
     /// does nothing.
     pub fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+        let mut out = Vec::new();
+        self.cancel_into(at_ns, request, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Plane::cancel`], with its outputs appended to `out`, as [`Plane::step_into`].
+    pub fn cancel_into(
+        &mut self,
+        at_ns: u64,
+        request: RequestId,
+        out: &mut Vec<PlaneOutput>,
+    ) -> Result<(), Error> {
         let at = at_ns.max(self.last_ns);
         let r = self.open_request(request)?;
-        let mut out = Vec::new();
-        if !self.requests[r].cancelled {
-            self.requests[r].cancelled = true;
-            self.requests[r].closed = true;
+        let ri = r as usize;
+        if !self.requests[ri].cancelled {
+            self.requests[ri].cancelled = true;
+            self.requests[ri].closed = true;
             out.push(said(
                 request,
                 at,
                 Event::Said { level: Level::Note, text: format!("{request} is cancelled") },
             ));
-            if let Some(&first) = self.requests[r].nodes.first() {
-                let because = self.nodes[first].spec.id.0;
-                for at_node in 0..self.requests[r].nodes.len() {
-                    let me = self.requests[r].nodes[at_node];
-                    let skip = match self.nodes[me].state {
+            if let Some(&first) = self.requests[ri].nodes.first() {
+                let because = self.rows[first as usize].id.0;
+                for at_node in 0..self.requests[ri].nodes.len() {
+                    let me = self.requests[ri].nodes[at_node];
+                    let skip = match self.states[me as usize] {
                         NodeState::Waiting | NodeState::Ready => true,
-                        NodeState::Running => self.nodes[me]
-                            .task
-                            .is_some_and(|task| self.tasks[task].runner != me),
+                        NodeState::Running => {
+                            let task = self.rows[me as usize].task;
+                            task != NONE && self.tasks[task as usize].runner != me
+                        }
                         _ => false,
                     };
                     if skip {
                         self.leave_task(me);
-                        self.moved(at, me, NodeState::Skipped { because }, &mut out);
+                        self.moved(at, me, NodeState::Skipped { because }, out);
                     }
                 }
             }
         }
-        self.after(at, out, vec![r])
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.push(r);
+        self.after(at, out, &mut touched);
+        touched.clear();
+        self.touched = touched;
+        Ok(())
     }
 
     /// What follows any input: the deferred nodes settled, the threads given work, and the
     /// requests `touched` that are over finished.
-    fn after(
-        &mut self,
-        at: u64,
-        mut out: Vec<PlaneOutput>,
-        mut touched: Vec<usize>,
-    ) -> Result<Vec<PlaneOutput>, Error> {
-        self.settle_deferred(at, &mut out, &mut touched);
+    fn after(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
+        self.settle_deferred(at, out, touched);
         self.last_ns = at;
-        self.dispatch(at, &mut out, &mut touched);
-        touched.sort_unstable_by_key(|&r| self.requests[r].seq);
+        self.dispatch(at, out, touched);
+        let requests = &self.requests;
+        touched.sort_unstable_by_key(|&r| requests[r as usize].seq);
         touched.dedup();
-        for r in touched {
-            let request = &self.requests[r];
+        for &r in touched.iter() {
+            let request = &self.requests[r as usize];
             if request.closed && request.open == 0 && !request.finished {
-                self.requests[r].finished = true;
-                let path =
-                    self.critical(r).into_iter().map(|it| self.nodes[it].spec.id.0).collect();
-                let id = self.requests[r].id;
+                self.requests[r as usize].finished = true;
+                let path = self.critical(r);
+                let request = &self.requests[r as usize];
+                let id = request.id;
+                let ok = request.failed == NONE && !request.cancelled;
+                let release = request.release;
                 out.push(said(id, at, Event::Critical { path }));
-                let ok = self.requests[r].failed.is_none() && !self.requests[r].cancelled;
                 out.push(PlaneOutput::Finished { request: id, ok });
-                if self.requests[r].release {
+                if release {
                     self.free_request(r);
                 }
             }
         }
-        Ok(out)
     }
 
-    fn open_request(&self, request: RequestId) -> Result<usize, Error> {
+    fn open_request(&self, request: RequestId) -> Result<u32, Error> {
         match self.request_index.get(&request) {
-            Some(&r) if !self.requests[r].finished => Ok(r),
+            Some(&r) if !self.requests[r as usize].finished => Ok(r),
             Some(_) => Err(Error::Over),
             None => Err(Error::UnknownRequest(request.0)),
         }
     }
 
-    /// `nodes`, each after its deps of them, or why they cannot be added to request `r`.
-    /// Nothing of them is added yet.
-    fn check(&self, r: usize, nodes: Vec<Spec>) -> Result<Vec<Spec>, Error> {
-        let mut new: FxHashMap<NodeId, usize> = FxHashMap::default();
+    /// Whether `nodes` can be added to request `r`: none of their ids known or given twice,
+    /// each dep one of them or a node of `r`, and no cycle among them. If so, their ids are in
+    /// the index as places of the batch ([`NEW`]), and [`Plane::batch`] says each one's deps
+    /// and the order to add them in: each after its deps of them, the first given first among
+    /// those that can go. If not, nothing is changed.
+    fn check(&mut self, r: u32, nodes: &[Spec]) -> Result<(), Error> {
+        let batch = &mut self.batch;
+        batch.deps.clear();
+        batch.deps_at.clear();
+        batch.order.clear();
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        assert!(nodes.len() < NEW as usize, "{} nodes in one input", nodes.len());
         for (at, spec) in nodes.iter().enumerate() {
-            if self.index.contains_key(&spec.id) || new.insert(spec.id, at).is_some() {
+            let fresh = match self.index.entry(spec.id) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(it) => {
+                    it.insert(NEW | at as u32);
+                    true
+                }
+            };
+            if !fresh {
+                unindex(&mut self.index, &nodes[..at]);
                 return Err(Error::Twice(spec.id));
             }
         }
-        // Kahn's order over the new nodes, the first given first among those that can go.
-        let mut waiting = vec![0usize; nodes.len()];
-        let mut then: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        let mut in_order = true;
         for (at, spec) in nodes.iter().enumerate() {
+            batch.deps_at.push(batch.deps.len() as u32);
             for dep in &spec.deps {
-                match new.get(dep) {
-                    Some(&it) => {
-                        waiting[at] += 1;
-                        then[it].push(at);
+                match self.index.get(dep) {
+                    Some(&it) if it & NEW != 0 => {
+                        in_order &= (it & !NEW) < at as u32;
+                        batch.deps.push(it);
                     }
-                    None if self.index.get(dep).is_some_and(|&it| self.nodes[it].request == r) => {}
-                    None => return Err(Error::UnknownDep { node: spec.id, dep: *dep }),
+                    Some(&it) if self.rows[it as usize].request == r => batch.deps.push(it),
+                    _ => {
+                        unindex(&mut self.index, nodes);
+                        return Err(Error::UnknownDep { node: spec.id, dep: *dep });
+                    }
                 }
             }
         }
-        let mut can: BTreeSet<usize> = (0..nodes.len()).filter(|&it| waiting[it] == 0).collect();
-        let mut order = Vec::with_capacity(nodes.len());
-        while let Some(at) = can.pop_first() {
-            order.push(at);
-            for &next in &then[at] {
-                waiting[next] -= 1;
-                if waiting[next] == 0 {
-                    can.insert(next);
-                }
-            }
-        }
-        if order.len() < nodes.len() {
-            let mut cycle: Vec<NodeId> =
-                (0..nodes.len()).filter(|&it| waiting[it] > 0).map(|it| nodes[it].id).collect();
-            cycle.sort();
+        batch.deps_at.push(batch.deps.len() as u32);
+        // Given each after its deps of them, the order is the order given.
+        if !in_order && let Err(cycle) = batch.sort(nodes) {
+            unindex(&mut self.index, nodes);
             return Err(Error::Cycle(cycle));
         }
-        let mut nodes: Vec<Option<Spec>> = nodes.into_iter().map(Some).collect();
-        Ok(order.into_iter().filter_map(|at| nodes[at].take()).collect())
+        Ok(())
     }
 
-    fn add(&mut self, at: u64, r: usize, nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>) {
+    /// Adds the nodes [`Plane::check`] took to request `r`.
+    fn add(&mut self, at: u64, r: u32, mut nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>) {
         if nodes.is_empty() {
             return;
         }
-        let mut added = Vec::with_capacity(nodes.len());
-        for spec in nodes {
-            let me = self.free_nodes.pop().unwrap_or(self.nodes.len());
-            let deps: Vec<usize> = spec.deps.iter().map(|it| self.index[it]).collect();
-            let mut waiting = 0;
-            let mut skipped = None;
-            let mut blocker: Option<usize> = None;
-            for &dep in &deps {
-                match &self.nodes[dep].state {
-                    NodeState::Built | NodeState::Cached { .. } => {
-                        let later = |it: usize| (self.nodes[it].done_at, self.nodes[it].seq);
-                        if blocker.is_none_or(|it| later(dep) > later(it)) {
-                            blocker = Some(dep);
-                        }
-                    }
-                    NodeState::Failed { .. } => _ = skipped.get_or_insert(dep),
-                    NodeState::Skipped { because } => {
-                        _ = skipped.get_or_insert(self.index[&NodeId(*because)])
-                    }
-                    _ => waiting += 1,
-                }
-            }
-            for &dep in &deps {
-                self.nodes[dep].dependents.push(me);
-            }
-            if !self.requests[r].keep_going {
-                skipped = skipped.or(self.requests[r].failed);
-            }
-            if self.requests[r].cancelled {
-                skipped = skipped.or(self.requests[r].nodes.first().copied());
-            }
-            let id = self.requests[r].id;
-            out.push(said(
-                id,
-                at,
-                Event::Node {
-                    id: spec.id.0,
-                    kind: spec.kind,
-                    name: spec.name.clone(),
-                    deps: spec.deps.iter().map(|it| it.0).collect(),
-                },
-            ));
-            self.index.insert(spec.id, me);
-            let priority = spec.cost;
-            let node = Node {
-                request: r,
-                seq: self.seq(),
-                spec,
-                state: NodeState::Waiting,
-                waiting,
-                dependents: Vec::new(),
-                priority,
-                done_at: None,
-                started_at: None,
-                path_ns: 0,
-                blocker,
-                task: None,
-                group: None,
-            };
-            if me == self.nodes.len() {
-                self.nodes.push(node);
-            } else {
-                self.nodes[me] = node;
-            }
-            self.requests[r].nodes.push(me);
-            self.requests[r].open += 1;
-            added.push(me);
-            match skipped {
-                Some(because) => {
-                    let because = self.nodes[because].spec.id.0;
-                    self.moved(at, me, NodeState::Skipped { because }, out);
-                }
-                None if waiting == 0 => self.became_ready(at, me, out),
-                None => self.moved(at, me, NodeState::Waiting, out),
-            }
+        let mut batch = std::mem::take(&mut self.batch);
+        if !batch.order.is_empty() {
+            permute(&mut nodes, &mut batch.order);
         }
+        batch.slots.clear();
+        batch.slots.resize(nodes.len(), NONE);
+        let mut added = std::mem::take(&mut self.added);
+        added.clear();
+        for (at_node, spec) in nodes.into_iter().enumerate() {
+            let place = match batch.order.get(at_node) {
+                Some(&place) => (place & !NEW) as usize,
+                None => at_node,
+            };
+            let me = self.add_one(at, r, spec, &batch, place, out);
+            batch.slots[place] = me;
+            added.push(me);
+        }
+        self.batch = batch;
         // A node's priority is its cost and the most of its dependents'. A node is added after
         // its deps, so from the last added to the first each new one's dependents, all new,
         // have theirs before it. An older node's priority can only rise, and only through a
         // dep of a new one: what rises is carried up through its deps, and no further.
         for &me in added.iter().rev() {
-            let node = &self.nodes[me];
-            let after = node.dependents.iter().map(|&it| self.nodes[it].priority).max();
-            let priority = node.spec.cost.saturating_add(after.unwrap_or(0));
+            let edges = &self.requests[r as usize].edges;
+            let row = &self.rows[me as usize];
+            let mut after = 0;
+            let mut edge = row.first_out;
+            while edge != NONE {
+                let it = edges[edge as usize];
+                after = after.max(self.rows[it.owner as usize].priority);
+                edge = it.next;
+            }
+            let priority = row.cost.saturating_add(after);
             self.raise(me, priority);
         }
-        let mut rising: Vec<(usize, u64)> = Vec::new();
+        let mut rising = std::mem::take(&mut self.rising);
+        rising.clear();
+        let request = &self.requests[r as usize];
         for &me in &added {
-            let node = &self.nodes[me];
-            rising.extend(node.spec.deps.iter().map(|it| (self.index[it], node.priority)));
+            let priority = self.rows[me as usize].priority;
+            let deps = request.deps(&self.cold[me as usize]);
+            rising.extend(deps.iter().map(|it| (it.dep, priority)));
         }
         while let Some((me, after)) = rising.pop() {
-            let priority = self.nodes[me].spec.cost.saturating_add(after);
-            if priority <= self.nodes[me].priority {
+            let priority = self.rows[me as usize].cost.saturating_add(after);
+            if priority <= self.rows[me as usize].priority {
                 continue;
             }
             self.raise(me, priority);
-            let node = &self.nodes[me];
-            rising.extend(node.spec.deps.iter().map(|it| (self.index[it], priority)));
+            let deps = self.requests[r as usize].deps(&self.cold[me as usize]);
+            rising.extend(deps.iter().map(|it| (it.dep, priority)));
         }
+        self.rising = rising;
+        self.added = added;
     }
 
-    /// Sets `me`'s priority, keeping its place among its request's ready nodes.
-    fn raise(&mut self, me: usize, priority: u64) {
-        let node = &self.nodes[me];
-        if node.priority == priority {
+    /// Adds the node at `place` of the batch to request `r`, each of its deps added before it:
+    /// its slot.
+    fn add_one(
+        &mut self,
+        at: u64,
+        r: u32,
+        spec: Spec,
+        batch: &Batch,
+        place: usize,
+        out: &mut Vec<PlaneOutput>,
+    ) -> u32 {
+        let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
+        let me = match self.free_nodes.pop() {
+            Some(me) => me,
+            None => {
+                assert!(self.rows.len() < NEW as usize, "the plane holds 2^31 nodes");
+                self.rows.push(NodeRow {
+                    priority: 0,
+                    seq: 0,
+                    cost: 0,
+                    path_ns: 0,
+                    id,
+                    request: r,
+                    waiting: 0,
+                    task: NONE,
+                    heap_at: NONE,
+                    next_member: NONE,
+                    first_out: NONE,
+                    last_out: NONE,
+                });
+                self.cold.push(NodeCold {
+                    memory: 0,
+                    done_at: 0,
+                    started_at: 0,
+                    deps_at: 0,
+                    deps: 0,
+                    blocker: NONE,
+                    group: 0,
+                    name_at: 0,
+                    name_len: 0,
+                    pool,
+                    flags: 0,
+                });
+                self.states.push(NodeState::Waiting);
+                self.keys.push(Key([0; 32]));
+                (self.rows.len() - 1) as u32
+            }
+        };
+        let request = &mut self.requests[r as usize];
+        let deps_at = request.edges.len() as u32;
+        let mut waiting = 0;
+        // The id of the node it is skipped because of.
+        let mut skipped: Option<u32> = None;
+        let mut blocker = NONE;
+        let later = |rows: &[NodeRow], cold: &[NodeCold], it: u32| {
+            (cold[it as usize].done_at, rows[it as usize].seq)
+        };
+        for &dep in &batch.deps[batch.deps_at[place] as usize..batch.deps_at[place + 1] as usize] {
+            let dep = if dep & NEW != 0 { batch.slots[(dep & !NEW) as usize] } else { dep };
+            match &self.states[dep as usize] {
+                NodeState::Built | NodeState::Cached { .. } => {
+                    if blocker == NONE
+                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                    {
+                        blocker = dep;
+                    }
+                }
+                NodeState::Failed { .. } => _ = skipped.get_or_insert(self.rows[dep as usize].id.0),
+                NodeState::Skipped { because } => _ = skipped.get_or_insert(*because),
+                _ => waiting += 1,
+            }
+            let edge = request.edges.len() as u32;
+            request.edges.push(Edge { dep, owner: me, next: NONE });
+            let row = &mut self.rows[dep as usize];
+            if row.last_out == NONE {
+                row.first_out = edge;
+            } else {
+                request.edges[row.last_out as usize].next = edge;
+            }
+            row.last_out = edge;
+        }
+        let deps_len = request.edges.len() as u32 - deps_at;
+        if !request.keep_going && skipped.is_none() && request.failed != NONE {
+            skipped = Some(self.rows[request.failed as usize].id.0);
+        }
+        if request.cancelled
+            && skipped.is_none()
+            && let Some(&first) = request.nodes.first()
+        {
+            skipped = Some(self.rows[first as usize].id.0);
+        }
+        let name_at = u32::try_from(request.names.len()).expect("a request's names under 4 GiB");
+        request.names.push_str(&name);
+        request.nodes.push(me);
+        request.open += 1;
+        let request_id = request.id;
+        out.push(said(
+            request_id,
+            at,
+            Event::Node { id: id.0, kind, name, deps: deps.into_iter().map(|it| it.0).collect() },
+        ));
+        *self.index.get_mut(&id).expect("a checked node in the index") = me;
+        let seq = self.seq();
+        let m = me as usize;
+        self.rows[m] = NodeRow {
+            priority: cost,
+            seq,
+            cost,
+            path_ns: 0,
+            id,
+            request: r,
+            waiting,
+            task: NONE,
+            heap_at: NONE,
+            next_member: NONE,
+            first_out: NONE,
+            last_out: NONE,
+        };
+        self.cold[m] = NodeCold {
+            memory,
+            done_at: 0,
+            started_at: 0,
+            deps_at,
+            deps: deps_len,
+            blocker,
+            group: 0,
+            name_at,
+            name_len: self.requests[r as usize].names.len() as u32 - name_at,
+            pool,
+            flags: if key.is_some() { KEYED } else { 0 },
+        };
+        self.keys[m] = key.unwrap_or(Key([0; 32]));
+        self.states[m] = NodeState::Waiting;
+        match skipped {
+            Some(because) => self.moved(at, me, NodeState::Skipped { because }, out),
+            None if waiting == 0 => self.became_ready(at, me, out),
+            None => self.moved(at, me, NodeState::Waiting, out),
+        }
+        me
+    }
+
+    /// Sets `me`'s priority, higher than it was, keeping its place among its request's ready
+    /// nodes.
+    fn raise(&mut self, me: u32, priority: u64) {
+        let row = &mut self.rows[me as usize];
+        if row.priority == priority {
             return;
         }
-        let ready = node.state == NodeState::Ready
-            && node.task.is_some_and(|it| !self.tasks[it].running);
-        if ready {
-            let (r, p) = (node.request, pool_at(self.tasks[node.task.expect("a task")].pool));
-            let entry = self.entry(me);
-            self.requests[r].ready[p].remove(&entry);
-            self.nodes[me].priority = priority;
-            let entry = self.entry(me);
-            self.requests[r].ready[p].insert(entry);
-        } else {
-            self.nodes[me].priority = priority;
+        debug_assert!(row.priority < priority, "a priority only rises");
+        row.priority = priority;
+        let (at, r, task) = (row.heap_at, row.request, row.task);
+        if at == NONE {
+            return;
         }
-    }
-
-    fn entry(&self, me: usize) -> Entry {
-        let node = &self.nodes[me];
-        (Reverse(node.priority), node.seq, me)
+        let p = pool_at(self.tasks[task as usize].pool);
+        let heap = &mut self.requests[r as usize].ready[p];
+        heap[at as usize].rank = !priority;
+        sift_up(heap, &mut self.rows, at as usize);
     }
 
     /// Says `me` is now `state`, and keeps what follows from it for its request.
-    fn moved(&mut self, at: u64, me: usize, state: NodeState, out: &mut Vec<PlaneOutput>) {
-        let node = &mut self.nodes[me];
+    fn moved(&mut self, at: u64, me: u32, state: NodeState, out: &mut Vec<PlaneOutput>) {
+        let row = &self.rows[me as usize];
+        let request = &mut self.requests[row.request as usize];
         if state.settled() {
-            self.requests[node.request].open -= 1;
+            request.open -= 1;
         }
-        node.state = state.clone();
-        let id = self.requests[node.request].id;
-        out.push(said(id, at, Event::Moved { id: node.spec.id.0, state }));
+        out.push(said(request.id, at, Event::Moved { id: row.id.0, state: state.clone() }));
+        self.states[me as usize] = state;
     }
 
     /// Puts `me`, of a task not running, among its request's ready nodes of pool `p`. A
     /// request that had none comes back at the pool's virtual time: what it did not use while
     /// it had nothing to run is not owed to it.
-    fn make_ready(&mut self, me: usize, p: usize) {
-        let request = &mut self.requests[self.nodes[me].request];
+    fn make_ready(&mut self, me: u32, p: usize) {
+        let row = self.rows[me as usize];
+        let request = &mut self.requests[row.request as usize];
         if request.ready[p].is_empty() {
             request.vtime[p] = request.vtime[p].max(self.vclock[p]);
+            request.active_at[p] = self.active[p].len() as u32;
+            self.active[p].push(row.request);
         }
-        let entry = (Reverse(self.nodes[me].priority), self.nodes[me].seq, me);
-        request.ready[p].insert(entry);
+        let entry = Ready { rank: !row.priority, seq: row.seq, node: me };
+        let heap = &mut request.ready[p];
+        heap.push(entry);
+        let last = heap.len() - 1;
+        sift_up(heap, &mut self.rows, last);
+    }
+
+    /// Takes `me` from its request's ready nodes of pool `p`.
+    fn unready(&mut self, me: u32, p: usize) {
+        let row = &self.rows[me as usize];
+        let (r, at) = (row.request, row.heap_at);
+        debug_assert!(at != NONE, "a node not ready taken from its ready nodes");
+        let request = &mut self.requests[r as usize];
+        heap_remove(&mut request.ready[p], &mut self.rows, at as usize);
+        if request.ready[p].is_empty() {
+            let place = request.active_at[p];
+            request.active_at[p] = NONE;
+            self.active[p].swap_remove(place as usize);
+            if let Some(&moved) = self.active[p].get(place as usize) {
+                self.requests[moved as usize].active_at[p] = place;
+            }
+        }
     }
 
     /// `me`'s deps are done: it joins a task of its key, is settled by what the database has
     /// of the key, or is a task of its own, ready to run.
-    fn became_ready(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
-        let key = self.nodes[me].spec.key;
-        if let Some(key) = key {
-            // A key in flight is not yet in the database: its task puts it there before its
-            // `Done`, so asking first would only ask in vain.
-            if let Some(&task) = self.flight.get(&key) {
-                self.counts.joined += 1;
-                self.tasks[task].members.push(me);
-                self.nodes[me].task = Some(task);
-                if self.tasks[task].running {
-                    self.moved(at, me, NodeState::Running, out);
-                } else {
-                    self.make_ready(me, pool_at(self.tasks[task].pool));
-                    self.moved(at, me, NodeState::Ready, out);
-                }
+    fn became_ready(&mut self, at: u64, me: u32, out: &mut Vec<PlaneOutput>) {
+        let m = me as usize;
+        let cold = self.cold[m];
+        let r = self.rows[m].request as usize;
+        let task = if cold.flags & KEYED == 0 {
+            if let Some(why) = too_big(&self.config, &self.requests[r], &cold) {
+                self.deferred.push((me, NodeState::Failed { why }));
                 return;
             }
+            new_task(&mut self.tasks, &mut self.task_keys, &mut self.free_tasks, me, &cold, None)
+        } else {
+            let key = self.keys[m];
+            // A key in flight is not yet in the database: its task puts it there before its
+            // `Done`, so asking first would only ask in vain.
+            let vacant = match self.flight.entry(key) {
+                Entry::Occupied(it) => {
+                    let task = *it.get();
+                    self.join(at, me, task, out);
+                    return;
+                }
+                Entry::Vacant(it) => it,
+            };
             if let Some(outcome) = self.memo.as_ref().and_then(|memo| memo.settled(key)) {
                 self.counts.remembered += 1;
-                self.requests[self.nodes[me].request].stats.cached += 1;
+                self.requests[r].stats.cached += 1;
                 let state = match outcome {
                     Outcome::Built => NodeState::Cached { remote: false },
                     Outcome::Cached { remote } => NodeState::Cached { remote },
@@ -786,121 +1243,149 @@ impl Plane {
                 self.deferred.push((me, state));
                 return;
             }
-        }
-        let spec = &self.nodes[me].spec;
-        if let Some(budget) = &self.config.budget
-            && spec.memory > budget.bytes
-        {
-            let why = format!(
-                "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
-                spec.name,
-                gb(spec.memory),
-                gb(budget.bytes),
-                budget.from
+            if let Some(why) = too_big(&self.config, &self.requests[r], &cold) {
+                self.deferred.push((me, NodeState::Failed { why }));
+                return;
+            }
+            let task = new_task(
+                &mut self.tasks,
+                &mut self.task_keys,
+                &mut self.free_tasks,
+                me,
+                &cold,
+                Some(key),
             );
-            self.deferred.push((me, NodeState::Failed { why }));
-            return;
-        }
-        let made = Task {
-            key,
-            pool: spec.pool,
-            memory: spec.memory,
-            runner: me,
-            members: vec![me],
-            running: false,
-            passed: 0,
+            vacant.insert(task);
+            task
         };
-        let task = match self.free_tasks.pop() {
-            Some(task) => {
-                self.tasks[task] = made;
-                task
-            }
-            None => {
-                self.tasks.push(made);
-                self.tasks.len() - 1
-            }
-        };
-        if let Some(key) = key {
-            self.flight.insert(key, task);
-        }
-        self.nodes[me].task = Some(task);
-        self.make_ready(me, pool_at(self.tasks[task].pool));
+        self.rows[m].task = task;
+        self.make_ready(me, pool_at(cold.pool));
         self.moved(at, me, NodeState::Ready, out);
     }
 
-    fn settle_deferred(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<usize>) {
+    /// `me` joins `task`, of its key, as its last member.
+    fn join(&mut self, at: u64, me: u32, task: u32, out: &mut Vec<PlaneOutput>) {
+        self.counts.joined += 1;
+        let t = &mut self.tasks[task as usize];
+        debug_assert!(t.last != NONE, "a task in flight has a member");
+        self.rows[t.last as usize].next_member = me;
+        t.last = me;
+        let (running, pool) = (t.running, t.pool);
+        let row = &mut self.rows[me as usize];
+        row.next_member = NONE;
+        row.task = task;
+        if running {
+            self.moved(at, me, NodeState::Running, out);
+        } else {
+            self.make_ready(me, pool_at(pool));
+            self.moved(at, me, NodeState::Ready, out);
+        }
+    }
+
+    fn settle_deferred(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
         let mut next = 0;
         while next < self.deferred.len() {
-            let (me, state) = self.deferred[next].clone();
+            let me = self.deferred[next].0;
+            let state = std::mem::replace(&mut self.deferred[next].1, NodeState::Waiting);
             next += 1;
             // Skipped by a failure of the same step before it was settled.
-            if self.nodes[me].state.settled() {
+            if self.states[me as usize].settled() {
                 continue;
             }
-            touched.push(self.nodes[me].request);
+            touched.push(self.rows[me as usize].request);
             self.settle(at, me, state, out);
         }
         self.deferred.clear();
     }
 
-    fn settle(&mut self, at: u64, me: usize, state: NodeState, out: &mut Vec<PlaneOutput>) {
+    fn settle(&mut self, at: u64, me: u32, state: NodeState, out: &mut Vec<PlaneOutput>) {
         let failed = matches!(state, NodeState::Failed { .. });
+        let m = me as usize;
+        let (row, cold) = (self.rows[m], self.cold[m]);
+        let r = row.request as usize;
         // Each dep settled before `me` was ready, so its path is known.
-        let node = &self.nodes[me];
-        let own = node.started_at.map_or(0, |it| at.saturating_sub(it));
-        let before = node.spec.deps.iter().map(|it| self.nodes[self.index[it]].path_ns).max();
+        let own = if cold.flags & STARTED != 0 { at.saturating_sub(cold.started_at) } else { 0 };
+        let request = &mut self.requests[r];
+        let before = request.deps(&cold).iter().map(|it| self.rows[it.dep as usize].path_ns).max();
         let path = own.saturating_add(before.unwrap_or(0));
-        let stats = &mut self.requests[node.request].stats;
-        stats.critical_path_ns = stats.critical_path_ns.max(path);
-        self.nodes[me].path_ns = path;
-        self.nodes[me].done_at = Some(at);
+        request.stats.critical_path_ns = request.stats.critical_path_ns.max(path);
+        self.rows[m].path_ns = path;
+        self.cold[m].done_at = at;
+        self.cold[m].flags |= DONE;
         self.moved(at, me, state, out);
-        let because = self.nodes[me].spec.id.0;
         if !failed {
-            for at_dependent in 0..self.nodes[me].dependents.len() {
-                let dependent = self.nodes[me].dependents[at_dependent];
-                let node = &mut self.nodes[dependent];
-                node.waiting -= 1;
-                if node.waiting == 0 && node.state == NodeState::Waiting {
-                    node.blocker = Some(me);
-                    self.became_ready(at, dependent, out);
+            let mut edge = row.first_out;
+            while edge != NONE {
+                let it = self.requests[r].edges[edge as usize];
+                edge = it.next;
+                let dependent = &mut self.rows[it.owner as usize];
+                dependent.waiting -= 1;
+                if dependent.waiting == 0 && matches!(self.states[it.owner as usize], NodeState::Waiting) {
+                    self.cold[it.owner as usize].blocker = me;
+                    self.became_ready(at, it.owner, out);
                 }
             }
             return;
         }
-        let r = self.nodes[me].request;
-        self.requests[r].failed.get_or_insert(me);
-        let mut skipping: Vec<usize> = self.nodes[me].dependents.clone();
+        let because = row.id.0;
+        let request = &mut self.requests[r];
+        if request.failed == NONE {
+            request.failed = me;
+        }
+        let mut skipping = std::mem::take(&mut self.skipping);
+        skipping.clear();
+        push_dependents(&mut skipping, &self.requests[r].edges, row.first_out);
         if !self.requests[r].keep_going {
-            skipping.extend(self.requests[r].nodes.iter().copied());
+            skipping.extend_from_slice(&self.requests[r].nodes);
         }
         let mut at_skipping = 0;
         while let Some(&it) = skipping.get(at_skipping) {
             at_skipping += 1;
-            if matches!(self.nodes[it].state, NodeState::Waiting | NodeState::Ready) {
+            if matches!(self.states[it as usize], NodeState::Waiting | NodeState::Ready) {
                 self.leave_task(it);
                 self.moved(at, it, NodeState::Skipped { because }, out);
-                skipping.extend(self.nodes[it].dependents.iter().copied());
+                let first_out = self.rows[it as usize].first_out;
+                push_dependents(&mut skipping, &self.requests[r].edges, first_out);
             }
         }
+        self.skipping = skipping;
     }
 
     /// `me` no longer waits for its task: a node of a task not running is no longer ready, and
     /// a task with no node left is dropped. A running task runs on without it; its runner
     /// never leaves it.
-    fn leave_task(&mut self, me: usize) {
-        let Some(task) = self.nodes[me].task.take() else { return };
-        let t = &mut self.tasks[task];
+    fn leave_task(&mut self, me: u32) {
+        let m = me as usize;
+        let task = self.rows[m].task;
+        if task == NONE {
+            return;
+        }
+        self.rows[m].task = NONE;
+        let t = self.tasks[task as usize];
         debug_assert!(!t.running || t.runner != me, "the runner of a running task left it");
-        t.members.retain(|&it| it != me);
+        let next = self.rows[m].next_member;
+        self.rows[m].next_member = NONE;
+        let mut before = NONE;
+        let mut member = t.first;
+        while member != me {
+            before = member;
+            member = self.rows[member as usize].next_member;
+        }
+        if before == NONE {
+            self.tasks[task as usize].first = next;
+        } else {
+            self.rows[before as usize].next_member = next;
+        }
+        if t.last == me {
+            self.tasks[task as usize].last = before;
+        }
         if t.running {
             return;
         }
-        let (p, r) = (pool_at(t.pool), self.nodes[me].request);
-        let entry = self.entry(me);
-        self.requests[r].ready[p].remove(&entry);
-        if self.tasks[task].members.is_empty() {
-            if let Some(key) = self.tasks[task].key {
+        self.unready(me, pool_at(t.pool));
+        if self.tasks[task as usize].first == NONE {
+            if t.keyed {
+                let key = self.task_keys[task as usize];
                 self.flight.remove(&key);
             }
             self.free_task(task);
@@ -910,38 +1395,52 @@ impl Plane {
     fn finish_task(
         &mut self,
         at: u64,
-        task: usize,
+        task: u32,
         outcome: Outcome,
         group: Option<u32>,
         out: &mut Vec<PlaneOutput>,
-        touched: &mut Vec<usize>,
+        touched: &mut Vec<u32>,
     ) {
-        let t = &mut self.tasks[task];
-        t.running = false;
-        let (pool, memory, key) = (pool_at(t.pool), t.memory, t.key);
-        let members = std::mem::take(&mut t.members);
-        self.running[pool] -= 1;
-        self.granted -= memory;
-        if let Some(key) = key {
+        let t = self.tasks[task as usize];
+        self.tasks[task as usize].running = false;
+        let p = pool_at(t.pool);
+        self.running[p] -= 1;
+        self.granted -= t.memory;
+        if t.keyed {
+            let key = self.task_keys[task as usize];
             self.flight.remove(&key);
         }
         self.free_task(task);
-        let state = match outcome {
+        let mut state = match outcome {
             Outcome::Built => NodeState::Built,
             Outcome::Cached { remote } => NodeState::Cached { remote },
             Outcome::Failed { why } => NodeState::Failed { why },
         };
-        let runner = self.tasks[task].runner;
-        for member in members {
-            if member != runner {
-                self.requests[self.nodes[member].request].stats.joined += 1;
+        let mut member = t.first;
+        while member != NONE {
+            let m = member as usize;
+            let next = self.rows[m].next_member;
+            let r = self.rows[m].request;
+            if member != t.runner {
+                self.requests[r as usize].stats.joined += 1;
             }
-            self.nodes[member].group = group;
-            self.nodes[member].task = None;
-            touched.push(self.nodes[member].request);
+            let cold = &mut self.cold[m];
+            match group {
+                Some(group) => {
+                    cold.group = group;
+                    cold.flags |= GROUP;
+                }
+                None => cold.flags &= !GROUP,
+            }
+            self.rows[m].task = NONE;
+            self.rows[m].next_member = NONE;
+            touched.push(r);
             // Every member is running: a node that leaves a running task is taken out of it.
-            debug_assert_eq!(self.nodes[member].state, NodeState::Running);
-            self.settle(at, member, state.clone(), out);
+            debug_assert_eq!(self.states[m], NodeState::Running);
+            let state =
+                if next == NONE { std::mem::replace(&mut state, NodeState::Waiting) } else { state.clone() };
+            self.settle(at, member, state, out);
+            member = next;
         }
     }
 
@@ -951,66 +1450,99 @@ impl Plane {
     }
 
     /// The task that holds back the others, while it is still to start.
-    fn hold(&mut self) -> Option<usize> {
+    fn hold(&mut self) -> Option<u32> {
         if let Some(task) = self.hold
-            && (self.tasks[task].running || self.tasks[task].members.is_empty())
+            && (self.tasks[task as usize].running || self.tasks[task as usize].first == NONE)
         {
             self.hold = None;
         }
         self.hold
     }
 
-    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<usize>) {
+    /// The request of `active` whose turn it is in pool `p`: the least virtual time, then the
+    /// heavier, then the first opened.
+    fn turn(&self, r: u32, p: usize) -> (u128, Reverse<u32>, u64) {
+        let request = &self.requests[r as usize];
+        (request.vtime[p], Reverse(request.weight), request.seq)
+    }
+
+    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
-            'next: while self.running[p] < limit {
-                let mut order: Vec<usize> = (0..self.requests.len())
-                    .filter(|&r| !self.requests[r].ready[p].is_empty())
-                    .collect();
-                order.sort_by_key(|&r| {
-                    let request = &self.requests[r];
-                    (request.vtime[p], Reverse(request.weight), request.seq)
-                });
-                let mut passed = Vec::new();
-                for r in order {
-                    match self.pick(r, p, &mut passed) {
-                        Pick::Start(me) => {
-                            let task = self.nodes[me].task.expect("a ready node's task");
-                            if self.tasks[task].memory > 0 {
-                                self.pass(&passed);
-                            }
-                            self.start(at, me, out);
-                            continue 'next;
-                        }
-                        Pick::Fail(me, why) => {
-                            self.leave_task(me);
-                            touched.push(r);
-                            self.deferred.push((me, NodeState::Failed { why }));
-                            self.settle_deferred(at, out, touched);
-                            continue 'next;
-                        }
-                        Pick::None => {}
+            if self.config.budget.is_none() {
+                // With no budget the first ready node of the request whose turn it is starts.
+                while self.running[p] < limit {
+                    let Some(r) = self.active[p].iter().copied().min_by_key(|&r| self.turn(r, p))
+                    else {
+                        break;
+                    };
+                    let me = self.requests[r as usize].ready[p][0].node;
+                    self.start(at, me, out);
+                }
+                continue;
+            }
+            while self.running[p] < limit {
+                let mut order = std::mem::take(&mut self.order);
+                order.clear();
+                order.extend_from_slice(&self.active[p]);
+                order.sort_unstable_by_key(|&r| self.turn(r, p));
+                let mut passed = std::mem::take(&mut self.passed);
+                passed.clear();
+                let mut picked = Pick::None;
+                for &r in &order {
+                    picked = self.pick(r, p, &mut passed);
+                    if !matches!(picked, Pick::None) {
+                        break;
                     }
                 }
-                break;
+                self.order = order;
+                match picked {
+                    Pick::Start(me) => {
+                        let task = self.rows[me as usize].task;
+                        if self.tasks[task as usize].memory > 0 {
+                            self.pass(&passed);
+                        }
+                        self.passed = passed;
+                        self.start(at, me, out);
+                    }
+                    Pick::Fail(me, why) => {
+                        self.passed = passed;
+                        self.leave_task(me);
+                        touched.push(self.rows[me as usize].request);
+                        self.deferred.push((me, NodeState::Failed { why }));
+                        self.settle_deferred(at, out, touched);
+                    }
+                    Pick::None => {
+                        self.passed = passed;
+                        break;
+                    }
+                }
             }
         }
     }
 
     /// Each of the tasks `passed` over was so once more; the first of them to have been so
     /// [`PlaneConfig::starve_after`] times holds back the rest, if none does.
-    fn pass(&mut self, passed: &[usize]) {
+    fn pass(&mut self, passed: &[u32]) {
         if passed.is_empty() {
             return;
         }
-        let mut seen = FxHashSet::default();
+        self.passes = self.passes.wrapping_add(1);
+        if self.passes == 0 {
+            for task in &mut self.tasks {
+                task.stamp = 0;
+            }
+            self.passes = 1;
+        }
         for &task in passed {
-            if !seen.insert(task) {
+            let t = &mut self.tasks[task as usize];
+            if t.stamp == self.passes {
                 continue;
             }
-            let t = &mut self.tasks[task];
+            t.stamp = self.passes;
             t.passed = t.passed.saturating_add(1);
-            if t.passed >= self.config.starve_after && self.hold().is_none() {
+            let starved = t.passed >= self.config.starve_after;
+            if starved && self.hold().is_none() {
                 self.hold = Some(task);
             }
         }
@@ -1024,106 +1556,272 @@ impl Plane {
     }
 
     /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
-    /// of it that did not fit, before that one, are added to `passed`.
-    fn pick(&mut self, r: usize, p: usize, passed: &mut Vec<usize>) -> Pick {
-        let Some(free) = self.memory_free() else {
-            return match self.requests[r].ready[p].first() {
-                Some(&(_, _, me)) => Pick::Start(me),
-                None => Pick::None,
-            };
-        };
+    /// of it that did not fit, before that one, are added to `passed`. Only with a budget.
+    fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<u32>) -> Pick {
+        let free = self.memory_free().expect("a budget");
         let nothing_runs = self.running == [0, 0];
         let hold = self.hold();
-        let mut unfit = None;
-        for &(_, _, me) in &self.requests[r].ready[p] {
-            let task = self.nodes[me].task.expect("a ready node's task");
-            let memory = self.tasks[task].memory;
+        // The heap in order, best first: from its root, the least of the places seen whose
+        // parent was taken.
+        let mut scan = std::mem::take(&mut self.scan);
+        scan.clear();
+        let heap = &self.requests[r as usize].ready[p];
+        if let Some(first) = heap.first() {
+            scan.push(Reverse((first.rank, first.seq, 0)));
+        }
+        let mut unfit = NONE;
+        let mut picked = NONE;
+        while let Some(Reverse((_, _, at))) = scan.pop() {
+            let at = at as usize;
+            let me = heap[at].node;
+            let task = self.rows[me as usize].task;
+            let memory = self.tasks[task as usize].memory;
             match hold {
                 // Only it, and what takes no memory, may start until it does.
                 Some(held) if held != task => {
                     if memory == 0 {
-                        return Pick::Start(me);
+                        picked = me;
+                        break;
                     }
                 }
-                _ if memory <= free => return Pick::Start(me),
-                Some(_) => unfit = Some(me),
+                _ if memory <= free => {
+                    picked = me;
+                    break;
+                }
+                Some(_) => unfit = me,
                 None => {
-                    unfit.get_or_insert(me);
+                    if unfit == NONE {
+                        unfit = me;
+                    }
                     passed.push(task);
                 }
             }
-        }
-        match unfit {
-            Some(me) if nothing_runs => {
-                let budget = self.config.budget.as_ref().expect("a budget");
-                let spec = &self.nodes[me].spec;
-                Pick::Fail(
-                    me,
-                    format!(
-                        "{} needs {} of memory as predicted, and with nothing of blaze's running \
-                         the process holds {} of the {} it may use ({})",
-                        spec.name,
-                        gb(spec.memory),
-                        gb(self.held),
-                        gb(budget.bytes),
-                        budget.from
-                    ),
-                )
+            for child in 4 * at + 1..(4 * at + 5).min(heap.len()) {
+                let it = &heap[child];
+                scan.push(Reverse((it.rank, it.seq, child as u32)));
             }
-            _ => Pick::None,
         }
+        self.scan = scan;
+        if picked != NONE {
+            return Pick::Start(picked);
+        }
+        if unfit == NONE || !nothing_runs {
+            return Pick::None;
+        }
+        let budget = self.config.budget.as_ref().expect("a budget");
+        let cold = &self.cold[unfit as usize];
+        let request = &self.requests[r as usize];
+        Pick::Fail(
+            unfit,
+            format!(
+                "{} needs {} of memory as predicted, and with nothing of blaze's running \
+                 the process holds {} of the {} it may use ({})",
+                request.name(cold),
+                gb(cold.memory),
+                gb(self.held),
+                gb(budget.bytes),
+                budget.from
+            ),
+        )
     }
 
-    fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
-        let task = self.nodes[me].task.expect("a ready node's task");
-        let p = pool_at(self.tasks[task].pool);
-        for at_member in 0..self.tasks[task].members.len() {
-            let member = self.tasks[task].members[at_member];
-            let (r, entry) = (self.nodes[member].request, self.entry(member));
-            self.requests[r].ready[p].remove(&entry);
+    fn start(&mut self, at: u64, me: u32, out: &mut Vec<PlaneOutput>) {
+        let m = me as usize;
+        let task = self.rows[m].task;
+        let t = self.tasks[task as usize];
+        let p = pool_at(t.pool);
+        let mut member = t.first;
+        while member != NONE {
+            self.unready(member, p);
+            member = self.rows[member as usize].next_member;
         }
-        self.nodes[me].started_at = Some(at);
-        let request = &mut self.requests[self.nodes[me].request];
+        self.cold[m].started_at = at;
+        self.cold[m].flags |= STARTED;
+        let request = &mut self.requests[self.rows[m].request as usize];
         request.stats.ran += 1;
         self.vclock[p] = self.vclock[p].max(request.vtime[p]);
-        request.vtime[p] += SHARE / u128::from(request.weight);
-        let t = &mut self.tasks[task];
-        t.runner = me;
-        t.running = true;
+        request.vtime[p] += request.stride;
+        self.tasks[task as usize].runner = me;
+        self.tasks[task as usize].running = true;
         self.running[p] += 1;
         self.granted += t.memory;
         self.counts.granted_most = self.counts.granted_most.max(self.granted);
         self.counts.ran += 1;
-        for at_member in 0..self.tasks[task].members.len() {
-            let member = self.tasks[task].members[at_member];
+        let mut member = t.first;
+        while member != NONE {
             self.moved(at, member, NodeState::Running, out);
+            member = self.rows[member as usize].next_member;
         }
-        let near = self.nodes[me].blocker.and_then(|it| self.nodes[it].group);
-        out.push(PlaneOutput::Run { id: self.nodes[me].spec.id, pool: self.tasks[task].pool, near });
+        let blocker = self.cold[m].blocker;
+        let near = (blocker != NONE && self.cold[blocker as usize].flags & GROUP != 0)
+            .then(|| self.cold[blocker as usize].group);
+        out.push(PlaneOutput::Run { id: self.rows[m].id, pool: t.pool, near });
     }
 
-    /// From request `r`'s node that settled last, back through what each one waited for last.
-    fn critical(&self, r: usize) -> Vec<usize> {
-        let nodes = &self.requests[r].nodes;
-        let last = nodes
+    /// From request `r`'s node that settled last, back through what each one waited for last:
+    /// their ids.
+    fn critical(&self, r: u32) -> Vec<u32> {
+        let last = self.requests[r as usize]
+            .nodes
             .iter()
             .copied()
-            .filter(|&it| self.nodes[it].done_at.is_some())
-            .max_by_key(|&it| (self.nodes[it].done_at, Reverse(self.nodes[it].seq)));
-        let mut path: Vec<usize> =
-            std::iter::successors(last, |&it| self.nodes[it].blocker).collect();
+            .filter(|&it| self.cold[it as usize].flags & DONE != 0)
+            .max_by_key(|&it| (self.cold[it as usize].done_at, Reverse(self.rows[it as usize].seq)));
+        let blocker = |it: &u32| Some(self.cold[*it as usize].blocker).filter(|&it| it != NONE);
+        let mut path: Vec<u32> =
+            std::iter::successors(last, blocker).map(|it| self.rows[it as usize].id.0).collect();
         path.reverse();
         path
     }
 }
 
 enum Pick {
-    Start(usize),
+    Start(u32),
     /// It cannot fit even with nothing running.
-    Fail(usize, String),
+    Fail(u32, String),
     None,
 }
 
 fn said(request: RequestId, at_ns: u64, event: Event) -> PlaneOutput {
     PlaneOutput::Said { request, record: Record { at_ns, event } }
+}
+
+/// Why a node of `request` cannot run at all as the budget stands: its prediction alone is
+/// more.
+fn too_big(config: &PlaneConfig, request: &Request, cold: &NodeCold) -> Option<String> {
+    let budget = config.budget.as_ref()?;
+    (cold.memory > budget.bytes).then(|| {
+        format!(
+            "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
+            request.name(cold),
+            gb(cold.memory),
+            gb(budget.bytes),
+            budget.from
+        )
+    })
+}
+
+/// A task of `me` alone, not running, in a free slot: its slot.
+fn new_task(
+    tasks: &mut Vec<TaskRow>,
+    task_keys: &mut Vec<Key>,
+    free: &mut Vec<u32>,
+    me: u32,
+    cold: &NodeCold,
+    key: Option<Key>,
+) -> u32 {
+    let row = TaskRow {
+        memory: cold.memory,
+        runner: me,
+        first: me,
+        last: me,
+        passed: 0,
+        stamp: 0,
+        pool: cold.pool,
+        running: false,
+        keyed: key.is_some(),
+    };
+    let key = key.unwrap_or(Key([0; 32]));
+    match free.pop() {
+        Some(task) => {
+            tasks[task as usize] = row;
+            task_keys[task as usize] = key;
+            task
+        }
+        None => {
+            tasks.push(row);
+            task_keys.push(key);
+            (tasks.len() - 1) as u32
+        }
+    }
+}
+
+/// Takes the ids of a batch refused back out of the index.
+fn unindex(index: &mut FxHashMap<NodeId, u32>, nodes: &[Spec]) {
+    for spec in nodes {
+        index.remove(&spec.id);
+    }
+}
+
+/// Puts `nodes` in `order`: the node at `i` is then the one that was at `order[i]`. Each place
+/// of `order` is marked [`NEW`] as it is filled.
+fn permute(nodes: &mut [Spec], order: &mut [u32]) {
+    for start in 0..order.len() {
+        if order[start] & NEW != 0 {
+            continue;
+        }
+        let mut at = start;
+        loop {
+            let from = order[at] as usize;
+            order[at] |= NEW;
+            if from == start {
+                break;
+            }
+            nodes.swap(at, from);
+            at = from;
+        }
+    }
+}
+
+/// The nodes that wait for a node, from its first edge on, after `into`'s.
+fn push_dependents(into: &mut Vec<u32>, edges: &[Edge], first: u32) {
+    let mut edge = first;
+    while edge != NONE {
+        let it = edges[edge as usize];
+        into.push(it.owner);
+        edge = it.next;
+    }
+}
+
+fn sift_up(heap: &mut [Ready], rows: &mut [NodeRow], mut at: usize) {
+    let entry = heap[at];
+    while at > 0 {
+        let parent = (at - 1) / 4;
+        if !entry.before(&heap[parent]) {
+            break;
+        }
+        heap[at] = heap[parent];
+        rows[heap[at].node as usize].heap_at = at as u32;
+        at = parent;
+    }
+    heap[at] = entry;
+    rows[entry.node as usize].heap_at = at as u32;
+}
+
+fn sift_down(heap: &mut [Ready], rows: &mut [NodeRow], mut at: usize) {
+    let entry = heap[at];
+    loop {
+        let first = 4 * at + 1;
+        if first >= heap.len() {
+            break;
+        }
+        let mut least = first;
+        for child in first + 1..(first + 4).min(heap.len()) {
+            if heap[child].before(&heap[least]) {
+                least = child;
+            }
+        }
+        if !heap[least].before(&entry) {
+            break;
+        }
+        heap[at] = heap[least];
+        rows[heap[at].node as usize].heap_at = at as u32;
+        at = least;
+    }
+    heap[at] = entry;
+    rows[entry.node as usize].heap_at = at as u32;
+}
+
+fn heap_remove(heap: &mut Vec<Ready>, rows: &mut [NodeRow], at: usize) {
+    rows[heap[at].node as usize].heap_at = NONE;
+    let last = heap.pop().expect("a ready node in its heap");
+    if at == heap.len() {
+        return;
+    }
+    heap[at] = last;
+    if at > 0 && last.before(&heap[(at - 1) / 4]) {
+        sift_up(heap, rows, at);
+    } else {
+        sift_down(heap, rows, at);
+    }
 }

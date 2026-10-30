@@ -9,7 +9,6 @@
 //! [`crate::watch::Tree`] watches with inotify then.
 
 use std::{
-    collections::BTreeSet,
     ffi::CString,
     io,
     os::{
@@ -65,15 +64,52 @@ struct Mount {
     fd: OwnedFd,
 }
 
+/// Where a directory an event names is, as far as the watch cares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    /// Outside the root, or under it beside the watched directory (a `target`): its events
+    /// are dropped.
+    Outside,
+    /// The watched directory or one under it, relative to the root: each of its events counts.
+    Under(Box<str>),
+    /// A directory above the watched one ("" for the root): an event counts when its name
+    /// leads to the watched directory.
+    Above(Box<str>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Outside,
+    Under,
+    Above,
+}
+
+/// Whether `error` is of opening a directory gone, or made unreadable, since an event named it.
+fn gone(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::EACCES | libc::ELOOP)
+    )
+}
+
+/// How many directories' places are kept before the cache starts again.
+const SEEN: usize = 1 << 16;
+
 pub(crate) struct Fanotify {
     fd: OwnedFd,
     /// The driver's root with its links resolved, as the kernel names an opened handle.
     root: PathBuf,
     dir: FileName,
     mounts: Vec<Mount>,
-    /// Where each directory under `dir` was last seen, relative to the root, by its file
-    /// system and handle.
-    known: FxHashMap<Vec<u8>, String>,
+    /// Where each directory under `dir` was last seen, relative to the root, by its key
+    /// ([`key`]).
+    known: FxHashMap<Box<[u8]>, String>,
+    /// The place of each directory an event named, by its key, so a batch of events opens each
+    /// directory's handle once and none again until a directory moves: the mark covers the
+    /// whole file system, and without it every write into a `target` or `/tmp` cost an
+    /// `open_by_handle_at`, a `readlink` and a `close`. Dropped when any directory under the
+    /// root moves and when events were lost, either of which can make a place untrue.
+    seen: FxHashMap<Box<[u8]>, Place>,
 }
 
 impl Fanotify {
@@ -112,8 +148,9 @@ impl Fanotify {
             dir: dir.clone(),
             mounts: Vec::new(),
             known: FxHashMap::default(),
+            seen: FxHashMap::default(),
         };
-        watch.learn(dir.as_str(), true, &mut BTreeSet::new())?;
+        watch.learn(dir.as_str(), true, &mut Vec::new())?;
         Ok(watch)
     }
 
@@ -122,24 +159,36 @@ impl Fanotify {
     }
 
     /// What the events in `bytes` say, learning each directory they say was made or moved in.
+    /// An event in a directory whose place is known costs one hash lookup, and one beside the
+    /// watched directory nothing more.
     pub(crate) fn take(&mut self, bytes: &[u8]) -> Done {
         let (events, mut lost) = parse(bytes);
-        let mut files = BTreeSet::new();
+        if lost {
+            self.seen.clear();
+        }
+        let mut files = Vec::with_capacity(events.len());
+        let mut rel = String::new();
         for (mask, record) in events {
-            let dir = match self.resolve(record.fsid, record.kind, record.handle) {
-                Ok(Some(dir)) => dir,
-                Ok(None) => continue,
+            let kind = match self.place(&record, &mut rel) {
+                Ok(Kind::Outside) => continue,
+                Ok(kind) => kind,
                 Err(_) => {
                     lost = true;
                     continue;
                 }
             };
-            let rel = match record.name {
-                b"" | b"." => dir,
-                name => join(&dir, &String::from_utf8_lossy(name)),
-            };
+            let moved = mask & ONDIR != 0 && mask & (MOVED_FROM | MOVED_TO) != 0;
+            if moved {
+                self.seen.clear();
+            }
+            if !matches!(record.name, b"" | b".") {
+                if !rel.is_empty() {
+                    rel.push('/');
+                }
+                rel.push_str(&String::from_utf8_lossy(record.name));
+            }
             let Some(file) = FileName::new(&rel) else { continue };
-            if !file.is_under(&self.dir) {
+            if kind == Kind::Above && !file.is_under(&self.dir) {
                 continue;
             }
             if mask & ONDIR != 0
@@ -148,16 +197,33 @@ impl Fanotify {
             {
                 lost = true;
             }
-            files.insert(file);
+            files.push(file);
         }
-        Done::Changed { files: files.into_iter().collect(), lost }
+        files.sort_unstable();
+        files.dedup();
+        Done::Changed { files, lost }
+    }
+
+    /// The kind of place of the directory `record` names, with its name relative to the root
+    /// written to `rel` (empty for [`Kind::Outside`]); its handle is opened only the first time.
+    fn place(&mut self, record: &Record<'_>, rel: &mut String) -> io::Result<Kind> {
+        if let Some(place) = self.seen.get(record.key) {
+            return Ok(write(place, rel));
+        }
+        let place = self.resolve(record.fsid, record.key, record.kind, record.handle)?;
+        let kind = write(&place, rel);
+        if self.seen.len() >= SEEN {
+            self.seen.clear();
+        }
+        self.seen.insert(record.key.into(), place);
+        Ok(kind)
     }
 
     /// Learns the handle of `rel` and of every directory under it, marking each file system
     /// met, and adds each file found to `found`: a directory moved in has no events of what
     /// was in it already. Every error of the watched directory itself (`top`) is the watch's;
     /// below it, a directory gone or unreadable is passed over.
-    fn learn(&mut self, rel: &str, top: bool, found: &mut BTreeSet<FileName>) -> io::Result<()> {
+    fn learn(&mut self, rel: &str, top: bool, found: &mut Vec<FileName>) -> io::Result<()> {
         let mut todo = vec![rel.to_owned()];
         let mut first = top;
         while let Some(rel) = todo.pop() {
@@ -165,15 +231,13 @@ impl Fanotify {
             let is_top = std::mem::take(&mut first);
             match self.learn_one(&path, &rel) {
                 Ok(()) => {}
-                Err(error) if is_top => return Err(error),
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::EACCES | libc::ELOOP)
-                    ) =>
-                {
-                    continue;
+                Err(error) if is_top => {
+                    return Err(match gone(&error) {
+                        true => named(error, format!("opening {}", path.display())),
+                        false => error,
+                    });
                 }
+                Err(error) if gone(&error) => continue,
                 Err(error) => return Err(error),
             }
             let Ok(entries) = std::fs::read_dir(&path) else { continue };
@@ -182,7 +246,7 @@ impl Fanotify {
                 if entry.file_type().is_ok_and(|it| it.is_dir()) {
                     todo.push(child);
                 } else if let Some(file) = FileName::new(&child) {
-                    found.insert(file);
+                    found.push(file);
                 }
             }
         }
@@ -196,7 +260,11 @@ impl Fanotify {
         let dir = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         if dir < 0 {
             let error = io::Error::last_os_error();
-            return Err(keep_eperm(error, format!("opening {}", path.display())));
+            // Kept bare so `learn` can pass over a directory gone below the watched one.
+            return Err(match gone(&error) {
+                true => error,
+                false => keep_eperm(error, format!("opening {}", path.display())),
+            });
         }
         // SAFETY: the call returned a descriptor of its own.
         let dir = unsafe { OwnedFd::from_raw_fd(dir) };
@@ -242,36 +310,74 @@ impl Fanotify {
                 .map_err(|error| keep_eperm(error, format!("open_by_handle_at in {}", path.display())))?;
             self.mounts.push(Mount { fsid, fd: dir });
         }
-        if FileName::new(rel).is_some_and(|it| it.is_under(&self.dir)) {
-            self.known.insert(key(&fsid, kind, &handle), rel.to_owned());
+        let key = key(&fsid, kind, &handle);
+        let place = classify(&self.dir, rel);
+        if matches!(place, Place::Under(_)) {
+            self.known.insert(key.clone(), rel.to_owned());
+        }
+        if self.seen.len() < SEEN {
+            self.seen.insert(key, place);
         }
         Ok(())
     }
 
-    /// Where the directory of `handle` is, relative to the root: `None` outside it, or for a
-    /// directory gone that was never under the watched one. An error where it cannot be said.
-    fn resolve(&mut self, fsid: &[u8], kind: i32, handle: &[u8]) -> io::Result<Option<String>> {
-        let Some(mount) = self.mounts.iter().find(|it| it.fsid[..] == *fsid) else { return Ok(None) };
-        let key = key(fsid, kind, handle);
+    /// Where the directory of `handle` (whose [`key`] is `key`) is now: outside the root, or a
+    /// directory gone that was never under the watched one, is [`Place::Outside`]. An error
+    /// where it cannot be said.
+    fn resolve(&mut self, fsid: &[u8], key: &[u8], kind: i32, handle: &[u8]) -> io::Result<Place> {
+        let Some(mount) = self.mounts.iter().find(|it| it.fsid[..] == *fsid) else {
+            return Ok(Place::Outside);
+        };
         let path = open_by_handle(mount.fd.as_raw_fd(), kind, handle).and_then(|fd| path_of(&fd));
         match path {
             Ok(path) => {
                 let Ok(rel) = path.strip_prefix(&self.root) else {
-                    self.known.remove(&key);
-                    return Ok(None);
+                    self.known.remove(key);
+                    return Ok(Place::Outside);
                 };
-                let rel = rel.to_string_lossy().into_owned();
-                if FileName::new(&rel).is_some_and(|it| it.is_under(&self.dir)) {
-                    self.known.insert(key, rel.clone());
+                let rel = rel.to_string_lossy();
+                let place = classify(&self.dir, &rel);
+                if matches!(place, Place::Under(_)) {
+                    self.known.insert(key.into(), rel.into_owned());
                 } else {
-                    self.known.remove(&key);
+                    self.known.remove(key);
                 }
-                Ok(Some(rel))
+                Ok(place)
             }
             Err(error) if matches!(error.raw_os_error(), Some(libc::ESTALE | libc::ENOENT)) => {
-                Ok(self.known.get(&key).cloned())
+                Ok(self.known.get(key).map_or(Place::Outside, |rel| classify(&self.dir, rel)))
             }
             Err(error) => Err(error),
+        }
+    }
+}
+
+/// The place of the directory `rel` (relative to the root, "" for the root) for a watch of
+/// `dir`.
+fn classify(dir: &FileName, rel: &str) -> Place {
+    if FileName::new(rel).is_some_and(|it| it.is_under(dir)) {
+        return Place::Under(rel.into());
+    }
+    let above = rel.is_empty()
+        || dir.as_str().strip_prefix(rel).is_some_and(|rest| rest.starts_with('/'));
+    match above {
+        true => Place::Above(rel.into()),
+        false => Place::Outside,
+    }
+}
+
+/// `place`'s name into `rel`, and its kind.
+fn write(place: &Place, rel: &mut String) -> Kind {
+    rel.clear();
+    match place {
+        Place::Outside => Kind::Outside,
+        Place::Under(dir) => {
+            rel.push_str(dir);
+            Kind::Under
+        }
+        Place::Above(dir) => {
+            rel.push_str(dir);
+            Kind::Above
         }
     }
 }
@@ -280,6 +386,9 @@ impl Fanotify {
 #[derive(Debug, PartialEq, Eq)]
 struct Record<'a> {
     fsid: &'a [u8],
+    /// The file system's id and the `struct file_handle`, as the event carries them: the
+    /// directory's [`key`], read in place.
+    key: &'a [u8],
     kind: i32,
     handle: &'a [u8],
     name: &'a [u8],
@@ -333,6 +442,7 @@ fn fid(body: &[u8], named: bool) -> Option<Record<'_>> {
     let size = u32_at(body.get(..16)?, 8) as usize;
     let kind = i32::from_ne_bytes(body[12..16].try_into().ok()?);
     let handle = body.get(16..16 + size)?;
+    let key = &body[..16 + size];
     let name = match named {
         true => {
             let rest = &body[16 + size..];
@@ -340,7 +450,7 @@ fn fid(body: &[u8], named: bool) -> Option<Record<'_>> {
         }
         false => &[],
     };
-    Some(Record { fsid, kind, handle, name })
+    Some(Record { fsid, key, kind, handle, name })
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -355,8 +465,11 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
 }
 
-fn key(fsid: &[u8], kind: i32, handle: &[u8]) -> Vec<u8> {
-    [fsid, &kind.to_ne_bytes()[..], handle].concat()
+/// A directory's key: its file system's id, then its `struct file_handle` (length, type,
+/// bytes), laid out as an event's record carries them.
+fn key(fsid: &[u8], kind: i32, handle: &[u8]) -> Box<[u8]> {
+    let size = u32::try_from(handle.len()).expect("a handle of at most MAX_HANDLE bytes");
+    [fsid, &size.to_ne_bytes()[..], &kind.to_ne_bytes()[..], handle].concat().into()
 }
 
 /// The id of the file system of `fd`, as fanotify's events carry it.
@@ -453,7 +566,10 @@ fn join(dir: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::BTreeSet,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -493,13 +609,72 @@ mod tests {
         bytes.extend(event(DELETE | ONDIR, &dfid_name(fsid, 1, &[7; 12], b"sub")));
         let (events, lost) = parse(&bytes);
         assert!(!lost);
+        let (file, dir) = (key(&fsid, 1, &[9; 8]), key(&fsid, 1, &[7; 12]));
         assert_eq!(
             events,
             vec![
-                (CREATE, Record { fsid: &fsid, kind: 1, handle: &[9; 8], name: b"lib.rs" }),
-                (DELETE | ONDIR, Record { fsid: &fsid, kind: 1, handle: &[7; 12], name: b"sub" }),
+                (
+                    CREATE,
+                    Record { fsid: &fsid, key: &file, kind: 1, handle: &[9; 8], name: b"lib.rs" }
+                ),
+                (
+                    DELETE | ONDIR,
+                    Record { fsid: &fsid, key: &dir, kind: 1, handle: &[7; 12], name: b"sub" }
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn a_directory_is_placed_by_where_it_is_against_the_watched_one() {
+        let dir = FileName::new("crates/a").unwrap();
+        assert_eq!(classify(&dir, "crates/a"), Place::Under("crates/a".into()));
+        assert_eq!(classify(&dir, "crates/a/src"), Place::Under("crates/a/src".into()));
+        assert_eq!(classify(&dir, ""), Place::Above("".into()));
+        assert_eq!(classify(&dir, "crates"), Place::Above("crates".into()));
+        assert_eq!(classify(&dir, "crates/ab"), Place::Outside);
+        assert_eq!(classify(&dir, "crate"), Place::Outside);
+        assert_eq!(classify(&dir, "target"), Place::Outside);
+    }
+
+    /// Events of directories whose places are known are read without opening a handle: those
+    /// beside the watched directory are dropped, those above it count only on the way to it,
+    /// and a directory moved drops every place, so what comes after it is found anew (here,
+    /// with no file system marked, as outside).
+    #[test]
+    fn known_places_answer_until_a_directory_moves() {
+        let root = std::env::temp_dir().join(format!("blaze-fanotify-seen-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(&root).unwrap());
+        let mut watch = Fanotify {
+            fd,
+            root: root.clone(),
+            dir: FileName::new("src").unwrap(),
+            mounts: Vec::new(),
+            known: FxHashMap::default(),
+            seen: FxHashMap::default(),
+        };
+        let fsid = [3; 8];
+        let (under, beside, top) = ([1; 8], [2; 8], [4; 8]);
+        watch.seen.insert(key(&fsid, 1, &under), Place::Under("src/a".into()));
+        watch.seen.insert(key(&fsid, 1, &beside), Place::Outside);
+        watch.seen.insert(key(&fsid, 1, &top), Place::Above("".into()));
+        let mut bytes = event(CREATE, &dfid_name(fsid, 1, &under, b"x.rs"));
+        bytes.extend(event(MODIFY, &dfid_name(fsid, 1, &under, b"x.rs")));
+        bytes.extend(event(CLOSE_WRITE, &dfid_name(fsid, 1, &beside, b"out.o")));
+        bytes.extend(event(MODIFY, &dfid_name(fsid, 1, &top, b"src")));
+        bytes.extend(event(MODIFY, &dfid_name(fsid, 1, &top, b"Cargo.toml")));
+        bytes.extend(event(MOVED_TO | ONDIR, &dfid_name(fsid, 1, &under, b"moved")));
+        bytes.extend(event(MODIFY, &dfid_name(fsid, 1, &under, b"after.rs")));
+        let Done::Changed { files, lost } = watch.take(&bytes) else { unreachable!() };
+        assert!(!lost);
+        let names: Vec<&str> = files.iter().map(FileName::as_str).collect();
+        assert_eq!(names, ["src", "src/a/moved", "src/a/x.rs"]);
+        assert_eq!(watch.seen.len(), 1);
+        assert_eq!(watch.seen.get(&key(&fsid, 1, &under)[..]), Some(&Place::Outside));
+        drop(watch);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

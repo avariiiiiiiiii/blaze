@@ -65,8 +65,9 @@ const CLIF_PER_IMPORTED: usize = 16;
 /// A function as the compiles that call it import it.
 pub(super) struct Export {
     /// The module of the function alone, under `llvm::OWN`, with what it refers to declared
-    /// under the names of `requests`, as LLVM's pre-link pipeline left it.
-    pub(super) bitcode: Vec<u8>,
+    /// under the names of `requests`, as LLVM's pre-link pipeline left it. Shared with the
+    /// function's own compile where the two are the same bytes (`v2::release`).
+    pub(super) bitcode: Arc<[u8]>,
     pub(super) requests: Requests,
     pub(super) signature: ir::Signature,
     /// Its instructions, as LLVM counts them.

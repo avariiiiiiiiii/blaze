@@ -7,8 +7,9 @@ use span::{Edition, ErasedFileAstId};
 use crate::{
     item_tree::{
         Const, Enum, ExternBlock, ExternCrate, Function, Impl, ItemTree, Macro2, MacroCall,
-        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, SourceDatabase, Static,
-        Struct, Trait, TypeAlias, Union, Use, UseTree, UseTreeKind, attrs::AttrsOrCfg,
+        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, SourceDatabase,
+        Static, Struct, Trait, TypeAlias, Union, Use, UseTreeId, UseTreeKind,
+        attrs::AttrsOrCfgRef,
     },
     visibility::RawVisibility,
 };
@@ -84,13 +85,13 @@ impl Printer<'_> {
         }
     }
 
-    fn print_attrs(&mut self, attrs: &AttrsOrCfg, inner: bool, separated_by: &str) {
+    fn print_attrs(&mut self, attrs: AttrsOrCfgRef<'_>, inner: bool, separated_by: &str) {
         let (cfg_disabled_expr, attrs) = match attrs {
-            AttrsOrCfg::Enabled { attrs } => (None, attrs),
-            AttrsOrCfg::CfgDisabled(inner_box) => (Some(&inner_box.0), &inner_box.1),
+            AttrsOrCfgRef::Enabled { attrs } => (None, attrs),
+            AttrsOrCfgRef::CfgDisabled(cfg, attrs) => (Some(cfg), attrs),
         };
         let inner = if inner { "!" } else { "" };
-        for attr in &*attrs.as_ref() {
+        for attr in &*attrs {
             w!(
                 self,
                 "#{}[{}{}]{}",
@@ -122,8 +123,8 @@ impl Printer<'_> {
         };
     }
 
-    fn print_use_tree(&mut self, use_tree: &UseTree) {
-        match &use_tree.kind {
+    fn print_use_tree(&mut self, use_tree: UseTreeId) {
+        match self.tree.use_tree(use_tree).kind(self.tree) {
             UseTreeKind::Single { path, alias } => {
                 w!(self, "{}", path.display(self.db, self.edition));
                 if let Some(alias) = alias {
@@ -141,7 +142,7 @@ impl Printer<'_> {
                     w!(self, "{}::", prefix.display(self.db, self.edition));
                 }
                 w!(self, "{{");
-                for (i, tree) in list.iter().enumerate() {
+                for (i, &tree) in list.iter().enumerate() {
                     if i != 0 {
                         w!(self, ", ");
                     }
@@ -161,15 +162,15 @@ impl Printer<'_> {
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
                 w!(self, "use ");
-                self.print_use_tree(use_tree);
+                self.print_use_tree(*use_tree);
                 wln!(self, ";");
             }
             ModItemKind::ExternCrate(ast_id, item) => {
                 let ExternCrate { name, alias, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                w!(self, "extern crate {}", name.display(self.db, self.edition));
-                if let Some(alias) = alias {
+                w!(self, "extern crate {}", self.tree[*name].display(self.db, self.edition));
+                if let Some(alias) = self.tree.import_alias(*alias) {
                     w!(self, " as {}", alias.display(self.edition));
                 }
                 wln!(self, ";");
@@ -179,7 +180,7 @@ impl Printer<'_> {
                 self.print_ast_id(ast_id.erase());
                 w!(self, "extern {{");
                 self.indented(|this| {
-                    for child in &**children {
+                    for child in this.tree.items(*children) {
                         this.print_mod_item(*child);
                     }
                 });
@@ -189,32 +190,32 @@ impl Printer<'_> {
                 let Function { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                wln!(self, "fn {};", name.display(self.db, self.edition));
+                wln!(self, "fn {};", self.tree[*name].display(self.db, self.edition));
             }
             ModItemKind::Struct(ast_id, item) => {
                 let Struct { visibility, name, value_ns_ctor: _ } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                wln!(self, "struct {} {{ ... }}", name.display(self.db, self.edition));
+                wln!(self, "struct {} {{ ... }}", self.tree[*name].display(self.db, self.edition));
             }
             ModItemKind::Union(ast_id, item) => {
                 let Union { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                wln!(self, "union {} {{ ... }}", name.display(self.db, self.edition));
+                wln!(self, "union {} {{ ... }}", self.tree[*name].display(self.db, self.edition));
             }
             ModItemKind::Enum(ast_id, item) => {
                 let Enum { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                wln!(self, "enum {} {{ ... }}", name.display(self.db, self.edition));
+                wln!(self, "enum {} {{ ... }}", self.tree[*name].display(self.db, self.edition));
             }
             ModItemKind::Const(ast_id, item) => {
                 let Const { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
                 w!(self, "const ");
-                match name {
+                match self.tree.get_name(*name) {
                     Some(name) => w!(self, "{}", name.display(self.db, self.edition)),
                     None => w!(self, "_"),
                 }
@@ -225,7 +226,7 @@ impl Printer<'_> {
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
                 w!(self, "static ");
-                w!(self, "{}", name.display(self.db, self.edition));
+                w!(self, "{}", self.tree[*name].display(self.db, self.edition));
                 w!(self, " = _;");
                 wln!(self);
             }
@@ -233,7 +234,7 @@ impl Printer<'_> {
                 let Trait { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                w!(self, "trait {} {{ ... }}", name.display(self.db, self.edition));
+                w!(self, "trait {} {{ ... }}", self.tree[*name].display(self.db, self.edition));
             }
             ModItemKind::Impl(ast_id, item) => {
                 let Impl { is_trait_impl: _ } = item;
@@ -244,20 +245,20 @@ impl Printer<'_> {
                 let TypeAlias { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                w!(self, "type {}", name.display(self.db, self.edition));
+                w!(self, "type {}", self.tree[*name].display(self.db, self.edition));
                 w!(self, ";");
                 wln!(self);
             }
             ModItemKind::Mod(ast_id, item) => {
-                let Mod { name, visibility, kind } = item;
+                let Mod { name, visibility, items: _ } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                w!(self, "mod {}", name.display(self.db, self.edition));
-                match kind {
+                w!(self, "mod {}", self.tree[*name].display(self.db, self.edition));
+                match self.tree.mod_kind(item) {
                     ModKind::Inline { items } => {
                         w!(self, " {{");
                         self.indented(|this| {
-                            for item in &**items {
+                            for item in items {
                                 this.print_mod_item(*item);
                             }
                         });
@@ -277,18 +278,22 @@ impl Printer<'_> {
                     ctxt,
                     expand_to
                 );
-                wln!(self, "{}!(...);", path.display(self.db, self.edition));
+                wln!(self, "{}!(...);", self.tree[*path].display(self.db, self.edition));
             }
             ModItemKind::MacroRules(ast_id, item) => {
                 let MacroRules { name } = item;
                 self.print_ast_id(ast_id.erase());
-                wln!(self, "macro_rules! {} {{ ... }}", name.display(self.db, self.edition));
+                wln!(
+                    self,
+                    "macro_rules! {} {{ ... }}",
+                    self.tree[*name].display(self.db, self.edition)
+                );
             }
             ModItemKind::Macro2(ast_id, item) => {
                 let Macro2 { name, visibility } = item;
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                wln!(self, "macro {} {{ ... }}", name.display(self.db, self.edition));
+                wln!(self, "macro {} {{ ... }}", self.tree[*name].display(self.db, self.edition));
             }
         }
 

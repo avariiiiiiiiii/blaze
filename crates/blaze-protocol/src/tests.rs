@@ -476,6 +476,65 @@ fn a_record_of_functions_is_small() {
     assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
 }
 
+/// A writer that takes one byte per write, and counts its writes.
+struct Trickle {
+    bytes: Vec<u8>,
+    writes: usize,
+}
+
+impl std::io::Write for Trickle {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        match bytes.first() {
+            Some(&byte) => {
+                self.bytes.push(byte);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A frame is its length and its item however few bytes each write takes; into a `Vec` it is
+/// one write; one encoded in place is the frame `send` writes; a kept buffer reads them all.
+#[test]
+fn frames_are_written_in_place_and_read_into_one_buffer() {
+    let item = to_vec(&record()).unwrap();
+    let mut framed = (item.len() as u32).to_be_bytes().to_vec();
+    framed.extend_from_slice(&item);
+    let mut trickle = Trickle { bytes: Vec::new(), writes: 0 };
+    write_frame(&mut trickle, &item).unwrap();
+    assert_eq!(trickle.bytes, framed);
+    assert_eq!(trickle.writes, framed.len());
+    let mut whole = Vec::new();
+    write_frame(&mut whole, &item).unwrap();
+    assert_eq!(whole, framed);
+    let mut sent = Vec::new();
+    send(&mut sent, &record()).unwrap();
+    assert_eq!(sent, framed);
+    let mut writer = crate::cbor::Writer::new();
+    let mut appended = vec![9];
+    crate::append_frame(&mut writer, &mut appended, &record()).unwrap();
+    assert_eq!(appended[1..], framed);
+    // An item with no encoding leaves the buffer as it was.
+    assert!(crate::append_frame(&mut writer, &mut appended, &u128::MAX).is_err());
+    assert_eq!(appended[1..], framed);
+    let mut stream = framed.clone();
+    stream.extend_from_slice(&framed);
+    let mut from = stream.as_slice();
+    let mut buffer = Vec::new();
+    for _ in 0..2 {
+        assert!(crate::read_frame_into(&mut from, &mut buffer).unwrap());
+        assert_eq!(buffer, item);
+    }
+    assert!(!crate::read_frame_into(&mut from, &mut buffer).unwrap());
+    assert!(buffer.is_empty());
+}
+
 #[test]
 fn a_cancelled_node_is_settled_and_encodes_as_its_name() {
     use crate::events::NodeState;

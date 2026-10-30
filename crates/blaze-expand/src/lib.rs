@@ -1,4 +1,4 @@
-//! Proc-macro expansions kept in the store (docs/v2/plan/lanes/usercode.md section 6.5), so that no
+//! Proc-macro expansions kept in the store (docs/v2/plan/lanes/usercode.md), so that no
 //! macro is expanded twice for the same inputs, on this machine or, through the store's
 //! remote, another.
 //!
@@ -20,6 +20,10 @@
 //! and one that failed. `BLAZE_PROC_MACRO_CACHE=check` expands every call it finds kept
 //! anyway, and an output other than the kept one is an error naming the macro.
 //!
+//! An expansion runs inside a query on a worker, many at once, so it writes nothing shared: it
+//! reads the store, and what it keeps it leaves in its worker's own buffer for the store's
+//! owner ([`puts`]); its statistics are its worker's ([`tally`]).
+//!
 //! A macro of a crate blaze has a native expander for ([`native`]) is expanded by it, and not
 //! kept: `BLAZE_NATIVE_MACROS=verify` expands it both ways and fails the expansion where they
 //! differ; `BLAZE_NATIVE_MACROS=off` uses none.
@@ -28,13 +32,12 @@
 
 mod compare;
 pub mod native;
+pub mod puts;
+pub mod tally;
 
 use std::{
     any::Any,
-    sync::{
-        Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -44,9 +47,11 @@ use blaze_core::Traced;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     Given, RunKey, RunKind,
-    index::{self, FindError, Found, KeepError},
-    inputs::Disk,
+    index::{self, FindError, Found},
+    inputs::{self, Files, Now},
 };
+
+pub use puts::{Published, Put, publish, put, take_puts};
 use hir_expand::proc_macro::{ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::{
@@ -111,6 +116,8 @@ impl Native {
 
 /// Where expansions are kept, and what they are keyed by besides their call.
 pub struct Expansions {
+    /// Read to find an expansion, never written by one: what an expansion keeps goes to its
+    /// worker's buffer ([`take_puts`]), which the store's owner [`publish`]es.
     pub store: Arc<RwLock<Store>>,
     /// The toolchain whose proc-macro ABI and library the macros are built with.
     pub toolchain: ContentId,
@@ -125,12 +132,6 @@ struct Installed {
 }
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
-
-thread_local! {
-    /// The machine's files, hashed once per change of what `stat` says of them: one per
-    /// expanding thread, so no check of an expansion's inputs waits on another's.
-    static DISK: std::cell::RefCell<Disk> = std::cell::RefCell::new(Disk::new(Vec::new()));
-}
 
 /// What the store has of a call.
 enum Lookup {
@@ -378,7 +379,7 @@ impl Kept {
     }
 
     fn error(&self, why: impl std::fmt::Display) -> ProcMacroExpansionError {
-        system(format!("the expansion of `{}` of {}: {why}", self.name, self.dylib.path))
+        system(format!("{}: {why}", self.what()))
     }
 
     /// Expands by the macro's server or module, through the store.
@@ -410,14 +411,17 @@ impl Kept {
         let (given, spans) = given(&installed.expansions.toolchain, &call);
         let code = self.dylib.code().map_err(|why| self.error(why))?;
         let run = RunKey { code, given: given.finish() };
-        let call_env: Vec<(String, String)> =
-            env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
-        let seen = Environment::seen(&installed.expansions.environment.passed(), &call_env);
-        let found = DISK.with_borrow_mut(|disk| {
+        let seen = inputs::Env::new(Environment::seen(
+            &installed.expansions.environment.passed(),
+            env.iter(),
+        ));
+        // The files' table and this call's environment: no lock, and nothing here asks the
+        // database, so the store's guard is the one thing held across `find`.
+        let mut now = Now { files: Files::shared(), env: &seen };
+        let found = {
             let store = installed.expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            disk.set_env(seen);
-            match index::find(&store, &run, disk) {
-                // Read in place, under the lock: a hit copies nothing out of the store.
+            match index::find(&store, &run, &mut now) {
+                // Read in place, under the guard: a hit copies nothing out of the store.
                 Ok(Found::Hit { value, .. }) if installed.mode == Mode::Keep => {
                     read(value, &spans).map(Lookup::Read).map_err(|why| self.error(why))
                 }
@@ -429,11 +433,11 @@ impl Kept {
                 }
                 Err(FindError::Inputs(unreadable)) => Err(self.error(unreadable)),
             }
-        })?;
-        COUNTS.keyed.add(start.elapsed());
+        }?;
+        count(Counted::Keyed, start.elapsed());
         let found = match found {
             Lookup::Read(output) => {
-                COUNTS.found.add(start.elapsed());
+                count(Counted::Found, start.elapsed());
                 return Ok(output);
             }
             Lookup::Bytes(bytes) => Some(bytes),
@@ -444,12 +448,12 @@ impl Kept {
         let expanded =
             self.inner.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir);
         let traced = warm::take_traced();
-        COUNTS.expanded.add(expand.elapsed());
-        COUNTS.kinds[kind_byte(self.kind) as usize].add(expand.elapsed());
+        count(Counted::Expanded, expand.elapsed());
+        count(Counted::of(self.kind), expand.elapsed());
         let output = match self.failed(expanded) {
             Ok(output) => output,
             Err(error) => {
-                COUNTS.failed.add(Duration::ZERO);
+                count(Counted::Failed, Duration::ZERO);
                 return Err(error);
             }
         };
@@ -461,7 +465,7 @@ impl Kept {
                      of every input it was traced to read"
                 )));
             }
-            COUNTS.checked.add(Duration::ZERO);
+            count(Counted::Checked, Duration::ZERO);
             return Ok(output);
         }
         let traced = match self.keepable(traced, asked) {
@@ -470,21 +474,17 @@ impl Kept {
             Err(error) => return Err(error),
         };
         let Some(bytes) = bytes else {
-            COUNTS.unspanned.add(Duration::ZERO);
+            count(Counted::Unspanned, Duration::ZERO);
             return Ok(output);
         };
-        let mut store = installed.expansions.store.write().unwrap_or_else(|it| it.into_inner());
-        match index::keep(&mut store, &run, &traced, bytes) {
-            Ok(_) => COUNTS.kept.add(Duration::ZERO),
-            Err(KeepError::Corrupt(corrupt)) => return Err(self.error(corrupt)),
-            Err(KeepError::Mismatch(mismatch)) => {
-                return Err(self.error(format!(
-                    "the store has another expansion under the same key of every input it read, \
-                     so the key misses an input or the macro is not deterministic: {mismatch:?}"
-                )));
-            }
-        }
+        put(Put { run, traced, value: bytes, what: self.what() });
+        count(Counted::Kept, Duration::ZERO);
         Ok(output)
+    }
+
+    /// This macro, as an error about one of its expansions begins.
+    fn what(&self) -> String {
+        format!("the expansion of `{}` of {}", self.name, self.dylib.path)
     }
 
     /// What the expansion read, when it can be kept by it: `None` when it can't be, counted
@@ -498,16 +498,16 @@ impl Kept {
             Some(Ok(traced)) => traced,
             Some(Err(why)) => return Err(self.error(why)),
             None => {
-                COUNTS.untraced.add(Duration::ZERO);
+                count(Counted::Untraced, Duration::ZERO);
                 return Ok(None);
             }
         };
         if load_cargo::asked() != asked {
-            COUNTS.asked.add(Duration::ZERO);
+            count(Counted::Asked, Duration::ZERO);
             return Ok(None);
         }
         if index::untraceable(&traced) {
-            COUNTS.untraceable.add(Duration::ZERO);
+            count(Counted::Untraceable, Duration::ZERO);
             return Ok(None);
         }
         Ok(Some(traced))
@@ -551,7 +551,7 @@ impl ProcMacroExpander for Kept {
             let start = Instant::now();
             let natively =
                 native.expand(db, subtree, attrs, env, def_site, call_site, mixed_site);
-            COUNTS.native.add(start.elapsed());
+            count(Counted::Native, start.elapsed());
             if installed().native != Native::Verify {
                 return natively;
             }
@@ -574,7 +574,7 @@ impl ProcMacroExpander for Kept {
                      {difference}"
                 )));
             }
-            COUNTS.verified.add(Duration::ZERO);
+            count(Counted::Verified, Duration::ZERO);
             return Ok(normally);
         }
         if compare::enabled() {
@@ -645,10 +645,10 @@ impl ProcMacroExpander for Kept {
             mixed_site,
             current_dir,
         );
-        COUNTS.expanded.add(start.elapsed());
-        COUNTS.kinds[kind_byte(self.kind) as usize].add(start.elapsed());
+        count(Counted::Expanded, start.elapsed());
+        count(Counted::of(self.kind), start.elapsed());
         if expanded.is_err() {
-            COUNTS.failed.add(Duration::ZERO);
+            count(Counted::Failed, Duration::ZERO);
         }
         self.failed(expanded)
     }
@@ -660,84 +660,84 @@ impl ProcMacroExpander for Kept {
     }
 }
 
-/// How many, and the time they took on the threads that expanded them.
-struct Count {
-    calls: AtomicU64,
-    nanos: AtomicU64,
-}
-
-impl Count {
-    const fn new() -> Count {
-        Count { calls: AtomicU64::new(0), nanos: AtomicU64::new(0) }
-    }
-
-    fn add(&self, took: Duration) {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    fn get(&self) -> (u64, f64) {
-        (self.calls.load(Ordering::Relaxed), self.nanos.load(Ordering::Relaxed) as f64 / 1e9)
-    }
-}
-
-struct Counts {
-    /// Calls given a key and looked for, with the time that took.
-    keyed: Count,
+/// What is counted of expansions, each with the time it took on the thread that did it.
+#[derive(Clone, Copy)]
+enum Counted {
+    /// Calls given a key and looked for.
+    Keyed,
     /// Expanded by the macro's server or module, kept or not.
-    expanded: Count,
-    /// The same, by [`kind_byte`].
-    kinds: [Count; 3],
+    Expanded,
+    /// The same, by kind.
+    Derives,
+    Attributes,
+    FunctionLike,
     /// Read from the store instead.
-    found: Count,
+    Found,
     /// Expanded again under `check`, and the same as kept.
-    checked: Count,
+    Checked,
     /// Expanded by a native expander.
-    native: Count,
+    Native,
     /// Expanded both ways under `verify`, and the same.
-    verified: Count,
-    kept: Count,
-    asked: Count,
-    unspanned: Count,
-    untraced: Count,
-    untraceable: Count,
-    failed: Count,
+    Verified,
+    /// Left for the store's owner to keep ([`puts`]).
+    Kept,
+    Asked,
+    Unspanned,
+    Untraced,
+    Untraceable,
+    Failed,
 }
 
-static COUNTS: Counts = Counts {
-    keyed: Count::new(),
-    expanded: Count::new(),
-    kinds: [Count::new(), Count::new(), Count::new()],
-    found: Count::new(),
-    checked: Count::new(),
-    native: Count::new(),
-    verified: Count::new(),
-    kept: Count::new(),
-    asked: Count::new(),
-    unspanned: Count::new(),
-    untraced: Count::new(),
-    untraceable: Count::new(),
-    failed: Count::new(),
-};
+const COUNTED: usize = Counted::Failed as usize + 1;
+
+impl Counted {
+    fn of(kind: ProcMacroKind) -> Counted {
+        match kind {
+            ProcMacroKind::CustomDerive => Counted::Derives,
+            ProcMacroKind::Attr => Counted::Attributes,
+            ProcMacroKind::Bang => Counted::FunctionLike,
+        }
+    }
+}
+
+static TALLY: tally::Tally<COUNTED> = tally::Tally::new();
+
+thread_local! {
+    static MINE: tally::Mine<COUNTED> = tally::Mine::of(&TALLY);
+}
+
+fn count(what: Counted, took: Duration) {
+    // A thread that is ending has no block left to count into.
+    _ = MINE.try_with(|it| it.add(what as usize, took));
+}
+
+fn counted(what: Counted) -> (u64, f64) {
+    TALLY.get(what as usize)
+}
 
 /// The expansions so far, for the daemon's log: `None` before the first.
 pub fn report() -> Option<String> {
-    let (expanded, expanding) = COUNTS.expanded.get();
-    let (found, finding) = COUNTS.found.get();
-    let (native, natively) = COUNTS.native.get();
+    let (expanded, expanding) = counted(Counted::Expanded);
+    let (found, finding) = counted(Counted::Found);
+    let (native, natively) = counted(Counted::Native);
     if expanded + found + native == 0 {
         return None;
     }
-    let (_, keying) = COUNTS.keyed.get();
+    let (_, keying) = counted(Counted::Keyed);
     let mut said = format!(
         "proc macros: {expanded} expanded in {expanding:.2}s, {found} from the store in \
          {finding:.2}s, {keying:.2}s to key and look for them, {native} natively in \
          {natively:.2}s"
     );
-    let kinds = ["derives", "attributes", "function-like"].iter().zip(&COUNTS.kinds);
+    let kinds = [
+        ("derives", Counted::Derives),
+        ("attributes", Counted::Attributes),
+        ("function-like", Counted::FunctionLike),
+    ];
     let kinds: Vec<_> = kinds
-        .filter_map(|(what, count)| {
-            let (calls, took) = count.get();
+        .into_iter()
+        .filter_map(|(what, kind)| {
+            let (calls, took) = counted(kind);
             (calls != 0).then(|| format!("{calls} {what} in {took:.2}s"))
         })
         .collect();
@@ -745,17 +745,17 @@ pub fn report() -> Option<String> {
         said += &format!(" ({})", kinds.join(", "));
     }
     let rest = [
-        ("kept", &COUNTS.kept),
-        ("checked against what was kept", &COUNTS.checked),
-        ("verified against their native expander", &COUNTS.verified),
-        ("not kept, as they asked the database", &COUNTS.asked),
-        ("not kept, as their output has spans the call has not", &COUNTS.unspanned),
-        ("not kept, as their server traces nothing (BLAZE_SANDBOX=off)", &COUNTS.untraced),
-        ("not kept, as they read the clock or randomness", &COUNTS.untraceable),
-        ("failed", &COUNTS.failed),
+        ("kept", Counted::Kept),
+        ("checked against what was kept", Counted::Checked),
+        ("verified against their native expander", Counted::Verified),
+        ("not kept, as they asked the database", Counted::Asked),
+        ("not kept, as their output has spans the call has not", Counted::Unspanned),
+        ("not kept, as their server traces nothing (BLAZE_SANDBOX=off)", Counted::Untraced),
+        ("not kept, as they read the clock or randomness", Counted::Untraceable),
+        ("failed", Counted::Failed),
     ];
-    for (what, count) in rest {
-        let (calls, _) = count.get();
+    for (what, which) in rest {
+        let (calls, _) = counted(which);
         if calls != 0 {
             said += &format!("; {calls} {what}");
         }

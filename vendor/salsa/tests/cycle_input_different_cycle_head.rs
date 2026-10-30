@@ -31,7 +31,7 @@ trait MyDb: salsa::Database {
 }
 
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct MyDbImpl {
     storage: salsa::Storage<Self>,
     input: Option<Input>,

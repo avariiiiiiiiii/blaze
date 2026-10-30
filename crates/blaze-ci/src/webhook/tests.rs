@@ -210,6 +210,43 @@ fn a_form_encoded_delivery_is_refused_by_name() {
 }
 
 #[test]
+fn escaped_strings_are_read_as_well_as_borrowed_ones() {
+    let body = push("refs/heads/main", false)
+        .replace(r#""refs/heads/main""#, r#""refs\/heads\/l\u00e9ne""#)
+        .replace("indexable-inc/blaze", r"indexable-inc\/blaze");
+    let delivery = parse("push", "1", body.as_bytes()).unwrap();
+    assert_eq!(delivery.repo, "indexable-inc/blaze");
+    assert_eq!(delivery.event, Some(Event::Push { branch: "léne".to_owned(), commit: HEAD.to_owned() }));
+}
+
+#[test]
+fn a_pull_request_ci_runs_needs_its_number_pull_request_and_repository() {
+    let whole = pull_request("opened", SAME_REPO);
+    let value: serde_json::Value = serde_json::from_str(&whole).unwrap();
+    for field in ["number", "pull_request", "repository"] {
+        let mut less = value.clone();
+        less.as_object_mut().unwrap().remove(field);
+        let error = parse("pull_request", "1", less.to_string().as_bytes()).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.what.contains(field), "{}", error.what);
+    }
+    let mut closed = value.clone();
+    closed["action"] = "closed".into();
+    closed.as_object_mut().unwrap().remove("pull_request");
+    let delivery = parse("pull_request", "1", closed.to_string().as_bytes()).unwrap();
+    assert_eq!((delivery.event, delivery.repo.as_str()), (None, "indexable-inc/blaze"));
+}
+
+#[test]
+fn a_signature_of_the_right_length_with_a_non_hex_digit_is_401() {
+    let good = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+    let bad = good.replace("e17", "e1g");
+    let error = verify(b"It's a Secret to Everybody", b"Hello, World!", Some(&bad)).unwrap_err();
+    assert_eq!(error.status, 401);
+    assert_eq!(hex(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
+}
+
+#[test]
 fn a_payload_over_githubs_cap_is_refused() {
     let body = vec![b' '; MOST_PAYLOAD + 1];
     assert_eq!(parse("push", "1", &body).unwrap_err().status, 413);

@@ -62,26 +62,28 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 #[test_log::test]
 fn the_test() {
     crate::sync::check(|| {
-        let db_t1 = Knobs::default();
-        let db_t2 = db_t1.clone();
-        let db_t3 = db_t1.clone();
+        let db = Knobs::default();
+        let db = &db;
 
-        let t1 = thread::spawn(move || {
-            let _span = tracing::info_span!("t1", thread_id = ?thread::current().id()).entered();
-            query_a(&db_t1)
-        });
-        let t2 = thread::spawn(move || {
-            let _span = tracing::info_span!("t2", thread_id = ?thread::current().id()).entered();
-            query_b(&db_t2)
-        });
-        let t3 = thread::spawn(move || {
-            let _span = tracing::info_span!("t3", thread_id = ?thread::current().id()).entered();
-            query_c(&db_t3)
-        });
+        let (r_t1, r_t2, r_t3) = thread::scope(|scope| {
+            let t1 = scope.spawn(move || {
+                let _span =
+                    tracing::info_span!("t1", thread_id = ?thread::current().id()).entered();
+                query_a(db)
+            });
+            let t2 = scope.spawn(move || {
+                let _span =
+                    tracing::info_span!("t2", thread_id = ?thread::current().id()).entered();
+                query_b(db)
+            });
+            let t3 = scope.spawn(move || {
+                let _span =
+                    tracing::info_span!("t3", thread_id = ?thread::current().id()).entered();
+                query_c(db)
+            });
 
-        let r_t1 = t1.join().unwrap();
-        let r_t2 = t2.join().unwrap();
-        let r_t3 = t3.join().unwrap();
+            (t1.join().unwrap(), t2.join().unwrap(), t3.join().unwrap())
+        });
 
         assert_eq!((r_t1, r_t2, r_t3), (MAX, MAX, MAX));
     });

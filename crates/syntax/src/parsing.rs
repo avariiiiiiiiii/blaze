@@ -50,6 +50,18 @@ pub(crate) fn build_tree(
     parser_output: &parser::Output,
     edition: Edition,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
+    let (tree, mut errors, is_eof) = build_parsed(source, lexed, parser_output, edition);
+    errors.extend(lexer_errors(lexed, TextSize::new(0)));
+    (tree, errors, is_eof)
+}
+
+/// [`build_tree`] with the parser's errors only.
+fn build_parsed(
+    source: Arc<str>,
+    lexed: &parser::LexedStr<'_>,
+    parser_output: &parser::Output,
+    edition: Edition,
+) -> (FlatTree, Vec<SyntaxError>, bool) {
     let _p = tracing::info_span!("build_tree").entered();
     debug_assert_eq!(lexed.as_str(), &*source);
     let mut builder = SyntaxTreeBuilder::sourced(source);
@@ -64,8 +76,7 @@ pub(crate) fn build_tree(
         OutlineStrStep::Lazy { kind, text } => builder.lazy(kind, TextSize::of(text)),
     });
 
-    let (tree, mut errors) = builder.finish_raw(edition);
-    errors.extend(lexer_errors(lexed, TextSize::new(0)));
+    let (tree, errors) = builder.finish_raw(edition);
     (tree, errors, is_eof)
 }
 
@@ -117,55 +128,56 @@ pub(crate) fn lexer_errors<'a>(
 
 /// What parses an outline's lazy node: the body block of a `fn`, its text parsed alone as a
 /// block in the file's edition (`data`), which is exactly the subtree a full parse of the
-/// file makes there (`parser`'s outline module says why). The errors of that parse are not
-/// kept here: [`body_parser_errors`] finds them when asked.
-pub(crate) fn expand_lazy(kind: syntax_tree::SyntaxKind, text: &str, data: u32) -> FlatTree {
+/// file makes there (`parser`'s outline module says why), with that parse's parser errors in
+/// the text ([`body_errors`] reads them). Its lexer errors are the outline's, which lexed it.
+pub(crate) fn expand_lazy(
+    kind: syntax_tree::SyntaxKind,
+    text: &str,
+    data: u32,
+) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
     let kind = <RustLanguage as syntax_tree::Language>::kind_from_raw(kind);
     let edition = Edition::from_u32(data);
     let reparser = parser::Reparser::for_node(kind, None, None)
         .unwrap_or_else(|| panic!("a lazy {kind:?}: only blocks are left unparsed"));
     let lexed = parser::LexedStr::new(edition, text);
     let output = reparser.parse(&lexed.to_input(edition));
-    let (tree, _errors, is_eof) = build_tree(Arc::from(text), &lexed, &output, edition);
+    let (tree, errors, is_eof) = build_parsed(Arc::from(text), &lexed, &output, edition);
     assert!(is_eof, "a lazy {kind:?} of {} bytes parsed short of its end", text.len());
-    tree
+    let errors = errors
+        .into_iter()
+        .map(|it| {
+            let (msg, range) = it.into_parts();
+            (range, msg.into_boxed_str())
+        })
+        .collect();
+    (tree, errors)
 }
 
-/// The parser's errors in the lazy node of `kind` at `range` of `source`, its file: the errors
-/// a full parse of the file reports there. Its lexer errors are the outline's.
-pub(crate) fn body_parser_errors(
-    kind: SyntaxKind,
-    source: &str,
-    range: TextRange,
+/// The parser's errors in lazy node `at` of `tree`, an outline in `edition`, parsing it if it
+/// was not yet: the errors a full parse of the file reports there, from the one parse of the
+/// body ([`FlatTree::part_errors`]).
+pub(crate) fn body_errors(
+    tree: &FlatTree,
+    at: u32,
     edition: Edition,
-) -> Vec<SyntaxError> {
-    let Some(reparser) = parser::Reparser::for_node(kind, None, None) else {
-        panic!("a lazy {kind:?}: only blocks are left unparsed")
-    };
-    let lexed = parser::LexedStr::new(edition, &source[range]);
-    let output = reparser.parse(&lexed.to_input(edition));
-    let mut errors = Vec::new();
-    lexed.intersperse_trivia(&output, &mut |step| {
-        if let StrStep::Error { msg, pos } = step {
-            errors.push((msg.to_owned(), pos));
-        }
-    });
+) -> impl Iterator<Item = SyntaxError> + '_ {
+    let start = tree.range(at).start();
     let mut tokens_before = None;
-    errors
-        .into_iter()
-        .map(|(msg, pos)| {
-            // This one error's position is the number of its token in the file, not an offset.
-            let pos = match msg == ILLEGAL_FLOAT {
-                true => {
-                    *tokens_before.get_or_insert_with(|| {
-                        parser::LexedStr::new(edition, &source[..usize::from(range.start())]).len()
-                    }) + pos
-                }
-                false => usize::from(range.start()) + pos,
-            };
-            SyntaxError::new_at_offset(msg, TextSize::try_from(pos).unwrap())
-        })
-        .collect()
+    tree.part_errors(at).iter().map(move |(range, msg)| {
+        // This one error's position is the number of its token in the file, not an offset: in
+        // the body's parse it was the number in the body.
+        let range = match &**msg == ILLEGAL_FLOAT {
+            true => {
+                let before = *tokens_before.get_or_insert_with(|| {
+                    let lexed = parser::LexedStr::new(edition, &tree.source()[..usize::from(start)]);
+                    TextSize::try_from(lexed.len()).unwrap()
+                });
+                *range - start + before
+            }
+            false => *range,
+        };
+        SyntaxError::new(&**msg, range)
+    })
 }
 
 /// The message `LexedStr::intersperse_trivia` reports at a float split it cannot make.

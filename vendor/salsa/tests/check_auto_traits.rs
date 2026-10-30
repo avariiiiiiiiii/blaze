@@ -45,9 +45,7 @@ fn is_unwind_safe<T: UnwindSafe>(t: T) -> T {
 #[test]
 fn execute() {
     let db = is_send(salsa::DatabaseImpl::new());
-    let _handle = is_send(is_sync(is_unwind_safe(
-        db.storage().clone().into_zalsa_handle(),
-    )));
+    let _storage = is_send(is_sync(is_unwind_safe(db.storage())));
     let input = MyInput::new(&db, "Hello".to_string());
     test(&db, input);
 }

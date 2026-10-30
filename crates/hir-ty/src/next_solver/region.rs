@@ -1,7 +1,8 @@
 //! Things related to regions.
 
+use std::{marker::PhantomData, num::NonZeroU32};
+
 use hir_def::LifetimeParamId;
-use intern::{Interned, InternedRef, impl_internable};
 use macros::GenericTypeVisitable;
 use rustc_type_ir::{
     BoundVarIndexKind, DebruijnIndex, Flags, GenericTypeVisitable, INNERMOST, RegionVid, TypeFlags,
@@ -12,7 +13,7 @@ use rustc_type_ir::{
 
 use crate::next_solver::{
     GenericArg, OutlivesPredicate, impl_foldable_for_interned_slice, impl_stored_interned,
-    interned_slice,
+    interned_slice, interner::table, persist,
 };
 
 use super::{SolverDefId, interner::DbInterner};
@@ -20,38 +21,60 @@ use super::{SolverDefId, interner::DbInterner};
 pub type RegionKind<'db> = rustc_type_ir::RegionKind<DbInterner<'db>>;
 pub type RegionConstraint<'db> = rustc_type_ir::RegionConstraint<DbInterner<'db>>;
 
+/// Every interned [`Region`]. A `GenericArg` holds a row in 30 bits.
+static REGIONS: table::Rows = table::Rows::new("regions", table::LAST_ROW);
+
+/// A region: its row in [`REGIONS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Region<'db> {
-    pub(super) interned: InternedRef<'db, RegionInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[repr(align(4))] // Required for `GenericArg` bit-tagging.
-pub(super) struct RegionInterned(RegionKind<'static>);
+const _: () = assert!(size_of::<Option<Region<'static>>>() == 4);
 
-impl_internable!(gc; RegionInterned);
-impl_stored_interned!(RegionInterned, Region, StoredRegion);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Region<'static>>();
-};
+impl_stored_interned!(Region, StoredRegion);
 
 impl<'db> Region<'db> {
     /// You should avoid using this if you can, since we want `Region` to be defined in `rustc_type_ir` and then this method
     /// will become more difficult to use.
     pub fn new_without_interner(kind: RegionKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<RegionKind<'db>, RegionKind<'static>>(kind) };
-        Self { interned: Interned::new_gc(RegionInterned(kind)) }
+        Self::intern(kind)
     }
 
     pub fn new(_interner: DbInterner<'db>, kind: RegionKind<'db>) -> Self {
-        Self::new_without_interner(kind)
+        Self::intern(kind)
     }
 
-    pub fn inner(&self) -> &RegionKind<'db> {
-        let inner = &self.interned.0;
-        unsafe { std::mem::transmute::<&RegionKind<'static>, &RegionKind<'db>>(inner) }
+    pub(super) fn intern(kind: RegionKind<'db>) -> Self {
+        let words = persist::encode(&kind);
+        Self::at(REGIONS.intern(&words, || (region_flags(kind), region_binder(kind))))
+    }
+
+    /// This region's row: the same number for the same region, on every thread, for the life
+    /// of the process.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.index.get()
+    }
+
+    /// The region at `index`, which [`Self::index`] gave. Panics on any other number.
+    pub fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
+        match NonZeroU32::new(index) {
+            Some(index) if REGIONS.published(index) => Self::at(index),
+            _ => panic!("{index} is not the index of an interned region"),
+        }
+    }
+
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Region { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
     }
 
     pub fn new_early_param(
@@ -91,72 +114,84 @@ impl<'db> Region<'db> {
     }
 
     pub fn is_placeholder(&self) -> bool {
-        matches!(self.inner(), RegionKind::RePlaceholder(..))
+        matches!(self.kind(), RegionKind::RePlaceholder(..))
     }
 
     pub fn is_static(&self) -> bool {
-        matches!(self.inner(), RegionKind::ReStatic)
+        matches!(self.kind(), RegionKind::ReStatic)
     }
 
     pub fn is_erased(&self) -> bool {
-        matches!(self.inner(), RegionKind::ReErased)
+        matches!(self.kind(), RegionKind::ReErased)
     }
 
     pub fn is_var(&self) -> bool {
-        matches!(self.inner(), RegionKind::ReVar(_))
+        matches!(self.kind(), RegionKind::ReVar(_))
     }
 
     pub fn is_error(&self) -> bool {
-        matches!(self.inner(), RegionKind::ReError(_))
+        matches!(self.kind(), RegionKind::ReError(_))
     }
 
     pub fn error(interner: DbInterner<'db>) -> Self {
         interner.default_types().regions.error
     }
 
+    #[inline]
     pub fn type_flags(&self) -> TypeFlags {
-        let mut flags = TypeFlags::empty();
+        // SAFETY: a `Region` is a row of `REGIONS`.
+        unsafe { REGIONS.flags(self.index) }
+    }
+}
 
-        match &self.inner() {
-            RegionKind::ReVar(..) => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-                flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
-                flags |= TypeFlags::HAS_RE_INFER;
-            }
-            RegionKind::RePlaceholder(..) => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-                flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
-                flags |= TypeFlags::HAS_RE_PLACEHOLDER;
-            }
-            RegionKind::ReEarlyParam(..) => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-                flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
-                flags |= TypeFlags::HAS_RE_PARAM;
-            }
-            RegionKind::ReLateParam(..) => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-                flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
-            }
-            RegionKind::ReStatic => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-            }
-            RegionKind::ReBound(BoundVarIndexKind::Canonical, ..) => {
-                flags |= TypeFlags::HAS_RE_BOUND;
-                flags |= TypeFlags::HAS_CANONICAL_BOUND;
-            }
-            RegionKind::ReBound(BoundVarIndexKind::Bound(..), ..) => {
-                flags |= TypeFlags::HAS_RE_BOUND;
-            }
-            RegionKind::ReErased => {
-                flags |= TypeFlags::HAS_RE_ERASED;
-            }
-            RegionKind::ReError(..) => {
-                flags |= TypeFlags::HAS_FREE_REGIONS;
-                flags |= TypeFlags::HAS_RE_ERROR;
-            }
+/// The flags of a region of `kind`, as `rustc_middle` computes them.
+fn region_flags(kind: RegionKind<'_>) -> TypeFlags {
+    let mut flags = TypeFlags::empty();
+    match kind {
+        RegionKind::ReVar(..) => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+            flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
+            flags |= TypeFlags::HAS_RE_INFER;
         }
+        RegionKind::RePlaceholder(..) => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+            flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
+            flags |= TypeFlags::HAS_RE_PLACEHOLDER;
+        }
+        RegionKind::ReEarlyParam(..) => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+            flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
+            flags |= TypeFlags::HAS_RE_PARAM;
+        }
+        RegionKind::ReLateParam(..) => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+            flags |= TypeFlags::HAS_FREE_LOCAL_REGIONS;
+        }
+        RegionKind::ReStatic => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+        }
+        RegionKind::ReBound(BoundVarIndexKind::Canonical, ..) => {
+            flags |= TypeFlags::HAS_RE_BOUND;
+            flags |= TypeFlags::HAS_CANONICAL_BOUND;
+        }
+        RegionKind::ReBound(BoundVarIndexKind::Bound(..), ..) => {
+            flags |= TypeFlags::HAS_RE_BOUND;
+        }
+        RegionKind::ReErased => {
+            flags |= TypeFlags::HAS_RE_ERASED;
+        }
+        RegionKind::ReError(..) => {
+            flags |= TypeFlags::HAS_FREE_REGIONS;
+            flags |= TypeFlags::HAS_RE_ERROR;
+        }
+    }
+    flags
+}
 
-        flags
+fn region_binder(kind: RegionKind<'_>) -> DebruijnIndex {
+    match kind {
+        RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), _) => debruijn.shifted_in(1),
+        _ => INNERMOST,
     }
 }
 
@@ -210,8 +245,10 @@ impl std::fmt::Debug for Region<'_> {
 impl<'db> IntoKind for Region<'db> {
     type Kind = RegionKind<'db>;
 
+    #[inline]
     fn kind(self) -> Self::Kind {
-        *self.inner()
+        // SAFETY: a `Region` is a row of `REGIONS`.
+        persist::decode(unsafe { REGIONS.fields(self.index) })
     }
 }
 
@@ -251,11 +288,10 @@ impl<'db> Flags for Region<'db> {
         self.type_flags()
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        match &self.inner() {
-            RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), _) => debruijn.shifted_in(1),
-            _ => INNERMOST,
-        }
+        // SAFETY: a `Region` is a row of `REGIONS`.
+        unsafe { REGIONS.binder(self.index) }
     }
 }
 
@@ -303,7 +339,7 @@ impl<'db> rustc_type_ir::inherent::Region<DbInterner<'db>> for Region<'db> {
 
 impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Region<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(REGIONS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }

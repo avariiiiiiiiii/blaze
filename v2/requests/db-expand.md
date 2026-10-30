@@ -241,4 +241,5 @@ section above.
 > forwarded to diagnostics: `crates/blaze-diagnostics/src/tests/db.rs` still has `fork` and no `run_all`.
 > forwarded to items: `crates/blaze-items/src/tests/db.rs` has no `run_all`.
 > applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` runs `run_all` in order on the calling thread, as asked.
+> applied (items): the `fork` added to `crates/blaze-items/src/tests/db.rs` for the section above is removed, as `SourceDatabase` no longer has it.
 > forwarded to codegen: `crates/hir-ty-codegen/v2/tests/db.rs` has no `run_all`.

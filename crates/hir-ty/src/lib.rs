@@ -95,10 +95,17 @@ pub use infer::{
     cast::CastError, could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
 };
 pub use lower::{
-    ElidedLifetimes, ElidedOutput, FieldType, GenericDefaults, GenericDefaultsRef,
-    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, SelfAndAssocBounds,
-    TyDefId, TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult, ValueTyDefId,
-    diagnostics::*, elided_lifetimes, with_elided_regions,
+    ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults, GenericDefaultsRef,
+    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, Lowered,
+    SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult,
+    ValueTyDefId,
+    batch::{
+        Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
+    },
+    diagnostics::*,
+    elided_lifetimes,
+    persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
+    with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};

@@ -3,6 +3,7 @@
 use base_db::FxIndexSet;
 use hir_expand::name::{AsName, Name};
 use intern::{Symbol, sym};
+use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::{
     AstPtr, AstToken as _,
@@ -67,7 +68,7 @@ impl<'db> ExprCollector<'db> {
                     args,
                     is_direct_literal,
                     |name, range| {
-                        let expr_id = self.alloc_expr_desugared(Expr::Path(Path::from(name)));
+                        let expr_id = self.alloc_expr_desugared(Expr::Path(&Path::from(name)));
                         if let Some(range) = range {
                             self.store
                                 .template_map
@@ -170,36 +171,38 @@ impl<'db> ExprCollector<'db> {
                         );
                         let sym =
                             if incomplete_lit.is_empty() { sym.clone() } else { Symbol::intern(s) };
-                        let s = self.alloc_expr_desugared(Expr::Literal(Literal::String(sym)));
-                        let from_str = self.alloc_expr(
-                            Expr::Call { callee: from_str, args: Box::new([s]) },
-                            syntax_ptr,
-                        );
+                        let s = self.alloc_expr_desugared(Expr::Literal(&Literal::String(sym)));
+                        let from_str = self
+                            .alloc_expr(Expr::Call { callee: from_str, args: &[s] }, syntax_ptr);
                         return if !fmt.arguments.arguments.is_empty() || !fmt.orphans.is_empty() {
                             // With an incomplete format string (e.g. only an opening `{`), it's possible for `arguments`
                             // to be non-empty when reaching this code path.
-                            self.alloc_expr(
+                            let mut statements = self.take_stmt_buffer();
+                            statements.extend(
+                                fmt.arguments
+                                    .arguments
+                                    .iter()
+                                    .map(|arg| arg.expr)
+                                    .chain(fmt.orphans.iter().copied().filter(|orphan| {
+                                        fmt.arguments
+                                            .arguments
+                                            .iter()
+                                            .all(|arg| arg.expr != *orphan)
+                                    }))
+                                    .map(|expr| Statement::Expr { expr, has_semi: true }),
+                            );
+                            let block = self.alloc_expr(
                                 Expr::Block {
                                     id: None,
-                                    statements: fmt
-                                        .arguments
-                                        .arguments
-                                        .iter()
-                                        .map(|arg| arg.expr)
-                                        .chain(fmt.orphans.iter().copied().filter(|orphan| {
-                                            fmt.arguments
-                                                .arguments
-                                                .iter()
-                                                .all(|arg| arg.expr != *orphan)
-                                        }))
-                                        .map(|expr| Statement::Expr { expr, has_semi: true })
-                                        .collect(),
+                                    statements: &statements,
                                     tail: Some(from_str),
                                     label: None,
                                     unsafe_: Unsafe::No,
                                 },
                                 syntax_ptr,
-                            )
+                            );
+                            self.return_stmt_buffer(statements);
+                            block
                         } else {
                             from_str
                         };
@@ -294,15 +297,11 @@ impl<'db> ExprCollector<'db> {
 
         let arguments = &fmt.arguments.arguments[..];
 
-        let (mut statements, args) = if arguments.is_empty() {
+        let mut statements = self.take_stmt_buffer();
+        let args = if arguments.is_empty() {
             // Generate:
             //     []
-            (
-                Vec::new(),
-                self.alloc_expr_desugared(Expr::Array(Array::ElementList {
-                    elements: Box::new([]),
-                })),
-            )
+            self.alloc_expr_desugared(Expr::Array(Array::ElementList { elements: &[] }))
         } else {
             // Generate:
             //     super let args = (&arg0, &arg1, &…);
@@ -315,7 +314,7 @@ impl<'db> ExprCollector<'db> {
             );
             let args_pat = self.alloc_pat_desugared(Pat::Bind { id: args_binding, subpat: None });
             self.add_definition_to_binding(args_binding, args_pat);
-            let elements = arguments
+            let elements: SmallVec<[ExprId; 8]> = arguments
                 .iter()
                 .map(|arg| {
                     self.alloc_expr_desugared(Expr::Ref {
@@ -325,7 +324,7 @@ impl<'db> ExprCollector<'db> {
                     })
                 })
                 .collect();
-            let args_tuple = self.alloc_expr_desugared(Expr::Tuple { exprs: elements });
+            let args_tuple = self.alloc_expr_desugared(Expr::Tuple { exprs: &elements });
             // FIXME: Make this a `super let` when we have this statement.
             let let_statement_1 = Statement::Let {
                 pat: args_pat,
@@ -342,20 +341,20 @@ impl<'db> ExprCollector<'db> {
             //         <core::fmt::Argument>::new_debug(args.0),
             //         …
             //     ];
-            let args = argmap
+            let args: SmallVec<[ExprId; 8]> = argmap
                 .iter()
                 .map(|&(arg_index, ty)| {
-                    let args_ident_expr = self.alloc_expr_desugared(Expr::Path(args_path.clone()));
+                    let args_ident_expr = self.alloc_expr_desugared(Expr::Path(&args_path));
                     let arg = self.alloc_expr_desugared(Expr::Field {
                         expr: args_ident_expr,
-                        name: Name::new_tuple_field(arg_index),
+                        name: &Name::new_tuple_field(arg_index),
                     });
                     let arg_ptr = arguments.get(arg_index).and_then(|it| it.syntax);
                     self.make_argument(arg_ptr, arg, ty)
                 })
                 .collect();
             let args =
-                self.alloc_expr_desugared(Expr::Array(Array::ElementList { elements: args }));
+                self.alloc_expr_desugared(Expr::Array(Array::ElementList { elements: &args }));
             let args_binding =
                 self.alloc_binding(args_name, BindingAnnotation::Unannotated, HygieneId::ROOT);
             let args_pat = self.alloc_pat_desugared(Pat::Bind { id: args_binding, subpat: None });
@@ -368,18 +367,18 @@ impl<'db> ExprCollector<'db> {
                 else_branch: None,
                 is_super: false,
             };
-            (
-                vec![let_statement_1, let_statement_2],
-                self.alloc_expr_desugared(Expr::Path(args_path)),
-            )
+            statements.push(let_statement_1);
+            statements.push(let_statement_2);
+            self.alloc_expr_desugared(Expr::Path(&args_path))
         };
 
         // Generate:
         //     unsafe {
         //         <core::fmt::Arguments>::new(b"…", &args)
         //     }
-        let template = self
-            .alloc_expr_desugared(Expr::Literal(Literal::ByteString(bytecode.into_boxed_slice())));
+        let template = self.alloc_expr_desugared(Expr::Literal(&Literal::ByteString(
+            bytecode.into_boxed_slice(),
+        )));
         let call = {
             let new = self.ty_rel_lang_path_desugared_expr(lang_items.FormatArguments, sym::new);
             let args = self.alloc_expr_desugared(Expr::Ref {
@@ -387,12 +386,12 @@ impl<'db> ExprCollector<'db> {
                 rawness: Rawness::Ref,
                 mutability: Mutability::Shared,
             });
-            self.alloc_expr_desugared(Expr::Call { callee: new, args: Box::new([template, args]) })
+            self.alloc_expr_desugared(Expr::Call { callee: new, args: &[template, args] })
         };
         let call = self.alloc_expr(
             Expr::Block {
                 id: None,
-                statements: Box::new([]),
+                statements: &[],
                 tail: Some(call),
                 label: None,
                 unsafe_: Unsafe::Yes,
@@ -407,7 +406,7 @@ impl<'db> ExprCollector<'db> {
         statements
             .extend(fmt.orphans.into_iter().map(|expr| Statement::Expr { expr, has_semi: true }));
 
-        if !statements.is_empty() {
+        let expr = if !statements.is_empty() {
             // Generate:
             //     {
             //         super let …
@@ -417,7 +416,7 @@ impl<'db> ExprCollector<'db> {
             self.alloc_expr(
                 Expr::Block {
                     id: None,
-                    statements: statements.into_boxed_slice(),
+                    statements: &statements,
                     tail: Some(call),
                     label: None,
                     unsafe_: Unsafe::No,
@@ -426,7 +425,9 @@ impl<'db> ExprCollector<'db> {
             )
         } else {
             call
-        }
+        };
+        self.return_stmt_buffer(statements);
+        expr
     }
 
     /// rustc's `inline_literals`: a string literal, or an integer literal its type can hold,
@@ -481,11 +482,11 @@ impl<'db> ExprCollector<'db> {
     /// integer no larger than its type holds, an unsuffixed one taken as `i32` and `isize` and
     /// `usize` as 64 bits wide (larger ones do not compile for a narrower target).
     fn inlinable_literal(&self, mut expr: ExprId) -> Option<Symbol> {
-        while let Expr::Ref { expr: inner, rawness: Rawness::Ref, .. } = &self.store.exprs[expr] {
-            expr = *inner;
+        while let Expr::Ref { expr: inner, rawness: Rawness::Ref, .. } = self.store.expr(expr) {
+            expr = inner;
         }
         let fits = |n: u128, max: u128| (n <= max).then(|| Symbol::intern(&n.to_string()));
-        match &self.store.exprs[expr] {
+        match self.store.expr(expr) {
             Expr::Literal(Literal::String(text)) => Some(text.clone()),
             Expr::Literal(Literal::Int(n, ty)) => {
                 let max = match ty {
@@ -564,7 +565,7 @@ impl<'db> ExprCollector<'db> {
         );
         let new_fn = match new_fn {
             Some(new_fn) => {
-                let new_fn = self.store.exprs.alloc(Expr::Path(new_fn));
+                let new_fn = self.store.alloc_expr(Expr::Path(&new_fn));
                 if let Some(arg_ptr) = arg_ptr {
                     // Trait errors (the argument does not implement the expected fmt trait) will show
                     // on this path, so to not end up with synthetic syntax we insert this mapping. We
@@ -578,7 +579,7 @@ impl<'db> ExprCollector<'db> {
             }
             None => self.missing_expr(),
         };
-        self.alloc_expr_desugared(Expr::Call { callee: new_fn, args: Box::new([arg]) })
+        self.alloc_expr_desugared(Expr::Call { callee: new_fn, args: &[arg] })
     }
 
     fn ty_rel_lang_path_desugared_expr(
@@ -586,7 +587,8 @@ impl<'db> ExprCollector<'db> {
         lang: Option<impl Into<LangItemTarget>>,
         relative_name: Symbol,
     ) -> ExprId {
-        self.alloc_expr_desugared(self.ty_rel_lang_path_expr(lang, relative_name))
+        let path = self.ty_rel_lang_path(lang, relative_name);
+        self.alloc_expr_desugared(path.as_ref().map_or(Expr::Missing, Expr::Path))
     }
 }
 

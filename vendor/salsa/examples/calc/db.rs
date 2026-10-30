@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 // ANCHOR: db_struct
 #[salsa::db]
-#[derive(Clone)]
 #[cfg_attr(not(test), derive(Default))]
 pub struct CalcDatabaseImpl {
     storage: salsa::Storage<Self>,

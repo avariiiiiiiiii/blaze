@@ -1,8 +1,9 @@
 //! The host's side of the encoding a stream crosses into and out of a native expander in
 //! (`proc_macro/lib.rs`, `wire`), from and to rust-analyzer's token trees, with each span a
-//! number of the [`Spans`] of the expansion: `crates/blaze-macro-wasm/src/wire.rs`, the same
-//! text after this comment (`tests.rs` holds them to it), as blaze-macro-wasm depends on this
-//! crate.
+//! number of the [`Spans`] of the expansion. Up to [`Reader`] it is
+//! `crates/blaze-macro-wasm/src/wire.rs`, the same text after this comment (`tests.rs` holds
+//! them to it), as blaze-macro-wasm depends on this crate: spans are numbered and streams
+//! written as the wasm host does.
 
 use intern::Symbol;
 use rustc_hash::FxHashMap;
@@ -205,23 +206,21 @@ fn fragment_contents<'a>(subtree: &Subtree, mut contents: TtIter<'a>) -> Option<
     (wrapper && contents.next().is_none()).then_some(inner_contents)
 }
 
-/// Reads what the module wrote.
+/// Reads what the module wrote, straight into rust-analyzer's flat tree: what the wasm host's
+/// `Reader` and `top_subtree` make in two passes, with a tree per group between them, made in
+/// one, with nothing allocated but the tree it gives (`tests.rs` holds the two to the same
+/// output). Each token tree is one element of the tree; the encoding spends at least 10 bytes on
+/// one (a punctuation mark's), which bounds the tree's length before it is read.
 pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
     spans: &'a Spans,
-}
-
-/// A stream the module wrote, as trees: what [`Reader`] makes, and what is turned into
-/// rust-analyzer's.
-pub(crate) enum Tree {
-    Group { kind: DelimiterKind, open: Span, close: Span, entire: Span, trees: Vec<Tree> },
-    Leaf(Leaf),
+    flat: Vec<TokenTree>,
 }
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(bytes: &'a [u8], spans: &'a Spans) -> Reader<'a> {
-        Reader { bytes, at: 0, spans }
+        Reader { bytes, at: 0, spans, flat: Vec::with_capacity(bytes.len() / 10 + 1) }
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
@@ -250,17 +249,28 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(self.take(len)?).map_err(|it| it.to_string())
     }
 
-    pub(crate) fn stream(&mut self) -> Result<Vec<Tree>, String> {
-        let count = self.u32()? as usize;
-        let mut trees = Vec::with_capacity(count.min(1 << 16));
+    /// rust-analyzer's tree of the stream the module wrote: its one group, or the stream in a
+    /// group without delimiters at `call_site`, as its server writes it.
+    pub(crate) fn top(mut self, call_site: Span) -> Result<TopSubtree, String> {
+        let delimiter = tt::Delimiter::invisible_spanned(call_site);
+        self.flat.push(TokenTree::Subtree(Subtree { delimiter, len: 0 }));
+        let count = self.u32()?;
         for _ in 0..count {
-            trees.push(self.tree()?);
+            self.tree()?;
         }
-        Ok(trees)
+        if count == 1 && matches!(self.flat.get(1), Some(TokenTree::Subtree(_))) {
+            self.flat.remove(0);
+        } else {
+            let len = (self.flat.len() - 1) as u32;
+            if let TokenTree::Subtree(top) = &mut self.flat[0] {
+                top.len = len;
+            }
+        }
+        Ok(TopSubtree::from_serialized(self.flat))
     }
 
-    fn tree(&mut self) -> Result<Tree, String> {
-        Ok(match self.u8()? {
+    fn tree(&mut self) -> Result<(), String> {
+        match self.u8()? {
             0 => {
                 let kind = match self.u8()? {
                     0 => DelimiterKind::Parenthesis,
@@ -268,99 +278,80 @@ impl<'a> Reader<'a> {
                     2 => DelimiterKind::Bracket,
                     _ => DelimiterKind::Invisible,
                 };
-                let (open, close, entire) = (self.span()?, self.span()?, self.span()?);
-                Tree::Group { kind, open, close, entire, trees: self.stream()? }
+                let (open, close) = (self.span()?, self.span()?);
+                // The whole group's, which rust-analyzer's tree does not keep.
+                self.span()?;
+                let at = self.flat.len();
+                let delimiter = tt::Delimiter { open, close, kind };
+                self.flat.push(TokenTree::Subtree(Subtree { delimiter, len: 0 }));
+                let count = self.u32()?;
+                for _ in 0..count {
+                    self.tree()?;
+                }
+                let len = (self.flat.len() - at - 1) as u32;
+                if let TokenTree::Subtree(subtree) = &mut self.flat[at] {
+                    subtree.len = len;
+                }
             }
             1 => {
                 let span = self.span()?;
                 let is_raw = if self.u8()? == 1 { IdentIsRaw::Yes } else { IdentIsRaw::No };
-                Tree::Leaf(Leaf::Ident(tt::Ident {
-                    sym: Symbol::intern(self.text()?),
-                    span,
-                    is_raw,
-                }))
+                let sym = Symbol::intern(self.text()?);
+                self.flat.push(TokenTree::Leaf(Leaf::Ident(tt::Ident { sym, span, is_raw })));
             }
             2 => {
                 let span = self.span()?;
                 let char = char::from_u32(self.u32()?).ok_or("the module wrote no character")?;
                 let spacing = if self.u8()? != 0 { Spacing::Joint } else { Spacing::Alone };
-                Tree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span }))
+                self.flat.push(TokenTree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span })));
             }
             3 => {
                 let span = self.span()?;
                 let (kind, hashes) = (self.u8()?, self.u8()?);
+                let kind = lit_kind(kind, hashes);
                 let text = self.text()?;
-                let suffix = match u32::from_le_bytes(
-                    self.bytes
-                        .get(self.at..self.at + 4)
-                        .ok_or("a literal ends early")?
-                        .try_into()
-                        .unwrap(),
-                ) {
-                    u32::MAX => {
+                let suffix = match self.bytes.get(self.at..self.at + 4) {
+                    None => return Err("a literal ends early".to_owned()),
+                    Some(it) if u32::from_le_bytes(it.try_into().unwrap()) == u32::MAX => {
                         self.at += 4;
                         ""
                     }
-                    _ => self.text()?,
+                    Some(_) => self.text()?,
                 };
-                Tree::Leaf(Leaf::Literal(tt::Literal::new(
-                    text,
-                    span,
-                    lit_kind(kind, hashes),
-                    suffix,
-                )))
+                // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a
+                // literal to the compiler, as the native server's reader splits it
+                // (`legacy_protocol`, `flat`).
+                let negative = matches!(kind, LitKind::Integer | LitKind::Float);
+                match text.strip_prefix('-').filter(|_| negative) {
+                    Some(magnitude) => {
+                        let minus = tt::Punct { char: '-', spacing: Spacing::Alone, span };
+                        self.flat.push(TokenTree::Leaf(Leaf::Punct(minus)));
+                        let literal = tt::Literal::new(magnitude, span, kind, suffix);
+                        self.flat.push(TokenTree::Leaf(Leaf::Literal(literal)));
+                    }
+                    None => {
+                        let literal = tt::Literal::new(text, span, kind, suffix);
+                        self.flat.push(TokenTree::Leaf(Leaf::Literal(literal)));
+                    }
+                }
             }
             other => return Err(format!("the module wrote a tree of kind {other}")),
-        })
+        }
+        Ok(())
     }
 }
 
-/// rust-analyzer's tree of a macro's output: its one group, or the stream in a group without
-/// delimiters at `call_site`, as its server writes it.
-pub(crate) fn top_subtree(trees: Vec<Tree>, call_site: Span) -> TopSubtree {
-    let mut flat = Vec::new();
-    match <[Tree; 1]>::try_from(trees) {
-        Ok([group @ Tree::Group { .. }]) => flatten(group, &mut flat),
-        Ok([leaf]) => flatten(top_of(vec![leaf], call_site), &mut flat),
-        Err(trees) => flatten(top_of(trees, call_site), &mut flat),
-    }
-    TopSubtree::from_serialized(flat)
+/// A stream the host made, as trees ([`Writer::trees`]): what the lexer makes of text a macro
+/// asks to be tokens of (`lex.rs`).
+pub(crate) enum Tree {
+    Group { kind: DelimiterKind, open: Span, close: Span, entire: Span, trees: Vec<Tree> },
+    Leaf(Leaf),
 }
 
-fn top_of(trees: Vec<Tree>, call_site: Span) -> Tree {
-    let (open, close, entire) = (call_site, call_site, call_site);
-    Tree::Group { kind: DelimiterKind::Invisible, open, close, entire, trees }
-}
-
-fn flatten(tree: Tree, flat: &mut Vec<TokenTree>) {
-    match tree {
-        // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a literal
-        // to the compiler, as the native server's reader splits it (`legacy_protocol`, `flat`).
-        Tree::Leaf(Leaf::Literal(literal))
-            if matches!(literal.kind, LitKind::Integer | LitKind::Float)
-                && literal.text().starts_with('-') =>
-        {
-            let (text, suffix) = literal.text_and_suffix();
-            let span = literal.span;
-            let minus = tt::Punct { char: '-', spacing: Spacing::Alone, span };
-            let magnitude = tt::Literal::new(&text[1..], span, literal.kind, suffix);
-            flat.push(TokenTree::Leaf(Leaf::Punct(minus)));
-            flat.push(TokenTree::Leaf(Leaf::Literal(magnitude)));
-        }
-        Tree::Leaf(leaf) => flat.push(TokenTree::Leaf(leaf)),
-        Tree::Group { kind, open, close, entire: _, trees } => {
-            let at = flat.len();
-            flat.push(TokenTree::Subtree(Subtree {
-                delimiter: tt::Delimiter { open, close, kind },
-                len: 0,
-            }));
-            for tree in trees {
-                flatten(tree, flat);
-            }
-            let len = (flat.len() - at - 1) as u32;
-            if let TokenTree::Subtree(subtree) = &mut flat[at] {
-                subtree.len = len;
-            }
-        }
+impl Spans {
+    /// Forgets every span, keeping the room, for the next expansion on this thread.
+    pub(crate) fn clear(&mut self) {
+        self.all.clear();
+        self.numbers.clear();
     }
 }

@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Once};
+use std::path::Path;
 
 use paths::AbsPathBuf;
 use span::{EditionedFileId, ErasedFileAstId, SpanAnchor, SyntaxContext, TextRange};
@@ -6,6 +6,7 @@ use tt::{IdentIsRaw, LitKind, Spacing};
 
 use super::{
     verified::{QUOTE, SERDE_DERIVE, SYN_2, SYN_3, THISERROR_IMPL_1, THISERROR_IMPL_2, TOKIO_MACROS},
+    wire::Tree,
     *,
 };
 
@@ -23,7 +24,206 @@ fn span(start: u32, end: u32) -> Span {
 }
 
 fn tokens(text: &str, at: Span) -> TopSubtree {
-    wire::top_subtree(lex::stream(text, at).expect("the test's text lexes"), at)
+    reference::top_subtree(lex::stream(text, at).expect("the test's text lexes"), at)
+}
+
+/// The wasm host's reading of a module's output (`crates/blaze-macro-wasm/src/wire.rs`,
+/// `Reader` and `top_subtree`): trees, then rust-analyzer's flat tree of them, which
+/// [`wire::Reader`] makes in one pass.
+mod reference {
+    use intern::Symbol;
+    use span::Span;
+    use tt::{DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree};
+
+    use super::wire::{Spans, Tree};
+
+    pub(super) fn read(bytes: &[u8], spans: &Spans, call_site: Span) -> Result<TopSubtree, String> {
+        let mut reader = Reader { bytes, at: 0, spans };
+        Ok(top_subtree(reader.stream()?, call_site))
+    }
+
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        spans: &'a Spans,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+            let end = self.at.checked_add(len).filter(|it| *it <= self.bytes.len());
+            let end = end.ok_or("the module wrote a stream that ends early")?;
+            let it = &self.bytes[self.at..end];
+            self.at = end;
+            Ok(it)
+        }
+
+        fn u8(&mut self) -> Result<u8, String> {
+            Ok(self.take(1)?[0])
+        }
+
+        fn u32(&mut self) -> Result<u32, String> {
+            Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        }
+
+        fn span(&mut self) -> Result<Span, String> {
+            let number = self.u32()?;
+            self.spans.get(number).ok_or_else(|| format!("the module named span {number}, unknown"))
+        }
+
+        fn text(&mut self) -> Result<&'a str, String> {
+            let len = self.u32()? as usize;
+            std::str::from_utf8(self.take(len)?).map_err(|it| it.to_string())
+        }
+
+        fn stream(&mut self) -> Result<Vec<Tree>, String> {
+            let count = self.u32()? as usize;
+            let mut trees = Vec::with_capacity(count.min(1 << 16));
+            for _ in 0..count {
+                trees.push(self.tree()?);
+            }
+            Ok(trees)
+        }
+
+        fn tree(&mut self) -> Result<Tree, String> {
+            Ok(match self.u8()? {
+                0 => {
+                    let kind = match self.u8()? {
+                        0 => DelimiterKind::Parenthesis,
+                        1 => DelimiterKind::Brace,
+                        2 => DelimiterKind::Bracket,
+                        _ => DelimiterKind::Invisible,
+                    };
+                    let (open, close, entire) = (self.span()?, self.span()?, self.span()?);
+                    Tree::Group { kind, open, close, entire, trees: self.stream()? }
+                }
+                1 => {
+                    let span = self.span()?;
+                    let is_raw = if self.u8()? == 1 { IdentIsRaw::Yes } else { IdentIsRaw::No };
+                    Tree::Leaf(Leaf::Ident(tt::Ident {
+                        sym: Symbol::intern(self.text()?),
+                        span,
+                        is_raw,
+                    }))
+                }
+                2 => {
+                    let span = self.span()?;
+                    let char = char::from_u32(self.u32()?).ok_or("the module wrote no character")?;
+                    let spacing = if self.u8()? != 0 { Spacing::Joint } else { Spacing::Alone };
+                    Tree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span }))
+                }
+                3 => {
+                    let span = self.span()?;
+                    let (kind, hashes) = (self.u8()?, self.u8()?);
+                    let text = self.text()?;
+                    let suffix = match u32::from_le_bytes(
+                        self.bytes
+                            .get(self.at..self.at + 4)
+                            .ok_or("a literal ends early")?
+                            .try_into()
+                            .unwrap(),
+                    ) {
+                        u32::MAX => {
+                            self.at += 4;
+                            ""
+                        }
+                        _ => self.text()?,
+                    };
+                    let kind = match kind {
+                        0 => LitKind::Byte,
+                        1 => LitKind::Char,
+                        2 => LitKind::Integer,
+                        3 => LitKind::Float,
+                        4 => LitKind::Str,
+                        5 => LitKind::StrRaw(hashes),
+                        6 => LitKind::ByteStr,
+                        7 => LitKind::ByteStrRaw(hashes),
+                        8 => LitKind::CStr,
+                        9 => LitKind::CStrRaw(hashes),
+                        _ => LitKind::Err(()),
+                    };
+                    Tree::Leaf(Leaf::Literal(tt::Literal::new(text, span, kind, suffix)))
+                }
+                other => return Err(format!("the module wrote a tree of kind {other}")),
+            })
+        }
+    }
+
+    pub(super) fn top_subtree(trees: Vec<Tree>, call_site: Span) -> TopSubtree {
+        let mut flat = Vec::new();
+        match <[Tree; 1]>::try_from(trees) {
+            Ok([group @ Tree::Group { .. }]) => flatten(group, &mut flat),
+            Ok([leaf]) => flatten(top_of(vec![leaf], call_site), &mut flat),
+            Err(trees) => flatten(top_of(trees, call_site), &mut flat),
+        }
+        TopSubtree::from_serialized(flat)
+    }
+
+    fn top_of(trees: Vec<Tree>, call_site: Span) -> Tree {
+        let (open, close, entire) = (call_site, call_site, call_site);
+        Tree::Group { kind: DelimiterKind::Invisible, open, close, entire, trees }
+    }
+
+    fn flatten(tree: Tree, flat: &mut Vec<TokenTree>) {
+        match tree {
+            Tree::Leaf(Leaf::Literal(literal))
+                if matches!(literal.kind, LitKind::Integer | LitKind::Float)
+                    && literal.text().starts_with('-') =>
+            {
+                let (text, suffix) = literal.text_and_suffix();
+                let span = literal.span;
+                let minus = tt::Punct { char: '-', spacing: Spacing::Alone, span };
+                let magnitude = tt::Literal::new(&text[1..], span, literal.kind, suffix);
+                flat.push(TokenTree::Leaf(Leaf::Punct(minus)));
+                flat.push(TokenTree::Leaf(Leaf::Literal(magnitude)));
+            }
+            Tree::Leaf(leaf) => flat.push(TokenTree::Leaf(leaf)),
+            Tree::Group { kind, open, close, entire: _, trees } => {
+                let at = flat.len();
+                flat.push(TokenTree::Subtree(Subtree {
+                    delimiter: tt::Delimiter { open, close, kind },
+                    len: 0,
+                }));
+                for tree in trees {
+                    flatten(tree, flat);
+                }
+                let len = (flat.len() - at - 1) as u32;
+                if let TokenTree::Subtree(subtree) = &mut flat[at] {
+                    subtree.len = len;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_one_pass_reader_reads_as_the_wasm_host_does() {
+    let at = span(2, 40);
+    let group = |kind, trees| Tree::Group { kind, open: span(1, 2), close: span(8, 9), entire: span(1, 9), trees };
+    let lexed = |text: &str| lex::stream(text, at).unwrap();
+    let negative = |text: &str| Tree::Leaf(Leaf::Literal(lex::literal_from_str(text, at).unwrap()));
+    let streams: Vec<Vec<Tree>> = vec![
+        vec![],
+        lexed("x"),
+        vec![negative("-1i32")],
+        vec![negative("-2.5")],
+        lexed("a::b(1u8, \"s\", r#\"raw\"#) { c[0] } 'a"),
+        vec![group(tt::DelimiterKind::Brace, lexed("struct S { x: i32 }"))],
+        vec![group(tt::DelimiterKind::Parenthesis, vec![negative("-7")]), Tree::Leaf(Leaf::Punct(tt::Punct { char: ';', spacing: Spacing::Alone, span: at }))],
+        vec![group(tt::DelimiterKind::Invisible, lexed("r#type + 1"))],
+    ];
+    for trees in streams {
+        let mut spans = Spans::default();
+        let mut writer = Writer { out: Vec::new(), spans: &mut spans };
+        writer.trees(&trees);
+        let bytes = writer.out;
+        let ours = wire::Reader::new(&bytes, &spans).top(at).unwrap();
+        let theirs = reference::read(&bytes, &spans, at).unwrap();
+        assert_eq!(difference(&ours, &theirs), None);
+        assert!(ours == theirs);
+    }
+    let spans = Spans::default();
+    assert!(wire::Reader::new(&[1, 0, 0, 0], &spans).top(at).is_err());
+    assert!(reference::read(&[1, 0, 0, 0], &spans, at).is_err());
 }
 
 /// The text from the first `from` to the next `to` after it.
@@ -51,7 +251,8 @@ fn the_proc_macro_is_the_guests_but_for_its_imports_and_exports() {
 #[test]
 fn the_wire_and_the_lexer_are_the_wasm_hosts() {
     let from = |text: &'static str, start: &str| &text[text.find(start).unwrap()..];
-    assert_eq!(from(include_str!("wire.rs"), "\nuse intern::Symbol;"), from(WASM_WIRE, "\nuse intern::Symbol;"));
+    let numbering = |text: &'static str| between(text, "\nuse intern::Symbol;", "\n/// Reads what the module wrote");
+    assert_eq!(numbering(include_str!("wire.rs")), numbering(WASM_WIRE));
     let lex = from(include_str!("lex.rs"), "\nuse intern::Symbol;");
     let wasm_lex = from(WASM_LEX, "\nuse intern::Symbol;")
         .replacen("use crate::wire::Tree;", "use super::wire::Tree;", 1);
@@ -81,7 +282,7 @@ fn verified_closure(root: usize) -> Closure {
             }
         })
         .collect();
-    Closure { packages }
+    Closure::new(packages)
 }
 
 fn package_of(closure: &mut Closure, name: &str, version: &str) -> &mut Package {
@@ -172,10 +373,15 @@ fn what_no_source_names_is_not_compared() {
     for package in &mut closure.packages {
         package.cfg.retain(|it| it != "debug_assertions");
     }
-    package_of(&mut closure, "syn", "3.0.9").cfg.push("debug_assertions".to_owned());
+    let syn = package_of(&mut closure, "syn", "3.0.9");
+    syn.cfg.push("debug_assertions".to_owned());
+    syn.cfg.sort();
     assert_eq!(matches(&closure, SERDE_DERIVE), Ok(()));
-    package_of(&mut closure, "syn", "3.0.9").cfg.push("test".to_owned());
+    let syn = package_of(&mut closure, "syn", "3.0.9");
+    syn.cfg.push("test".to_owned());
+    syn.cfg.sort();
     assert!(matches(&closure, SERDE_DERIVE).is_err(), "syn's sources name `test`");
+    assert!(mentioned(SYN_3, "not-an-identifier"), "a name of other characters is compared");
 }
 
 #[test]
@@ -191,85 +397,175 @@ fn the_build_of_proc_macro2_is_what_its_code_shows() {
     );
 }
 
-/// The closures [`find`] is told of in these tests, by the library's path.
-static DESCRIBED: Mutex<Vec<(AbsPathBuf, Option<Closure>)>> = Mutex::new(Vec::new());
-
-fn described(name: &str, closure: Option<Closure>) -> AbsPathBuf {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        describe_with(Box::new(|dylib: &AbsPath| {
-            let described = lock(&DESCRIBED);
-            match described.iter().find(|it| *it.0 == *dylib) {
-                Some((_, closure)) => Ok(closure.clone()),
-                None => Err(format!("the test describes no {dylib}")),
-            }
-        }))
-        .unwrap();
-    });
-    let path = AbsPathBuf::assert_utf8(std::env::temp_dir().join(format!("{name}.wasm")));
-    lock(&DESCRIBED).push((path.clone(), closure));
-    path
+fn dylib(name: &str) -> AbsPathBuf {
+    AbsPathBuf::assert_utf8(std::env::temp_dir().join(format!("{name}.wasm")))
 }
 
 #[test]
 fn find_gives_an_expander_only_of_the_verified_copy() {
-    let dylib = described("blaze-native-serde", Some(verified_closure(SERDE_DERIVE)));
-    let found = find(&dylib, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
-    let again = find(&dylib, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
+    let serde = dylib("blaze-native-serde");
+    let closure = verified_closure(SERDE_DERIVE);
+    let found = find_in(&closure, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
+    let again = find_in(&closure, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
     assert_eq!(found.identity(), again.identity());
-    let other = find(&dylib, "Deserialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
+    let other = find_in(&closure, &serde, "Deserialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
     assert_ne!(found.identity(), other.identity());
-    assert!(find(&dylib, "Serialize", ProcMacroKind::Attr).is_err());
+    assert!(find_in(&closure, &serde, "Serialize", ProcMacroKind::Attr).is_err());
 
     let mut changed = verified_closure(SERDE_DERIVE);
-    package_of(&mut changed, "quote", "1.0.47").cfg.push("feature=\"nightly\"".to_owned());
-    let dylib = described("blaze-native-serde-changed", Some(changed));
-    assert!(find(&dylib, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
+    let quote = package_of(&mut changed, "quote", "1.0.47");
+    quote.cfg.push("feature=\"nightly\"".to_owned());
+    quote.cfg.sort();
+    assert!(find_in(&changed, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
     assert!(report().unwrap().contains("built with `feature=\"nightly\"`"));
 
-    let dylib = described("blaze-native-none", None);
-    assert!(find(&dylib, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
-    let unknown = AbsPathBuf::assert_utf8(std::env::temp_dir().join("blaze-native-unknown.wasm"));
-    assert!(find(&unknown, "Serialize", ProcMacroKind::CustomDerive).is_err());
+    let mut unsorted = verified_closure(SERDE_DERIVE);
+    package_of(&mut unsorted, "quote", "1.0.47").cfg.reverse();
+    let why = find_in(&unsorted, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap_err();
+    assert!(why.contains("the cfg of quote 1.0.47 is not sorted"), "{why}");
+}
+
+/// A crate of a description, as `load-cargo/src/described.rs` writes one.
+fn crate_of(dir: &Path, name: &str, version: &str, cfg: &[String], deps: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "display_name": name.replace('-', "_"),
+        "root_module": dir.join("src/lib.rs").to_str().unwrap(),
+        "edition": "2021",
+        "deps": deps,
+        "cfg": cfg,
+        "env": {
+            "CARGO_MANIFEST_DIR": dir.to_str().unwrap(),
+            "CARGO_PKG_NAME": name,
+            "CARGO_PKG_VERSION": version,
+        },
+        "is_workspace_member": false,
+        "is_proc_macro": false,
+    })
+}
+
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("blaze-native-{name}-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[test]
 fn a_description_is_read_as_a_closure() {
-    let dir = std::env::temp_dir().join(format!("blaze-native-described-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
+    let root = scratch_dir("described");
+    let dir = root.join("serde_derive");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
     std::fs::write(dir.join(".cargo-ok"), "{\"v\":1}").unwrap();
-    let crate_ = |name: &str, version: &str| {
-        serde_json::json!({
-            "display_name": name,
-            "root_module": dir.join("src/lib.rs").to_str().unwrap(),
-            "edition": "2021",
-            "deps": [],
-            "cfg": ["feature=\"default\"", "debug_assertions"],
-            "env": {
-                "CARGO_MANIFEST_DIR": dir.to_str().unwrap(),
-                "CARGO_PKG_NAME": name,
-                "CARGO_PKG_VERSION": version,
-            },
-            "is_workspace_member": true,
-            "is_proc_macro": true,
-        })
+    let cfg = ["feature=\"default\"".to_owned(), "debug_assertions".to_owned()];
+    let description = |name: &str, version: &str| {
+        let it = serde_json::json!({ "crates": [crate_of(&dir, name, version, &cfg, serde_json::json!([]))] });
+        let file = root.join(format!("{name}.json"));
+        std::fs::write(&file, it.to_string()).unwrap();
+        file
     };
-    let description = serde_json::json!({ "crates": [crate_("serde_derive", "1.0.229")] });
-    let closure = closure_of_description(&description.to_string()).unwrap().unwrap();
+    let mut path = description("serde_derive", "1.0.229");
+    let closure = closure::closure_at(&mut path).unwrap().unwrap();
     let package = &closure.packages[0];
     assert_eq!((package.name.as_str(), package.version.as_str()), ("serde_derive", "1.0.229"));
     assert_eq!(package.cfg, ["debug_assertions", "feature=\"default\""]);
     let files: Vec<&str> = package.files.iter().map(|it| it.0.as_str()).collect();
     assert_eq!(files, ["Cargo.toml", "src/lib.rs"]);
     assert_eq!(package.files[1].1, *blake3::hash(b"pub fn f() {}\n").as_bytes());
-    assert!(matches(&closure, SERDE_DERIVE).is_err());
+    assert!(matches!(closure.verdict(), Verdict::Other));
 
-    let description = serde_json::json!({ "crates": [crate_("my_macros", "0.1.0")] });
-    assert_eq!(closure_of_description(&description.to_string()), Ok(None));
-    assert!(closure_of_description("{}").is_err());
+    let mut path = description("my_macros", "0.1.0");
+    assert!(closure::closure_at(&mut path).unwrap().is_none());
+    let mut path = root.join("empty.json");
+    std::fs::write(&path, "{}").unwrap();
+    assert!(closure::closure_at(&mut path).is_err());
+    let mut path = root.join("missing.json");
+    assert!(closure::closure_at(&mut path).is_err());
+    _ = std::fs::remove_dir_all(&root);
+}
+
+/// The published files of the verified closure of `root` of [`PACKAGES`] under `dir`, one
+/// directory a package, and a description of them as blaze writes one: its path.
+fn published(dir: &Path, root: usize) -> std::path::PathBuf {
+    let all = closure_of(root);
+    let mut crates = Vec::new();
+    for &at in all {
+        let package = &PACKAGES[at];
+        let at_dir = dir.join(package.dir);
+        for (path, bytes) in package.files {
+            let file = at_dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, bytes).unwrap();
+        }
+        let deps: Vec<serde_json::Value> = package
+            .deps
+            .iter()
+            .map(|(name, dep)| {
+                serde_json::json!({ "crate": all.iter().position(|it| it == dep).unwrap(), "name": name })
+            })
+            .collect();
+        let cfg = actual()[at].cfg.clone().unwrap();
+        crates.push(crate_of(&at_dir, package.name, package.version, &cfg, deps.into()));
+    }
+    let description = dir.join("rust-project.json");
+    std::fs::write(&description, serde_json::json!({ "crates": crates }).to_string()).unwrap();
+    description
+}
+
+#[test]
+fn find_follows_the_files_on_disk() {
+    let dir = scratch_dir("on-disk");
+    let description = published(&dir, SERDE_DERIVE);
+    let module = dylib("blaze-native-on-disk");
+    let none = dylib("blaze-native-undescribed");
+    {
+        let (module, none, description) = (module.clone(), none.clone(), description.clone());
+        describe_with(Box::new(move |dylib: &AbsPath, into: &mut std::path::PathBuf| {
+            if *dylib == *none {
+                return Ok(false);
+            }
+            if *dylib != *module {
+                return Err(format!("the test describes no {dylib}"));
+            }
+            into.push(&description);
+            Ok(true)
+        }))
+        .unwrap();
+    }
+    let serialize = || find(&module, "Serialize", ProcMacroKind::CustomDerive).unwrap();
+    assert!(serialize().is_some());
+    assert!(find(&module, "Deserialize", ProcMacroKind::CustomDerive).unwrap().is_some());
+    assert!(find(&none, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
+    assert!(find(&dylib("blaze-native-unknown"), "Serialize", ProcMacroKind::CustomDerive).is_err());
+
+    // Kept: asking again of unchanged files gives the closure kept the first time.
+    let mut path = description.clone();
+    let first = closure::closure_at(&mut path).unwrap().unwrap();
+    let mut path = description.clone();
+    let second = closure::closure_at(&mut path).unwrap().unwrap();
+    if let (closure::Held::Kept(a), closure::Held::Kept(b)) = (&first, &second) {
+        assert!(std::ptr::eq(*a, *b));
+    } else {
+        panic!("a closure of settled files is kept");
+    }
+
+    let lib = dir.join(PACKAGES[SYN_3].dir).join("src/lib.rs");
+    let bytes = std::fs::read(&lib).unwrap();
+    let mut longer = bytes.clone();
+    longer.push(b'\n');
+    std::fs::write(&lib, &longer).unwrap();
+    assert!(serialize().is_none());
+    assert!(report().unwrap().contains("syn 3.0.9: its `src/lib.rs` is not the verified copy's"));
+    std::fs::write(&lib, &bytes).unwrap();
+    assert!(serialize().is_some());
+
+    let extra = dir.join(PACKAGES[QUOTE].dir).join("zzz.rs");
+    std::fs::write(&extra, "").unwrap();
+    let mut path = description.clone();
+    let closure = closure::closure_at(&mut path).unwrap().unwrap();
+    let quote = closure.packages.iter().find(|it| it.name == "quote").unwrap();
+    assert!(quote.files.iter().any(|it| it.0 == "zzz.rs"));
     _ = std::fs::remove_dir_all(&dir);
 }
 

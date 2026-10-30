@@ -2,7 +2,7 @@
 
 Native expanders for serde_derive, thiserror-impl 1 and 2 and tokio-macros (#1297), in
 `crates/blaze-expand/src/native/` (child of `usercode-macros`). Design:
-`docs/v2/usercode-macros-native-notes.md`. Written, not built. The code reads the vendored
+`docs/v2/plan/lanes/usercode/macros-native.md`. Written, not built. The code reads the vendored
 copies below with `include_bytes!`, so it does not compile until request 1 is applied.
 
 ## 1. To the coordinator: vendor nine crates under `vendor/native-macros/`
@@ -44,6 +44,8 @@ against blaze's `proc_macro` (`crates/blaze-expand/src/native/proc_macro/`), and
 verified closures is the hash of every published file, so the vendored copy is both the code
 and the table.
 
+> forwarded to coordinator: `vendor/native-macros/` is the coordinator's (crates.md, "Every other path"), not among the paths `requests` applies, and request 1 needs `git add -f`, which agents may not run. All nine published sources are in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`.
+
 ### Blaze's `Cargo.toml` of each
 
 Each is the published `Cargo.toml` with these edits, so edition, rust-version, `[lints]`,
@@ -81,6 +83,8 @@ and these specs: syn 3 gets clone-impls, default, derive, full, parsing, printin
 syn 2 the default set; proc-macro2 and quote default and proc-macro; serde_derive default.
 `native/tests.rs`'s `the_table_is_well_formed` and `the_verified_copy_matches_itself` check them.
 
+> forwarded to coordinator: with request 1.
+
 ## 2. To the coordinator: workspace dependencies (root `Cargo.toml`)
 
 ```toml
@@ -96,6 +100,8 @@ native-tokio-macros = { package = "blaze-native-tokio-macros", path = "vendor/na
 `proc_macro`) and the vendored packages become workspace members as path dependencies inside
 the workspace; nothing in `members` or `exclude` needs to change. `blake3`, `intern`,
 `ra-ap-rustc_lexer` and `serde_json` are already workspace dependencies.
+
+> applied: `native-proc-macro` (its crate exists) in the root `[workspace.dependencies]`. The five entries on `vendor/native-macros/*` wait for request 1: a workspace dependency on a directory that does not exist stops the workspace from loading once blaze-expand names it, so they land with the vendoring (`requests` adds them the pass after the directories appear).
 
 ## 3. To the parent (usercode-macros): `crates/blaze-expand/Cargo.toml`
 
@@ -115,8 +121,11 @@ native-tokio-macros.workspace = true
 ```
 
 and in `crates/blaze-expand/src/lib.rs`'s `report()`, append `native::report()` (the count of
-macros found and each first difference that made a verified crate's library miss), e.g.
+libraries that are verified copies, and each first difference that made a verified crate's
+library miss), e.g.
 `if let Some(native) = native::report() { said += "; "; said += &native; }`.
+
+> forwarded to usercode: `crates/blaze-expand/` is lane usercode's; its five `native-*` lines wait for request 1.
 
 ## 4. To the coordinator: register the description hook
 
@@ -134,35 +143,39 @@ macro, which fails the load (no-fallback): it must be registered before the firs
 What, in `own_macro.rs`:
 
 ```rust
-/// The `rust-project.json` blaze built the proc-macro module at `module` from, or `None` when
-/// `module` is not a module blaze built from a description (a library it runs natively).
-pub fn description_of(module: &Path) -> Result<Option<String>, String> {
-    if module.extension() != Some(OsStr::new("wasm")) {
-        return Ok(None);
-    }
-    let file = module.parent().ok_or("a module without a directory")?.join("rust-project.json");
-    std::fs::read_to_string(&file)
-        .map(Some)
-        .map_err(|e| format!("reading {}, the description of {}: {e}", file.display(), module.display()))
+/// Sets `into` to the `rust-project.json` blaze built the proc-macro module at `module` from,
+/// beside it ([`described_at`]), and says `true`; `false` when `module` is not a module blaze
+/// built from a description (a library it runs natively).
+pub fn description_of(module: &Path, into: &mut PathBuf) -> bool {
+    let (Some(dir), Some("wasm")) = (module.parent(), module.extension().and_then(OsStr::to_str))
+    else {
+        return false;
+    };
+    into.as_mut_os_string().clear();
+    into.push(dir);
+    into.push("rust-project.json");
+    true
 }
 ```
+
+It allocates nothing: the buffer is blaze-expand's, kept per thread and reused.
 
 and in `held_wide()`:
 
 ```rust
-blaze_expand::native::describe_with(Box::new(|dylib| {
-    match cargo::own_macro::description_of(dylib.as_ref())? {
-        Some(description) => blaze_expand::native::closure_of_description(&description),
-        None => Ok(None),
-    }
-}))?;
+blaze_expand::native::describe_with(Box::new(|dylib, into| {
+    Ok(cargo::own_macro::description_of(dylib.as_ref(), into))
+}))
+.expect("held_wide runs once per process");
 ```
 
-(`cargo` as blaze-engine already names `blaze_cargo::cargo`. `describe_with` errs when called
-twice; `held_wide` runs once per process, so its error can be an `expect` if `held_wide` has no
-`Result`.) `closure_of_description` returns `Ok(None)`
-without reading any file when the description's first crate is none blaze verified, so
-the hook costs one small file read per proc-macro library.
+(`cargo` as blaze-engine already names `blaze_cargo::cargo`; `describe_with` errs only when
+called twice.) blaze-expand reads the description itself and keeps what it read by the file's
+path and stat stamp, so after the first load a library costs one `stat` of its description and
+one of each file and directory of its closure; a `.wasm` module whose description is missing is
+an error naming both.
+
+> forwarded to codegen and cargo: `held_wide()` is in `crates/blaze-engine/src/lib.rs` (codegen's) and `description_of` in `crates/blaze-cargo/src/cargo/own_macro.rs` (cargo's); both lanes are still running.
 
 ## 5. To db (forwarded by the coordinator): no hook for `bitflags!`
 
@@ -171,3 +184,5 @@ Each step of a `macro_rules!` expansion is already done in process by `mbe`, and
 more than one step (bitflags' `__impl_*` macros are separate expansions, each with its own
 `MacroCallId` and syntax-context mark) would drop those marks from the output's syntax
 contexts, so it could not be exact. The reasoning is in the notes.
+
+> forwarded to db: a note, nothing to change in `hir-expand`.

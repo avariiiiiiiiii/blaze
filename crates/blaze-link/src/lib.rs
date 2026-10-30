@@ -1,4 +1,4 @@
-//! The parallel, in-place linker (docs/v2/link.md, docs/v2/link-notes.md; #275, #232, #1496).
+//! The parallel, in-place linker (docs/v2/plan/lanes/link/notes.md; #275, #232, #1496).
 //!
 //! An [`Image`] is an executable or shared library kept linked. A [`Change`] says which
 //! functions, statics, names and native inputs came or went; [`Image::stage`] places the new
@@ -330,6 +330,61 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
             all.extend(it.more);
         }
     }
+    Ok(out)
+}
+
+/// Reads `bytes` as a native input of `format` (for a fuzz target): whether it read. A
+/// reader returns an error, never panics, on any bytes.
+#[doc(hidden)]
+pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, bytes: &[u8]) -> bool {
+    let output = Output {
+        format,
+        arch,
+        kind: OutputKind::Executable { entry: "_start".to_owned() },
+        interpreter: None,
+        platform: (format == Format::MachO).then_some(Platform { platform: 1, minimum: 0x000b_0000, sdk: 0x000b_0000 }),
+        incremental: false,
+        debug: Debug::None,
+        live: None,
+        tags: 0,
+        stack: None,
+        windows_subsystem: false,
+    };
+    model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())
+}
+
+/// The default libraries the objects among `natives` ask for (COFF `/DEFAULTLIB`, Mach-O
+/// `LC_LINKER_OPTION`), in order and once each, without those any of them takes out with
+/// `/NODEFAULTLIB`: the caller finds them on its library path and passes them as natives too.
+/// Archive members are not read: the libraries a member asks for once pulled are not among
+/// them.
+pub fn default_libraries(output: &Output, natives: &[Native<'_>]) -> Result<Vec<String>, LinkError> {
+    let writer = model::writer(output)?;
+    let mut out: Vec<String> = Vec::new();
+    let mut none = false;
+    let mut left_out: Vec<String> = Vec::new();
+    for native in natives.iter().filter(|it| matches!(it.kind, NativeKind::Object)) {
+        let file = writer
+            .read(native.name, native.bytes, &native.kind)
+            .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name) })?;
+        let NativeFile::Object(object) = file else { continue };
+        for library in object.libraries {
+            if !out.iter().any(|it| it.eq_ignore_ascii_case(&library)) {
+                out.push(library);
+            }
+        }
+        for directive in object.directives {
+            match directive {
+                model::Directive::NoDefaultLib(Some(library)) => left_out.push(library),
+                model::Directive::NoDefaultLib(None) => none = true,
+                _ => {}
+            }
+        }
+    }
+    if none {
+        return Ok(Vec::new());
+    }
+    out.retain(|it| !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(it)));
     Ok(out)
 }
 

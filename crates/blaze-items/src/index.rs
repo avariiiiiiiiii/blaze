@@ -30,8 +30,8 @@ use base_db::Crate;
 use blaze_ids::{ContentId, Hasher};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, BuiltinDeriveImplId, EnumId, ImplId, ModuleDefId, ModuleId, TraitId,
-    VariantId,
+    AdtId, AssocItemId, BuiltinDeriveImplId, EnumId, HasModule, ImplId, ModuleDefId, ModuleId,
+    TraitId, VariantId,
     builtin_type::BuiltinType,
     item_scope::{ImportOrExternCrate, ImportOrGlob},
     nameres::crate_def_map,
@@ -308,9 +308,31 @@ pub(crate) fn implements_value(
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Result<ContentId, Unhashable> {
+    let (impls, blanket) = implements_entries(db, trait_, self_ty)?;
+    Ok(Hasher::new(domain).part(b"present").id(&impls).id(&blanket).finish())
+}
+
+/// The values of the impls of `trait_` for `self_ty` and of its blanket impls, hashed once
+/// for every fact that reads them.
+#[salsa::tracked]
+fn implements_entries(
+    db: &dyn HirDatabase,
+    trait_: TraitId,
+    self_ty: SimplifiedType,
+) -> Result<(ContentId, ContentId), Unhashable> {
     let impls = entry(db, impls_of(db, trait_, self_ty).iter())?;
     let blanket = entry(db, blanket_impls_of(db, trait_).iter())?;
-    Ok(Hasher::new(domain).part(b"present").id(&impls.value()).id(&blanket.value()).finish())
+    Ok((impls.value(), blanket.value()))
+}
+
+/// The value of every impl of `trait_`, in the order of [`trait_impls`]: what a blanket impl's
+/// coherence reads, hashed once per trait rather than once per blanket impl.
+#[salsa::tracked]
+pub(crate) fn all_impls_value(
+    db: &dyn HirDatabase,
+    trait_: TraitId,
+) -> Result<ContentId, Unhashable> {
+    Ok(entry(db, trait_impls(db, trait_).all().iter())?.value())
 }
 
 pub(crate) fn resolve_trait(db: &dyn HirDatabase, trait_: ItemKey) -> Option<TraitId> {
@@ -470,11 +492,18 @@ fn trait_impls_in(
 #[salsa::tracked(returns(ref))]
 pub(crate) fn trait_impls(db: &dyn HirDatabase, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
     Runs::new(
-        base_db::all_crates(db)
+        dependents(db, trait_.krate(db))
             .iter()
             .flat_map(|&krate| trait_impls_in(db, krate, trait_).rows())
             .collect(),
     )
+}
+
+/// `krate` and the crates that depend on it, directly or not: the only ones that can hold an
+/// impl of one of its traits, which the impl names.
+#[salsa::tracked(returns(deref))]
+fn dependents(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+    krate.transitive_rev_deps(db)
 }
 
 /// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.

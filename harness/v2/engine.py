@@ -25,13 +25,17 @@ The cargo reference (`reference_env`) is plain cargo with the pinned nightly
 against.
 """
 
+import concurrent.futures
 import hashlib
+import io
 import json
+import mmap
 import os
 import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -68,7 +72,7 @@ SCRUBBED = (
 V1_COMPILED = re.compile(r"^stats: (\d+) of (\d+) functions compiled", re.M)
 V1_STORE = re.compile(r"^store: (\d+) functions found, (\d+) compiled and added$", re.M)
 V1_LINK = re.compile(r"^link: \S+ \((.*)\)$", re.M)
-V1_DONE = re.compile(r"^(edit-to-binary:|cold: compiled|stats: )", re.M)
+V1_DONE_BYTES = re.compile(rb"^(edit-to-binary:|cold: compiled|stats: )", re.M)
 SETTLE_SECS = 3.0
 QUIET_SECS = 0.25
 # The commands whose request ends in `Response::Work` (crates/blaze-api/src/build.rs), which the
@@ -188,11 +192,27 @@ def cargo(step: str, args: list[str], ws: Path, env: dict[str, str], timeout: fl
 
 
 def digest(path: Path) -> str:
-    h = hashlib.sha256()
+    """The sha256 of the file at `path`, hashed mapped: one call over its bytes, no copy, and
+    hashlib holds no GIL while it hashes, so `digests` uses every core. The file is a finished
+    build's output, which nothing writes while it is hashed."""
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        if os.fstat(f.fileno()).st_size == 0:
+            return hashlib.sha256().hexdigest()
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            return hashlib.sha256(mapped).hexdigest()
+
+
+def digests(files: Sequence[tuple[Path, int]]) -> list[str]:
+    """`digest` of each (path, size) in `files`, in their order, on every core at once; the
+    largest are started first, so one big file does not run alone at the end."""
+    if len(files) < 2:
+        return [digest(path) for path, _ in files]
+    order = sorted(range(len(files)), key=lambda i: -files[i][1])
+    out = [""] * len(files)
+    with concurrent.futures.ThreadPoolExecutor(min(len(files), os.cpu_count() or 1)) as pool:
+        for i, got in zip(order, pool.map(lambda i: digest(files[i][0]), order)):
+            out[i] = got
+    return out
 
 
 OUTPUT_SUFFIXES = (".rlib", ".rmeta", ".so", ".dylib", ".dll", ".a", ".lib", ".exe", ".wasm", ".pdb")
@@ -202,39 +222,148 @@ def outputs(target: Path, profile: str = "debug") -> dict[str, str]:
     """The files a build of `target/<profile>` delivers, each by its path under it and its
     sha256: every executable and library at its top, in `examples/` and in `deps/` (test
     programs). What cargo keeps for itself (`.fingerprint`, `build`, `incremental`, dep-info,
-    `.cargo-lock`) and blaze's own `target/blaze` are not outputs."""
+    `.cargo-lock`) and blaze's own `target/blaze` are not outputs. A directory is listed once
+    (its entries' types come with it); only the files chosen are `stat`ed."""
     top = target / profile
-    found: dict[str, str] = {}
-    for sub in (top, top / "examples", top / "deps"):
-        if not sub.is_dir():
+    chosen: list[tuple[str, Path, int]] = []
+    for sub, prefix in ((top, ""), (top / "examples", "examples/"), (top / "deps", "deps/")):
+        try:
+            with os.scandir(sub) as listed:
+                entries = sorted(listed, key=lambda e: e.name)
+        except (FileNotFoundError, NotADirectoryError):
             continue
-        for path in sorted(sub.iterdir()):
+        for entry in entries:
             try:
-                info = path.lstat()
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                suffix = Path(entry.name).suffix
+                if suffix and suffix not in OUTPUT_SUFFIXES:
+                    continue
+                info = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
-            if not stat.S_ISREG(info.st_mode):
-                continue
-            executable = bool(info.st_mode & 0o111) and not path.suffix
-            if executable or path.suffix in OUTPUT_SUFFIXES:
-                found[str(path.relative_to(top))] = digest(path)
-    return found
+            if suffix or info.st_mode & 0o111:
+                chosen.append((prefix + entry.name, Path(entry.path), info.st_size))
+    return dict(zip((name for name, _, _ in chosen), digests([(path, size) for _, path, size in chosen])))
+
+
+def fill(f: io.FileIO, buffer: bytearray) -> int:
+    """Reads into `buffer` until it is full or the file ends; how many bytes it holds."""
+    view, got = memoryview(buffer), 0
+    while got < len(buffer):
+        n = f.readinto(view[got:])
+        if not n:
+            break
+        got += n
+    return got
 
 
 def first_difference(a: Path, b: Path) -> str:
-    """Where two files first differ: the byte offset, or which is longer."""
-    with open(a, "rb") as fa, open(b, "rb") as fb:
+    """Where two files first differ: the byte offset, or which is longer. A megabyte of each at
+    a time into two buffers made once, compared whole (one memcmp, no copy); the megabyte that
+    differs is halved by memcmp too, so no byte is compared in Python but the last 64."""
+    size = 1 << 20
+    x, y = bytearray(size), bytearray(size)
+    with open(a, "rb", buffering=0) as fa, open(b, "rb", buffering=0) as fb:
         at = 0
         while True:
-            x, y = fa.read(1 << 16), fb.read(1 << 16)
-            if x != y:
-                for i, (p, q) in enumerate(zip(x, y)):
-                    if p != q:
-                        return f"byte {at + i:#x}: {p:#04x} against {q:#04x}"
-                return f"one ends at byte {at + min(len(x), len(y)):#x}"
-            if not x:
+            nx, ny = fill(fa, x), fill(fb, y)
+            if nx == ny == size and x == y:
+                at += size
+                continue
+            n = min(nx, ny)
+            if n == size or x[:n] != y[:n]:
+                lo, hi = 0, n
+                while hi - lo > 64:
+                    mid = (lo + hi) // 2
+                    if x[lo:mid] == y[lo:mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                i = next(i for i in range(lo, hi) if x[i] != y[i])
+                return f"byte {at + i:#x}: {x[i]:#04x} against {y[i]:#04x}"
+            if nx != ny:
+                return f"one ends at byte {at + n:#x}"
+            if nx == 0:
                 return "the same"
-            at += len(x)
+            at += nx
+
+
+def tree_digest(root: Path, skip: Sequence[str] = ()) -> str:
+    """The sha256 of a source tree: every file's path under `root`, whether it is executable
+    and its sha256, and every symbolic link's target, in path order; the directories named in
+    `skip` at the top are left out (build outputs)."""
+    files: list[tuple[str, Path, int, bool]] = []
+    links: list[tuple[str, str]] = []
+    for here, dirs, names in os.walk(root):
+        base = Path(here)
+        if base == root:
+            dirs[:] = [d for d in dirs if d not in skip]
+        for name in [*dirs, *names]:
+            path = base / name
+            info = path.lstat()
+            rel = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(info.st_mode):
+                links.append((rel, os.readlink(path)))
+            elif stat.S_ISREG(info.st_mode):
+                files.append((rel, path, info.st_size, bool(info.st_mode & 0o111)))
+    files.sort()
+    links.sort()
+    h = hashlib.sha256(b"blaze v2 proof tree 1\0")
+    for (rel, _, _, executable), sha in zip(files, digests([(path, size) for _, path, size, _ in files])):
+        h.update(f"f\0{rel}\0{int(executable)}\0{sha}\n".encode())
+    for rel, to in links:
+        h.update(f"l\0{rel}\0{to}\n".encode())
+    return h.hexdigest()
+
+
+class Kept:
+    """Reference results (rustc's, cargo's) kept on disk across runs under `root/<kind>`, each
+    a JSON file named by the sha256 of everything it depends on, which the caller gives
+    whole: a rerun does again only what changed. `root` empty keeps nothing. An entry is
+    written to a file of its own and renamed into place, so a reader never sees half of one."""
+
+    def __init__(self, root: str, kind: str):
+        self.dir = Path(root).expanduser() / kind if root else None
+        self.domain = f"blaze v2 proof {kind} 1"
+
+    def key(self, *parts: str) -> str:
+        h = hashlib.sha256(self.domain.encode())
+        for part in parts:
+            h.update(b"\0" + part.encode())
+        return h.hexdigest()
+
+    def path(self, key: str) -> Path | None:
+        return None if self.dir is None else self.dir / key[:2] / f"{key}.json"
+
+    def get(self, key: str) -> object | None:
+        path = self.path(key)
+        if path is None:
+            return None
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise Failed(f"the kept result {path} is not JSON ({e}); delete it") from None
+
+    def put(self, key: str, value: object) -> None:
+        path = self.path(key)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+        part.write_text(json.dumps(value, sort_keys=True))
+        part.replace(path)
+
+
+def toolchain_identity(env: dict[str, str]) -> str:
+    """What the pinned toolchain says it is (`rustc -vV`, `cargo -vV`): part of the key of every
+    reference result kept."""
+    said = [run(f"`{tool} -vV`", [tool, "-vV"], ROOT, env, 300, check=True).stdout for tool in ("rustc", "cargo")]
+    return "\n".join(said)
 
 
 class Engine(ABC):
@@ -369,23 +498,35 @@ class V1(Engine):
         return Mark({str(p): p.stat().st_size for p in self.logs(home)})
 
     def work_since(self, home: Path, mark: Mark) -> Work:
-        def text() -> str:
-            out: list[str] = []
+        # Each log's bytes after the mark, read once: a poll reads only what was added since.
+        read: dict[str, bytearray] = {}
+
+        def grew() -> bool:
+            more = False
             for path in self.logs(home):
+                got = read.setdefault(str(path), bytearray())
                 with open(path, "rb") as f:
-                    f.seek(mark.sizes.get(str(path), 0))
-                    out.append(f.read().decode(errors="replace"))
-            return "".join(out)
+                    f.seek(mark.sizes.get(str(path), 0) + len(got))
+                    added = f.read()
+                if added:
+                    got += added
+                    more = True
+            return more
+
+        def done() -> bool:
+            return any(V1_DONE_BYTES.search(got) for got in read.values())
 
         # A worker writes what it did after it answered the client: wait for it to be quiet.
-        began, said, quiet = time.monotonic(), text(), time.monotonic()
+        began = time.monotonic()
+        grew()
+        quiet, finished = time.monotonic(), done()
         while time.monotonic() - began < SETTLE_SECS:
             time.sleep(0.05)
-            now = text()
-            if now != said:
-                said, quiet = now, time.monotonic()
-            elif V1_DONE.search(said) and time.monotonic() - quiet >= QUIET_SECS:
+            if grew():
+                quiet, finished = time.monotonic(), done()
+            elif finished and time.monotonic() - quiet >= QUIET_SECS:
                 break
+        said = "".join(read[path].decode(errors="replace") for path in sorted(read, key=Path))
         compiled = sum(int(n) for n, _ in V1_COMPILED.findall(said))
         stored = V1_STORE.findall(said)
         links = V1_LINK.findall(said)

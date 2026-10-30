@@ -80,9 +80,9 @@ impl<'db> SolverDelegate for SolverContext<'db> {
 
     fn leak_check(
         &self,
-        _max_input_universe: rustc_type_ir::UniverseIndex,
+        max_input_universe: rustc_type_ir::UniverseIndex,
     ) -> Result<(), NoSolution> {
-        Ok(())
+        InferCtxt::leak_check(&self.0, max_input_universe, None).map_err(|_| NoSolution)
     }
 
     /// What `arg` needs to be well formed: the bounds of every struct, enum and union in it
@@ -124,7 +124,6 @@ impl<'db> SolverDelegate for SolverContext<'db> {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> {
-        use super::infer::region_constraints::Constraint;
         let interner = self.interner;
         if !interner.regions() {
             return Vec::new();
@@ -133,25 +132,29 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         let types: Vec<_> = inner
             .region_obligations()
             .iter()
-            .map(|it| OutlivesPredicate(GenericArg::from(it.sup_type), it.sub_region))
+            .map(|it| {
+                (
+                    OutlivesPredicate(GenericArg::from(it.sup_type), it.sub_region),
+                    VisibleForLeakCheck::Yes,
+                )
+            })
             .collect();
-        let var = |vid| Region::new_var(interner, vid);
-        // `a <= b` is `b: a`.
+        // `a <= b` is `b: a`; each keeps whether the leak check sees it, as rustc's
+        // `make_query_region_constraints` does.
         let mut constraints = inner.unwrap_region_constraints();
-        let regions = constraints.region_constraint_data().constraints.iter().map(|constraint| {
-            let (a, b) = match *constraint {
-                Constraint::VarSubVar(a, b) => (var(a), var(b)),
-                Constraint::RegSubVar(a, b) => (a, var(b)),
-                Constraint::VarSubReg(a, b) => (var(a), b),
-                Constraint::RegSubReg(a, b) => (a, b),
-            };
-            OutlivesPredicate(GenericArg::from(b), a)
-        });
+        let regions = constraints.region_constraint_data().constraints.iter_with_visibility().map(
+            |(constraint, visible)| {
+                let (a, b) = constraint.regions(interner);
+                (OutlivesPredicate(GenericArg::from(b), a), visible)
+            },
+        );
         let mut seen = rustc_hash::FxHashSet::default();
         regions
             .chain(types)
-            .filter(|it| it.0.as_region() != Some(it.1) && !says_nothing(it) && seen.insert(*it))
-            .map(|it| (RegionConstraint::Outlives(it), VisibleForLeakCheck::Yes))
+            .filter(|(it, _)| {
+                it.0.as_region() != Some(it.1) && !says_nothing(it) && seen.insert(*it)
+            })
+            .map(|(it, visible)| (RegionConstraint::Outlives(it), visible))
             .collect()
     }
 

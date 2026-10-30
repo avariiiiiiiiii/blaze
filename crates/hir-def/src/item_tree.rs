@@ -29,6 +29,19 @@
 //!
 //! In general, any item in the `ItemTree` stores its `AstId`, which allows mapping it back to its
 //! surface syntax.
+//!
+//! # Layout (docs/v2/plan/design/data.md)
+//!
+//! The tree is columns. An item is a [`ModItemId`], a dense index into three per-item columns:
+//! its [`ItemKind`] (`u8`), its data word (`u32`: its index in its kind's payload column) and its
+//! `FileAstId` (`u32`), [`ITEM_BYTES`] bytes an item. Each kind's payload is a flat array of
+//! plain records of `u32`s ([`Function`], [`Struct`], ...), which [`ItemTree::index`] hands out
+//! by reference. Lists (an inline module's items, an extern block's, a `use` tree's children, a
+//! tuple struct's constructor visibilities) are [`IdRange`]s into one array per element type,
+//! and every list's items come before the item holding it. Names and paths are `u32` ids into
+//! the tree's tables ([`NameId`], [`PathId`]); visibilities ([`RawVisibilityId`]) and attributes
+//! (keyed by item, in [`ItemTree::attrs`]) sit in side tables. [`persist`] writes the columns as
+//! they are.
 
 mod attrs;
 mod lower;
@@ -38,31 +51,25 @@ mod pretty;
 mod tests;
 
 use std::{
-    fmt::{self, Debug},
-    hash::Hash,
-    ops::Index,
+    fmt,
+    mem::size_of,
+    ops::{Index, Range},
     sync::OnceLock,
 };
 
-use ast::{AstNode, StructKind};
 use base_db::{Crate, SourceDatabase};
-use cfg::CfgOptions;
-use either::Either;
+use cfg::CfgExpr;
 use hir_expand::{
     ExpandTo, HirFileId,
+    attrs::Attr,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Interned;
 use la_arena::{Idx, RawIdx};
-use span::{
-    AstIdNode, Edition, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
-    SyntaxContext,
-};
+use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use stdx::never;
-use syntax::{SourceFile, SyntaxKind, ast, match_ast};
-use thin_vec::ThinVec;
-use tt::TextRange;
+use syntax::{SyntaxKind, ast, match_ast};
 
 use crate::{BlockId, attrs::parse_extra_crate_attrs};
 
@@ -71,7 +78,25 @@ pub(crate) use crate::item_tree::{
     lower::{lower_use_tree, visibility_from_ast},
 };
 
+/// `Record` for an id that is a `u32`: what it names is checked when a tree is decoded
+/// ([`persist`]), not when its bytes are.
+macro_rules! u32_records {
+    ($($ty:ident),* $(,)?) => {$(
+        // SAFETY: `#[repr(transparent)]` over a `u32`, so no padding and every bit pattern is a
+        // value.
+        unsafe impl blaze_format::Record for $ty {
+            const SCHEMA: blaze_format::SchemaHash = blaze_format::schema(stringify!($ty));
+            fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), blaze_format::FormatError> {
+                <u32 as blaze_format::Record>::check(bytes, buffer)
+            }
+        }
+    )*};
+}
+
+u32_records!(ModItemId, RawVisibilityId, NameId, PathId, AliasId, UseTreeId);
+
 #[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(transparent)]
 pub(crate) struct RawVisibilityId(u32);
 
 impl RawVisibilityId {
@@ -79,6 +104,11 @@ impl RawVisibilityId {
     const PRIV_IMPLICIT: Self = RawVisibilityId(u32::MAX - 1);
     const PRIV_EXPLICIT: Self = RawVisibilityId(u32::MAX - 2);
     const PUB_CRATE: Self = RawVisibilityId(u32::MAX - 3);
+
+    /// Whether this is one of the visibilities every tree has, not one of its table.
+    fn is_builtin(self) -> bool {
+        self.0 >= Self::PUB_CRATE.0
+    }
 }
 
 impl fmt::Debug for RawVisibilityId {
@@ -94,31 +124,83 @@ impl fmt::Debug for RawVisibilityId {
     }
 }
 
-fn lower_extra_crate_attrs<'a>(
-    db: &dyn SourceDatabase,
-    crate_attrs_as_src: SourceFile,
-    file_id: span::EditionedFileId,
-    cfg_options: &dyn Fn() -> &'a CfgOptions,
-) -> AttrsOrCfg {
-    #[derive(Copy, Clone)]
-    struct FakeSpanMap {
-        file_id: span::EditionedFileId,
+/// A name of an [`ItemTree`]: an index into its table of names, `&tree[id]` the [`Name`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct NameId(u32);
+
+impl NameId {
+    /// No name: the name of `const _`.
+    pub const NONE: NameId = NameId(u32::MAX);
+}
+
+/// A path of an [`ItemTree`]: an index into its table of paths, `&tree[id]` the path.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct PathId(u32);
+
+impl PathId {
+    /// No path: the prefix of `use {a, b}` or the path of `use *` in a nested tree.
+    pub const NONE: PathId = PathId(u32::MAX);
+}
+
+/// An [`ImportAlias`] of an [`ItemTree`], or none: [`ItemTree::import_alias`] reads it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct AliasId(u32);
+
+impl AliasId {
+    /// No `as`.
+    pub const NONE: AliasId = AliasId(u32::MAX);
+    /// `as _`.
+    pub const UNDERSCORE: AliasId = AliasId(u32::MAX - 1);
+}
+
+/// A `use` tree of an [`ItemTree`]: an index into its array of them.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct UseTreeId(u32);
+
+blaze_format::record! {
+    /// A list: `len` elements of one of the tree's arrays from `start`.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct IdRange: 1 {
+        pub start: u32,
+        pub len: u32,
     }
-    impl syntax_bridge::SpanMapper for FakeSpanMap {
-        fn span_for(&self, range: TextRange) -> Span {
-            Span {
-                range,
-                anchor: SpanAnchor {
-                    file_id: self.file_id,
-                    ast_id: NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER,
-                },
-                ctx: SyntaxContext::root(self.file_id.edition()),
-            }
-        }
+}
+
+impl IdRange {
+    pub const EMPTY: IdRange = IdRange { start: 0, len: 0 };
+    /// Not a list: the items of a `mod m;`.
+    const NONE: IdRange = IdRange { start: u32::MAX, len: 0 };
+
+    #[inline]
+    fn range(self) -> Range<usize> {
+        self.start as usize..self.start as usize + self.len as usize
     }
 
-    let span_map = FakeSpanMap { file_id };
-    AttrsOrCfg::lower(db, &crate_attrs_as_src, cfg_options, span_map)
+    /// Whether the list is within an array of `len` elements.
+    fn within(self, len: usize) -> bool {
+        (self.start as usize).checked_add(self.len as usize).is_some_and(|end| end <= len)
+    }
+}
+
+blaze_format::record! {
+    /// The attributes of one item: `attrs` of the tree's attributes and, when one of them is a
+    /// `cfg` that is false, that `cfg` (an index into the tree's `cfgs`; the attributes are then
+    /// those before it).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct AttrOwner: 1 {
+        pub(crate) owner: ModItemId,
+        pub(crate) attrs: IdRange,
+        pub(crate) cfg: u32,
+    }
+}
+
+impl AttrOwner {
+    /// No `cfg` disables the item.
+    pub(crate) const ENABLED: u32 = u32::MAX;
 }
 
 /// Computes an [`ItemTree`] for the given file or macro expansion.
@@ -127,13 +209,7 @@ pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate)
         Some(item_tree) => item_tree,
         None => {
             static EMPTY: OnceLock<ItemTree> = OnceLock::new();
-            EMPTY.get_or_init(|| ItemTree {
-                top_level: Box::new([]),
-                attrs: ThinVec::new(),
-                small_data: ThinVec::new(),
-                big_data: ThinVec::new(),
-                vis: ItemVisibilities { arena: ThinVec::new() },
-            })
+            EMPTY.get_or_init(ItemTree::default)
         }
     }
 }
@@ -148,21 +224,15 @@ fn file_item_tree_query(
 
     let mut ctx = lower::Ctx::new(db, file_id, krate);
     let syntax = file_id.parse_or_expand(db);
-    let mut item_tree = match_ast! {
+    let item_tree = match_ast! {
         match syntax {
             ast::SourceFile(file) => {
                 let root_file_id = krate.root_file_id(db);
-                let extra_top_attrs = (file_id == root_file_id).then(|| {
-                    parse_extra_crate_attrs(db, krate).map(|crate_attrs| {
-                        lower_extra_crate_attrs(db, crate_attrs, root_file_id.span_file_id(db), &|| ctx.cfg_options())
-                    })
-                }).flatten();
-                let top_attrs = match extra_top_attrs {
-                    Some(attrs @ AttrsOrCfg::Enabled { .. }) => attrs.merge(ctx.lower_attrs(&file)),
-                    Some(attrs @ AttrsOrCfg::CfgDisabled(_)) => attrs,
-                    None => ctx.lower_attrs(&file)
-                };
-                ctx.add_attrs(ModItemId::TOP_OWNER, top_attrs);
+                let extra_top_attrs = (file_id == root_file_id)
+                    .then(|| parse_extra_crate_attrs(db, krate))
+                    .flatten()
+                    .map(|crate_attrs| (crate_attrs, root_file_id.span_file_id(db)));
+                ctx.lower_top_attrs(&file, extra_top_attrs);
                 ctx.lower_module_items(&file)
             },
             ast::MacroItems(items) => {
@@ -181,12 +251,7 @@ fn file_item_tree_query(
             },
         }
     };
-    if item_tree.is_empty() {
-        None
-    } else {
-        item_tree.finalize();
-        Some(Box::new(item_tree))
-    }
+    if item_tree.is_empty() { None } else { Some(Box::new(item_tree)) }
 }
 
 #[salsa::tracked(returns(ref))]
@@ -200,21 +265,64 @@ pub(crate) fn block_item_tree_query(
     let block = ast_id.to_node(db);
 
     let ctx = lower::Ctx::new(db, ast_id.file_id, krate);
-    let mut item_tree = ctx.lower_block(&block);
-    item_tree.finalize();
-    item_tree
+    ctx.lower_block(&block)
 }
 
-/// The item tree of a source file.
+/// The item tree of a source file, as columns (the module's docs).
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ItemTree {
     top_level: Box<[ModItemId]>,
-    /// Sorted by the id. The last item, if it has [`ModItemId::TOP_OWNER`], is the top level attrs.
-    attrs: ThinVec<(ModItemId, AttrsOrCfg)>,
-    vis: ItemVisibilities,
-    big_data: ThinVec<(FileAstId<ast::Item>, BigModItem)>,
-    small_data: ThinVec<(FileAstId<ast::Item>, SmallModItem)>,
+    /// Per item: its kind, which payload column `data` indexes.
+    kinds: Box<[ItemKind]>,
+    /// Per item: its index in its kind's payload column.
+    data: Box<[u32]>,
+    /// Per item.
+    ast_ids: Box<[FileAstId<ast::Item>]>,
+    /// The items of inline modules and extern blocks, each list an [`IdRange`] of this.
+    children: Box<[ModItemId]>,
+
+    consts: Box<[Const]>,
+    enums: Box<[Enum]>,
+    extern_blocks: Box<[ExternBlock]>,
+    extern_crates: Box<[ExternCrate]>,
+    functions: Box<[Function]>,
+    impls: Box<[Impl]>,
+    macro2s: Box<[Macro2]>,
+    macro_calls: Box<[MacroCall]>,
+    macro_rules: Box<[MacroRules]>,
+    mods: Box<[Mod]>,
+    statics: Box<[Static]>,
+    structs: Box<[Struct]>,
+    traits: Box<[Trait]>,
+    type_aliases: Box<[TypeAlias]>,
+    unions: Box<[Union]>,
+    uses: Box<[Use]>,
+
+    /// Every `use` tree of the tree's `use` items, each child before its parent.
+    use_trees: Box<[UseTree]>,
+    /// The children of prefixed `use` trees, each list an [`IdRange`] of this.
+    use_tree_lists: Box<[UseTreeId]>,
+    /// The visibilities a struct's value-namespace constructor is the least of, each struct's an
+    /// [`IdRange`] of this.
+    ctor_vis: Box<[RawVisibilityId]>,
+
+    names: Box<[Name]>,
+    paths: Box<[Interned<ModPath>]>,
+    vis: Box<[RawVisibility]>,
+
+    /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
+    attr_owners: Box<[AttrOwner]>,
+    /// Every item's attributes, each item's an [`IdRange`] of this.
+    attrs: Box<[Attr]>,
+    /// The `cfg`s that disable items.
+    cfgs: Box<[CfgExpr]>,
 }
+
+/// Bytes per item in the per-item columns (`kinds`, `data`, `ast_ids`); its kind's payload
+/// record (at most 16 bytes, [`Struct`] and [`Mod`]) is in its own column.
+pub const ITEM_BYTES: usize =
+    size_of::<ItemKind>() + size_of::<u32>() + size_of::<FileAstId<ast::Item>>();
+const _: () = assert!(ITEM_BYTES == 9);
 
 impl ItemTree {
     /// Returns an iterator over all items located at the top level of the `HirFileId` this
@@ -225,46 +333,94 @@ impl ItemTree {
 
     /// Returns the inner attributes of the source file.
     #[inline]
-    pub(crate) fn top_level_attrs(&self) -> Option<&AttrsOrCfg> {
-        self.attrs.last().filter(|(id, _)| *id == ModItemId::TOP_OWNER).map(|(_, attrs)| attrs)
+    pub(crate) fn top_level_attrs(&self) -> Option<AttrsOrCfgRef<'_>> {
+        self.attr_owners
+            .last()
+            .filter(|owner| owner.owner == ModItemId::TOP_OWNER)
+            .map(|owner| self.attrs_of(owner))
     }
 
     /// Whether the file's own `#![cfg(...)]` is false. A crate whose root it is is empty, as
     /// rustc leaves one: none of its items and none of its crate attributes.
     pub fn configured_out(&self) -> bool {
-        matches!(self.top_level_attrs(), Some(AttrsOrCfg::CfgDisabled(_)))
+        matches!(self.top_level_attrs(), Some(AttrsOrCfgRef::CfgDisabled(..)))
     }
 
     #[inline]
-    pub(crate) fn attrs(&self, of: ModItemId) -> Option<&AttrsOrCfg> {
-        self.attrs.binary_search_by_key(&of, |(id, _)| *id).ok().map(|index| &self.attrs[index].1)
+    pub(crate) fn attrs(&self, of: ModItemId) -> Option<AttrsOrCfgRef<'_>> {
+        let at = self.attr_owners.binary_search_by_key(&of, |owner| owner.owner).ok()?;
+        Some(self.attrs_of(&self.attr_owners[at]))
+    }
+
+    #[inline]
+    fn attrs_of(&self, owner: &AttrOwner) -> AttrsOrCfgRef<'_> {
+        let attrs = Attrs::new(&self.attrs[owner.attrs.range()]);
+        match owner.cfg {
+            AttrOwner::ENABLED => AttrsOrCfgRef::Enabled { attrs },
+            cfg => AttrsOrCfgRef::CfgDisabled(&self.cfgs[cfg as usize], attrs),
+        }
+    }
+
+    /// The items of an inline module's or an extern block's list.
+    #[inline]
+    pub(crate) fn items(&self, list: IdRange) -> &[ModItemId] {
+        &self.children[list.range()]
+    }
+
+    /// Whether `m` is inline, and its items if so.
+    #[inline]
+    pub(crate) fn mod_kind(&self, m: &Mod) -> ModKind<'_> {
+        match m.items {
+            IdRange::NONE => ModKind::Outline,
+            items => ModKind::Inline { items: self.items(items) },
+        }
+    }
+
+    /// The visibility of a struct's constructor in the value namespace, if it has one.
+    #[inline]
+    pub(crate) fn value_ns_ctor(&self, s: &Struct) -> StructValueNsCtor<'_> {
+        let all = &self.ctor_vis[s.value_ns_ctor.range()];
+        match all {
+            [] => StructValueNsCtor::NoValueNsCtor,
+            [vis] => StructValueNsCtor::ValueNsCtorWithVis(vis),
+            _ => StructValueNsCtor::ValueNsCtorWithMinVis(all),
+        }
+    }
+
+    /// The name `id` names, `None` for [`NameId::NONE`].
+    #[inline]
+    pub fn get_name(&self, id: NameId) -> Option<&Name> {
+        match id {
+            NameId::NONE => None,
+            id => Some(&self[id]),
+        }
+    }
+
+    #[inline]
+    pub fn import_alias(&self, alias: AliasId) -> Option<ImportAlias> {
+        match alias {
+            AliasId::NONE => None,
+            AliasId::UNDERSCORE => Some(ImportAlias::Underscore),
+            AliasId(name) => Some(ImportAlias::Alias(self[NameId(name)].clone())),
+        }
+    }
+
+    #[inline]
+    pub fn use_tree(&self, id: UseTreeId) -> &UseTree {
+        &self.use_trees[id.0 as usize]
     }
 
     /// Returns a count of a few, expensive items.
     ///
     /// For more detail, see [`ItemTreeDataStats`].
     pub fn item_tree_stats(&self) -> ItemTreeDataStats {
-        let mut traits = 0;
-        let mut impls = 0;
-        let mut mods = 0;
-        let mut macro_calls = 0;
-        let mut macro_rules = 0;
-        for (_, item) in &self.small_data {
-            match item {
-                SmallModItem::Trait(_) => traits += 1,
-                SmallModItem::Impl(_) => impls += 1,
-                SmallModItem::MacroRules(_) => macro_rules += 1,
-                SmallModItem::MacroCall(_) => macro_calls += 1,
-                _ => {}
-            }
+        ItemTreeDataStats {
+            traits: self.traits.len(),
+            impls: self.impls.len(),
+            mods: self.mods.len(),
+            macro_calls: self.macro_calls.len(),
+            macro_rules: self.macro_rules.len(),
         }
-        for (_, item) in &self.big_data {
-            match item {
-                BigModItem::Mod(_) => mods += 1,
-                _ => {}
-            }
-        }
-        ItemTreeDataStats { traits, impls, mods, macro_calls, macro_rules }
     }
 
     pub fn pretty_print(&self, db: &dyn SourceDatabase, edition: Edition) -> String {
@@ -272,59 +428,27 @@ impl ItemTree {
     }
 
     fn is_empty(&self) -> bool {
-        let ItemTree { top_level, attrs, vis: _, big_data: _, small_data: _ } = self;
         // We don't need to check the rest since if those are empty, everything is empty.
-        // `attrs` might contain the top-level attrs so we need to check it separately.
-        top_level.is_empty() && attrs.is_empty()
-    }
-
-    fn finalize(&mut self) {
-        self.attrs.sort_unstable_by_key(|(id, _)| *id);
-
-        let ItemTree { top_level: _, attrs, big_data, small_data, vis } = self;
-        attrs.shrink_to_fit();
-        big_data.shrink_to_fit();
-        small_data.shrink_to_fit();
-        vis.arena.shrink_to_fit();
+        // `attr_owners` might hold the top-level attrs so we need to check it separately.
+        self.top_level.is_empty() && self.attr_owners.is_empty()
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
-struct ItemVisibilities {
-    arena: ThinVec<RawVisibility>,
+impl Index<NameId> for ItemTree {
+    type Output = Name;
+    #[inline]
+    fn index(&self, id: NameId) -> &Name {
+        &self.names[id.0 as usize]
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum SmallModItem {
-    Const(Const),
-    Enum(Enum),
-    ExternBlock(ExternBlock),
-    Function(Function),
-    Impl(Impl),
-    Macro2(Macro2),
-    MacroCall(MacroCall),
-    MacroRules(MacroRules),
-    Static(Static),
-    Trait(Trait),
-    TypeAlias(TypeAlias),
-    Union(Union),
+impl Index<PathId> for ItemTree {
+    type Output = Interned<ModPath>;
+    #[inline]
+    fn index(&self, id: PathId) -> &Interned<ModPath> {
+        &self.paths[id.0 as usize]
+    }
 }
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum BigModItem {
-    ExternCrate(ExternCrate),
-    Mod(Mod),
-    Use(Use),
-    Struct(Struct),
-}
-
-// `ModItem` is stored a bunch in `ItemTree`'s so we pay the max for each item. It should stay as
-// small as possible which is why we split them in two, most common ones are 3 usize but some rarer
-// ones are 5.
-#[cfg(target_pointer_width = "64")]
-const _: [(); std::mem::size_of::<BigModItem>()] = [(); std::mem::size_of::<[usize; 5]>()];
-#[cfg(target_pointer_width = "64")]
-const _: [(); std::mem::size_of::<SmallModItem>()] = [(); std::mem::size_of::<[usize; 3]>()];
 
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct ItemTreeDataStats {
@@ -376,9 +500,10 @@ impl TreeId {
     }
 }
 
+/// An item of an [`ItemTree`]: its index in the per-item columns.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
 pub struct ModItemId {
-    /// The LSB is 0 for small_data and 1 for big_data.
     index: u32,
 }
 
@@ -386,49 +511,35 @@ impl ModItemId {
     const TOP_OWNER: ModItemId = ModItemId { index: u32::MAX };
 
     #[inline]
-    fn new_small(index: u32) -> Self {
-        debug_assert!(
-            (index & 0x80_00_00_00) == 0 && index != (ModItemId::TOP_OWNER.index >> 1),
-            "too big index"
-        );
-        Self { index: index << 1 }
-    }
-    #[inline]
-    fn new_big(index: u32) -> Self {
-        debug_assert!(
-            (index & 0x80_00_00_00) == 0 && index != (ModItemId::TOP_OWNER.index >> 1),
-            "too big index"
-        );
-        Self { index: (index << 1) | 0b1 }
-    }
-
-    #[inline]
-    fn get(
-        self,
-        item_tree: &ItemTree,
-    ) -> (FileAstId<ast::Item>, Either<&SmallModItem, &BigModItem>) {
-        let index = self.index >> 1;
-        match self.index & 0b1 {
-            0 => {
-                let (ast_id, data) = &item_tree.small_data[index as usize];
-                (*ast_id, Either::Left(data))
-            }
-            1 => {
-                let (ast_id, data) = &item_tree.big_data[index as usize];
-                (*ast_id, Either::Right(data))
-            }
-            _ => unreachable!(),
-        }
+    fn new(index: u32) -> Self {
+        debug_assert!(index != ModItemId::TOP_OWNER.index, "too big index");
+        Self { index }
     }
 
     #[inline]
     pub(crate) fn ast_id(self, item_tree: &ItemTree) -> FileAstId<ast::Item> {
-        self.get(item_tree).0
+        item_tree.ast_ids[self.index as usize]
     }
 }
 
 macro_rules! mod_items {
-    ($mod_item:ident -> $( $typ:ident by $either:ident -> $ast:ty ),+ $(,)? ) => {
+    ($mod_item:ident -> $( $typ:ident in $column:ident -> $ast:ty ),+ $(,)? ) => {
+        /// Which kind an item is: which payload column its data word indexes.
+        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+        #[repr(u8)]
+        pub(crate) enum ItemKind {
+            $( $typ, )+
+        }
+
+        impl ItemKind {
+            const ALL: &'static [ItemKind] = &[$( ItemKind::$typ, )+];
+
+            /// The kind numbered `kind`, as `ItemKind::X as u8` numbers them.
+            pub(crate) fn from_u8(kind: u8) -> Option<ItemKind> {
+                Self::ALL.get(kind as usize).copied()
+            }
+        }
+
         #[derive(Debug, Copy, Clone)]
         pub(crate) enum $mod_item<'a> {
             $(
@@ -439,12 +550,17 @@ macro_rules! mod_items {
         impl ItemTree {
             #[inline]
             pub(crate) fn index(&self, id: ModItemId) -> $mod_item<'_> {
-                use BigModItem::*;
-                use SmallModItem::*;
+                let at = id.index as usize;
+                let (ast_id, data) = (self.ast_ids[at], self.data[at] as usize);
+                match self.kinds[at] {
+                    $( ItemKind::$typ => $mod_item::$typ(ast_id.downcast_unchecked(), &self.$column[data]), )+
+                }
+            }
 
-                let (ast_id, item) = id.get(self);
-                match item {
-                    $( Either::$either($typ(item)) => $mod_item::$typ(ast_id.downcast_unchecked(), item), )+
+            /// How long the payload column of `kind` is.
+            fn column_len(&self, kind: ItemKind) -> usize {
+                match kind {
+                    $( ItemKind::$typ => self.$column.len(), )+
                 }
             }
         }
@@ -459,23 +575,25 @@ macro_rules! mod_items {
 
 mod_items! {
 ModItemKind ->
-    Const by Left -> ast::Const,
-    Enum by Left -> ast::Enum,
-    ExternBlock by Left -> ast::ExternBlock,
-    ExternCrate by Right -> ast::ExternCrate,
-    Function by Left -> ast::Fn,
-    Impl by Left -> ast::Impl,
-    Macro2 by Left -> ast::MacroDef,
-    MacroCall by Left -> ast::MacroCall,
-    MacroRules by Left -> ast::MacroRules,
-    Mod by Right -> ast::Module,
-    Static by Left -> ast::Static,
-    Struct by Right -> ast::Struct,
-    Trait by Left -> ast::Trait,
-    TypeAlias by Left -> ast::TypeAlias,
-    Union by Left -> ast::Union,
-    Use by Right -> ast::Use,
+    Const in consts -> ast::Const,
+    Enum in enums -> ast::Enum,
+    ExternBlock in extern_blocks -> ast::ExternBlock,
+    ExternCrate in extern_crates -> ast::ExternCrate,
+    Function in functions -> ast::Fn,
+    Impl in impls -> ast::Impl,
+    Macro2 in macro2s -> ast::MacroDef,
+    MacroCall in macro_calls -> ast::MacroCall,
+    MacroRules in macro_rules -> ast::MacroRules,
+    Mod in mods -> ast::Module,
+    Static in statics -> ast::Static,
+    Struct in structs -> ast::Struct,
+    Trait in traits -> ast::Trait,
+    TypeAlias in type_aliases -> ast::TypeAlias,
+    Union in unions -> ast::Union,
+    Use in uses -> ast::Use,
 }
+
+const _: () = assert!(size_of::<ItemKind>() == 1);
 
 impl Index<RawVisibilityId> for ItemTree {
     type Output = RawVisibility;
@@ -492,20 +610,32 @@ impl Index<RawVisibilityId> for ItemTree {
             RawVisibilityId::PRIV_EXPLICIT => &VIS_PRIV_EXPLICIT,
             RawVisibilityId::PUB => &VIS_PUB,
             RawVisibilityId::PUB_CRATE => &VIS_PUB_CRATE,
-            _ => &self.vis.arena[index.0 as usize],
+            _ => &self.vis[index.0 as usize],
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Use {
-    pub(crate) visibility: RawVisibilityId,
-    pub(crate) use_tree: UseTree,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Use: 1 {
+        pub(crate) visibility: RawVisibilityId,
+        pub(crate) use_tree: UseTreeId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct UseTree {
-    kind: UseTreeKind,
+blaze_format::record! {
+    /// One `use` tree: [`UseTree::kind`] reads it.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct UseTree: 1 {
+        /// [`UseTree::SINGLE`], [`UseTree::GLOB`] or [`UseTree::PREFIXED`].
+        kind: u32,
+        /// The path, the glob's path or the prefix; [`PathId::NONE`] for none.
+        path: PathId,
+        /// A single import's alias.
+        alias: AliasId,
+        /// A prefixed tree's children, in `use_tree_lists`.
+        list: IdRange,
+    }
 }
 
 // FIXME: Would be nice to encode `None` into this
@@ -538,69 +668,86 @@ impl fmt::Display for ImportAliasDisplay<'_> {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum UseTreeKind {
+/// A `use` tree, read from the tree's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UseTreeKind<'a> {
     /// ```ignore
     /// use path::to::Item;
     /// use path::to::Item as Renamed;
     /// use path::to::Trait as _;
     /// ```
-    Single { path: Interned<ModPath>, alias: Option<ImportAlias> },
+    Single { path: &'a Interned<ModPath>, alias: Option<ImportAlias> },
 
     /// ```ignore
     /// use *;  // (invalid, but can occur in nested tree)
     /// use path::*;
     /// ```
-    Glob { path: Option<Interned<ModPath>> },
+    Glob { path: Option<&'a Interned<ModPath>> },
 
     /// ```ignore
     /// use prefix::{self, Item, ...};
     /// ```
-    Prefixed { prefix: Option<Interned<ModPath>>, list: Box<[UseTree]> },
+    Prefixed { prefix: Option<&'a Interned<ModPath>>, list: &'a [UseTreeId] },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExternCrate {
-    pub name: Name,
-    pub alias: Option<ImportAlias>,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct ExternCrate: 1 {
+        pub name: NameId,
+        pub alias: AliasId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExternBlock {
-    pub(crate) children: Box<[ModItemId]>,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct ExternBlock: 1 {
+        /// The block's items: [`ItemTree::items`].
+        pub(crate) children: IdRange,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Function {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Function: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Struct {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
-    pub(crate) value_ns_ctor: StructValueNsCtor,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Struct: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+        /// The constructor's visibilities in `ctor_vis`: [`ItemTree::value_ns_ctor`].
+        pub(crate) value_ns_ctor: IdRange,
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StructValueNsCtor {
+/// The visibility of a struct's constructor in the value namespace, read from the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructValueNsCtor<'a> {
     NoValueNsCtor,
-    ValueNsCtorWithVis(RawVisibilityId),
-    ValueNsCtorWithMinVis(ThinVec<RawVisibilityId>),
+    ValueNsCtorWithVis(&'a RawVisibilityId),
+    /// The least of these (a tuple struct whose fields are `pub(in ...)` of different paths).
+    ValueNsCtorWithMinVis(&'a [RawVisibilityId]),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Union {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Union: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Enum {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Enum: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -648,71 +795,110 @@ impl VisibilityExplicitness {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Const {
-    /// `None` for `const _: () = ();`
-    pub name: Option<Name>,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Const: 1 {
+        /// [`NameId::NONE`] for `const _: () = ();`: [`ItemTree::get_name`].
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Static {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Static: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Trait {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Trait: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Impl {
-    pub is_trait_impl: bool,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Impl: 1 {
+        pub is_trait_impl: bool,
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeAlias {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct TypeAlias: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Mod {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
-    pub(crate) kind: ModKind,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Mod: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+        /// An inline module's items; not a list for `mod m;`: [`ItemTree::mod_kind`].
+        pub(crate) items: IdRange,
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum ModKind {
+/// Whether a module is inline, read from the tree.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ModKind<'a> {
     /// `mod m { ... }`
-    Inline { items: Box<[ModItemId]> },
+    Inline { items: &'a [ModItemId] },
     /// `mod m;`
     Outline,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MacroCall {
     /// Path to the called macro.
-    pub path: Interned<ModPath>,
-    pub expand_to: ExpandTo,
+    pub path: PathId,
     pub ctxt: SyntaxContext,
+    pub expand_to: ExpandTo,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct MacroRules {
-    /// The name of the declared macro.
-    pub name: Name,
+blaze_format::record! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct MacroRules: 1 {
+        /// The name of the declared macro.
+        pub name: NameId,
+    }
 }
 
-/// "Macros 2.0" macro definition.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Macro2 {
-    pub name: Name,
-    pub(crate) visibility: RawVisibilityId,
+blaze_format::record! {
+    /// "Macros 2.0" macro definition.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Macro2: 1 {
+        pub name: NameId,
+        pub(crate) visibility: RawVisibilityId,
+    }
 }
+
+const _: () = {
+    assert!(size_of::<Const>() == 8);
+    assert!(size_of::<Enum>() == 8);
+    assert!(size_of::<ExternBlock>() == 8);
+    assert!(size_of::<ExternCrate>() == 12);
+    assert!(size_of::<Function>() == 8);
+    assert!(size_of::<Impl>() == 1);
+    assert!(size_of::<Macro2>() == 8);
+    assert!(size_of::<MacroCall>() == 12);
+    assert!(size_of::<MacroRules>() == 4);
+    assert!(size_of::<Mod>() == 16);
+    assert!(size_of::<Static>() == 8);
+    assert!(size_of::<Struct>() == 16);
+    assert!(size_of::<Trait>() == 8);
+    assert!(size_of::<TypeAlias>() == 8);
+    assert!(size_of::<Union>() == 8);
+    assert!(size_of::<Use>() == 8);
+    assert!(size_of::<UseTree>() == 20);
+    assert!(size_of::<AttrOwner>() == 16);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportKind {
@@ -728,20 +914,40 @@ impl Use {
     /// Expands the `UseTree` into individually imported `ModPath`s.
     pub fn expand(
         &self,
+        tree: &ItemTree,
         mut cb: impl FnMut(Idx<ast::UseTree>, ModPath, ImportKind, Option<ImportAlias>),
     ) {
-        self.use_tree.expand_impl(None, &mut 0, &mut cb)
+        tree.use_tree(self.use_tree).expand_impl(tree, None, &mut 0, &mut cb)
     }
 }
 
 impl UseTree {
-    /// The [`UseTreeKind`] of this `UseTree`.
-    pub fn kind(&self) -> &UseTreeKind {
-        &self.kind
+    const SINGLE: u32 = 0;
+    const GLOB: u32 = 1;
+    const PREFIXED: u32 = 2;
+
+    /// The [`UseTreeKind`] of this `UseTree`, in `tree`.
+    pub fn kind<'a>(&self, tree: &'a ItemTree) -> UseTreeKind<'a> {
+        let path = match self.path {
+            PathId::NONE => None,
+            path => Some(&tree[path]),
+        };
+        match self.kind {
+            UseTree::SINGLE => UseTreeKind::Single {
+                path: path.expect("a single import with no path"),
+                alias: tree.import_alias(self.alias),
+            },
+            UseTree::GLOB => UseTreeKind::Glob { path },
+            _ => UseTreeKind::Prefixed {
+                prefix: path,
+                list: &tree.use_tree_lists[self.list.range()],
+            },
+        }
     }
 
     fn expand_impl(
         &self,
+        tree: &ItemTree,
         prefix: Option<ModPath>,
         counting_index: &mut u32,
         cb: &mut impl FnMut(Idx<ast::UseTree>, ModPath, ImportKind, Option<ImportAlias>),
@@ -776,10 +982,10 @@ impl UseTree {
             }
         }
 
-        match &self.kind {
+        match self.kind(tree) {
             UseTreeKind::Single { path, alias } => {
                 if let Some((path, kind)) = concat_mod_paths(prefix, path) {
-                    cb(Idx::from_raw(RawIdx::from_u32(*counting_index)), path, kind, alias.clone());
+                    cb(Idx::from_raw(RawIdx::from_u32(*counting_index)), path, kind, alias);
                 }
             }
             UseTreeKind::Glob { path: Some(path) } => {
@@ -810,9 +1016,9 @@ impl UseTree {
                     },
                     None => prefix,
                 };
-                for tree in &**list {
+                for &child in list {
                     *counting_index += 1;
-                    tree.expand_impl(prefix.clone(), counting_index, cb);
+                    tree.use_tree(child).expand_impl(tree, prefix.clone(), counting_index, cb);
                 }
             }
         }

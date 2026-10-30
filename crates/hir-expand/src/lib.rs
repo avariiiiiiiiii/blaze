@@ -562,8 +562,7 @@ impl MacroCallId {
             return (eager.arg.clone(), SyntaxFixupUndoInfo::NONE, eager.span);
         }
 
-        let (parse, map) = loc.kind.file_id().parse_with_map(db);
-        let root = parse.syntax_node();
+        let (root, map) = loc.kind.file_id().parse_with_map(db);
 
         let (is_derive, censor_item_tree_attr_ids, item_node, span) = match &loc.kind {
             MacroCallKind::FnLike { ast_id, .. } => {
@@ -658,6 +657,8 @@ impl MacroCallId {
             }
         };
 
+        let fix_errors =
+            loc.kind.file_id().has_syntax_error_in(db, item_node.syntax().text_range());
         let (mut tt, undo_info) = attr_macro_input_to_token_tree(
             db,
             item_node.syntax(),
@@ -666,6 +667,7 @@ impl MacroCallId {
             is_derive,
             censor_item_tree_attr_ids,
             loc.krate,
+            fix_errors,
         );
 
         if loc.def.is_proc_macro() {
@@ -837,6 +839,7 @@ impl MacroCallId {
                     true,
                     attr_ids,
                     loc.krate,
+                    true,
                 )
             }
             MacroCallKind::Attr { censored_attr_ids: attr_ids, .. } => {
@@ -848,6 +851,7 @@ impl MacroCallId {
                     false,
                     attr_ids,
                     loc.krate,
+                    true,
                 )
             }
         };
@@ -975,8 +979,7 @@ fn expand_unimplemented_builtin_macro(span: Span) -> ExpandResult<tt::TopSubtree
 fn proc_macro_span(db: &dyn SourceDatabase, ast: AstId<ast::Fn>) -> Span {
     #[salsa::tracked(returns(copy))]
     fn proc_macro_span(db: &dyn SourceDatabase, ast: AstId<ast::Fn>, _: ()) -> Span {
-        let (parse, span_map) = ast.file_id.parse_with_map(db);
-        let root = parse.syntax_node();
+        let (root, span_map) = ast.file_id.parse_with_map(db);
         let ast_id_map = ast.file_id.ast_id_map(db);
 
         let node = ast_id_map.get(ast.value).to_node(&root);
@@ -1735,18 +1738,17 @@ impl HirFileId {
         }
     }
 
-    pub(crate) fn parse_with_map(
-        self,
-        db: &dyn SourceDatabase,
-    ) -> (Parse<SyntaxNode>, SpanMap<'_>) {
+    /// The file's root node and span map. A macro file's root is made from the memo in place,
+    /// with no clone of its parse.
+    pub(crate) fn parse_with_map(self, db: &dyn SourceDatabase) -> (SyntaxNode, SpanMap<'_>) {
         match self {
             HirFileId::FileId(file_id) => (
-                file_id.parse(db).to_syntax(),
+                file_id.parse(db).syntax_node(),
                 SpanMap::RealSpanMap(crate::span_map::real_span_map(db, file_id)),
             ),
             HirFileId::MacroFile(macro_file) => {
                 let (parse, map) = &macro_file.parse_macro_expansion(db).value;
-                (parse.clone(), SpanMap::ExpansionSpanMap(map))
+                (parse.syntax_node(), SpanMap::ExpansionSpanMap(map))
             }
         }
     }
@@ -1775,5 +1777,68 @@ impl HirFileId {
     #[salsa::tracked(lru = 1024, returns(ref))]
     pub fn ast_id_map(self, db: &dyn SourceDatabase) -> AstIdMap {
         AstIdMap::from_source(&self.parse_or_expand(db))
+    }
+
+    /// The ranges of the file's syntax errors, sorted by where they start: what
+    /// [`HirFileId::has_syntax_error_in`] searches, so the errors are found once per file.
+    #[salsa::tracked(returns(ref))]
+    fn syntax_error_ranges(self, db: &dyn SourceDatabase) -> Box<[TextRange]> {
+        let mut ranges: Vec<TextRange> = match self {
+            HirFileId::FileId(file_id) => {
+                file_id.parse_errors(db).unwrap_or_default().iter().map(SyntaxError::range).collect()
+            }
+            HirFileId::MacroFile(macro_file) => macro_file
+                .parse_macro_expansion(db)
+                .value
+                .0
+                .errors()
+                .iter()
+                .map(SyntaxError::range)
+                .collect(),
+        };
+        ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+        ranges.into_boxed_slice()
+    }
+}
+
+impl HirFileId {
+    /// Whether a syntax error of the file touches `range`. Only then is the input of an
+    /// attribute macro or derive fixed up ([`fixup::fixup_syntax`]): code without errors goes
+    /// to the macro exactly as written, as rustc passes it.
+    pub(crate) fn has_syntax_error_in(self, db: &dyn SourceDatabase, range: TextRange) -> bool {
+        touches_any(self.syntax_error_ranges(db), range)
+    }
+}
+
+/// Whether one of `ranges`, sorted by start, overlaps or touches `range`.
+fn touches_any(ranges: &[TextRange], range: TextRange) -> bool {
+    let before_end = ranges.partition_point(|it| it.start() <= range.end());
+    ranges[..before_end].iter().any(|it| it.end() >= range.start())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(start: u32, end: u32) -> TextRange {
+        TextRange::new(start.into(), end.into())
+    }
+
+    #[test]
+    fn error_ranges_touching() {
+        let errors = [range(3, 3), range(10, 20), range(15, 16), range(40, 41)];
+        let naive = |it: TextRange| {
+            errors.iter().any(|e| e.start() <= it.end() && e.end() >= it.start())
+        };
+        for start in 0..45 {
+            for end in start..45 {
+                let it = range(start, end);
+                assert_eq!(touches_any(&errors, it), naive(it), "{it:?}");
+            }
+        }
+        assert!(!touches_any(&[], range(0, 10)));
+        assert!(touches_any(&errors, range(0, 3)));
+        assert!(!touches_any(&errors, range(4, 9)));
+        assert!(touches_any(&errors, range(21, 40)));
     }
 }

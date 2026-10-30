@@ -77,6 +77,307 @@ fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     expect.assert_eq(&actual);
 }
 
+/// A body that lowers to every kind of expression and of pattern.
+const EVERY_VARIANT: &str = r#"
+//- minicore: range, fmt
+struct S { a: i32, b: i32 }
+struct T(i32, i32);
+const C: i32 = 0;
+macro_rules! two { () => { 2 } }
+macro_rules! wild { () => { _ } }
+fn main(x: i32, s: S, v: &[i32], r: &mut i32) {
+    let _ = const { 1 };
+    let _ = ("s", b"ab", c"c", 'c', b'a', true, 3, 1i64, 2u8, 0x10, 1.5, 2.5f32, 2f64);
+    let _ = (two!(), -x, !true, *r, &mut x, &raw const x, x as u8, nothing!());
+    let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, builtin # include_bytes);
+    let _ = [1, 2];
+    let _ = [0; 4];
+    let _ = 0..x;
+    let _ = ..;
+    let _ = S { a: 1, ..s };
+    let _ = S { a: 1, .. };
+    let _ = builtin # offset_of(S, a);
+    builtin # asm("");
+    format_args!("hi");
+    x += 1;
+    x = 1;
+    *r = 2;
+    (x, _) = (1, 2);
+    _ = x;
+    let c = |a: i32| -> i32 { a };
+    let _ = move || x;
+    let _ = async || 1;
+    let _ = async move { c.await };
+    let _ = || { yield 1; };
+    let _ = static || { yield; };
+    let _ = unsafe { f(x) };
+    let _ = s.m::<i32>(x);
+    let _ = 'b: { break 'b 1 };
+    'l: loop {
+        if x > 0 { continue 'l; } else { break 'l; }
+    }
+    while x < 2 {}
+    if let (.., y) = (x, x) {}
+    match x {
+        0 | 1 => {}
+        C => {}
+        -1 => {}
+        2..=5 if true => {}
+        ..=9 => {}
+        ref mut z => {}
+        w @ 10 => {}
+        wild!() => {}
+        const { 3 } => {}
+        !null => {}
+    }
+    let S { a, .. } = s;
+    let S { a: aa, b } = s;
+    let T(.., t) = T(1, 2);
+    let [first, .., last] = [1, 2, 3];
+    let [head, rest @ ..] = [1, 2];
+    let &p = &1;
+    let &mut q = &mut 1;
+    let box bx = b;
+    let builtin # deref(d) = e;
+    let Some(o) = opt else { return; };
+    do yeet x;
+    become f(x);
+    return x
+}
+"#;
+
+#[test]
+fn every_variant_pretty_prints() {
+    pretty_print(
+        EVERY_VARIANT,
+        expect![[r#"
+            fn main(x, s, v, r) {
+                let _ = const { /* Idx::<Expr>(1) */ };
+                let _ = ("s", "ab", "c\0", 'c', 97u8, true, 3, 1i64, 2u8, 16, 1.5, 2.5f32, 2f64, );
+                let _ = (2, -x, !true, *r, &mut x, &raw x, x as u8, �, );
+                let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, include_bytes!(_), );
+                let _ = [
+                    1, 2,
+                ];
+                let _ = [
+                    0; 4
+                ];
+                let _ = builtin#lang(Range){
+                    start: 0,
+                    end: x,
+                };
+                let _ = builtin#lang(RangeFull){
+                };
+                let _ = S{
+                    a: 1,
+                    ..s
+                };
+                let _ = S{
+                    a: 1,
+                    ..
+                };
+                let _ = builtin#offset_of(S, a);
+                builtin#asm(_);
+                builtin#lang(Arguments::from_str)(
+                    "hi",
+                );
+                x += 1;
+                x = 1;
+                *r = 2;
+                (x, _) = (1, 2, );
+                _ = x;
+                let c = |a: i32| -> i32 {
+                    a
+                };
+                let _ = move || x;
+                let _ = async || {
+                    1
+                };
+                let _ = async move {
+                    c.await
+                };
+                let _ = || {
+                    yield 1;
+                };
+                let _ = static || {
+                    yield;
+                };
+                let _ = unsafe {
+                    f(
+                        x,
+                    )
+                };
+                let _ = s.m::<i32>(
+                    x,
+                );
+                let _ = 'b: {
+                    break 'b 1
+                };
+                'l: loop {
+                    if x > 0 {
+                        continue 'l;
+                    } else {
+                        break 'l;
+                    }
+                }
+                loop if x < 2 {} else break
+                if let (.., y) = (x, x, ) {}
+                match x {
+                    (0 | 1) => {},
+                    C => {},
+                    -1 => {},
+                    2..=5 if true => {},
+                    ..=9 => {},
+                    ref mut z => {},
+                    w @ 10 => {},
+                    _ => {},
+                    � => {},
+                    !null => {},
+                }
+                let S {
+                    a,
+                    ..
+                } = s;
+                let S {
+                    a: aa,
+                    b,
+                } = s;
+                let T(, ..t) = T(
+                    1,
+                    2,
+                );
+                let [first, .., last, ] = [
+                    1, 2, 3,
+                ];
+                let [head, rest @ .., ] = [
+                    1, 2,
+                ];
+                let &p = &1;
+                let &mut q = &mut 1;
+                let box bx = b;
+                let deref!(d) = e;
+                let Some(o) = opt else {
+                    return;
+                };
+                do yeet x;
+                become f(
+                    x,
+                );
+                return x
+            }"#]],
+    );
+}
+
+/// The place of an expression's variant in the declaration of [`Expr`]: a variant added there
+/// stops this from compiling until [`EVERY_VARIANT`] has it too.
+fn expr_variant(expr: Expr<'_>) -> usize {
+    match expr {
+        Expr::Missing => 0,
+        Expr::Path(_) => 1,
+        Expr::If { .. } => 2,
+        Expr::Let { .. } => 3,
+        Expr::Block { .. } => 4,
+        Expr::Const(_) => 5,
+        Expr::Loop { .. } => 6,
+        Expr::Call { .. } => 7,
+        Expr::MethodCall { .. } => 8,
+        Expr::Match { .. } => 9,
+        Expr::Continue { .. } => 10,
+        Expr::Break { .. } => 11,
+        Expr::Return { .. } => 12,
+        Expr::Become { .. } => 13,
+        Expr::Yield { .. } => 14,
+        Expr::Yeet { .. } => 15,
+        Expr::RecordLit { .. } => 16,
+        Expr::Field { .. } => 17,
+        Expr::Await { .. } => 18,
+        Expr::Cast { .. } => 19,
+        Expr::Ref { .. } => 20,
+        Expr::UnaryOp { .. } => 21,
+        Expr::BinaryOp { .. } => 22,
+        Expr::Assignment { .. } => 23,
+        Expr::Index { .. } => 24,
+        Expr::Closure { .. } => 25,
+        Expr::Tuple { .. } => 26,
+        Expr::Array(_) => 27,
+        Expr::Literal(_) => 28,
+        Expr::Underscore => 29,
+        Expr::OffsetOf(_) => 30,
+        Expr::InlineAsm(_) => 31,
+        Expr::IncludeBytes => 32,
+    }
+}
+const EXPR_VARIANTS: usize = 33;
+
+/// [`expr_variant`] for patterns.
+fn pat_variant(pat: Pat<'_>) -> usize {
+    match pat {
+        Pat::Missing => 0,
+        Pat::Rest => 1,
+        Pat::Wild => 2,
+        Pat::Tuple { .. } => 3,
+        Pat::Or(_) => 4,
+        Pat::Record { .. } => 5,
+        Pat::Range { .. } => 6,
+        Pat::Slice { .. } => 7,
+        Pat::Path(_) => 8,
+        Pat::Lit(_) => 9,
+        Pat::Bind { .. } => 10,
+        Pat::TupleStruct { .. } => 11,
+        Pat::Ref { .. } => 12,
+        Pat::Box { .. } => 13,
+        Pat::Deref { .. } => 14,
+        Pat::NotNull => 15,
+        Pat::Expr(_) => 16,
+    }
+}
+const PAT_VARIANTS: usize = 17;
+
+#[test]
+fn every_variant_is_lowered() {
+    let (db, def) = lower(EVERY_VARIANT);
+    let body = Body::of(&db, def);
+    let mut exprs = [false; EXPR_VARIANTS];
+    body.exprs().for_each(|(_, expr)| exprs[expr_variant(expr)] = true);
+    let missing: Vec<_> = (0..EXPR_VARIANTS).filter(|&it| !exprs[it]).collect();
+    assert!(missing.is_empty(), "expression variants not lowered, by place in `Expr`: {missing:?}");
+    let mut pats = [false; PAT_VARIANTS];
+    body.pats().for_each(|(_, pat)| pats[pat_variant(pat)] = true);
+    let missing: Vec<_> = (0..PAT_VARIANTS).filter(|&it| !pats[it]).collect();
+    assert!(missing.is_empty(), "pattern variants not lowered, by place in `Pat`: {missing:?}");
+}
+
+/// `docs/v2/plan/design/data.md`: a HIR expression takes at most 12 bytes of its own columns,
+/// with what it keeps in `extra` and the lists counted apart.
+#[test]
+fn every_variant_fits_the_column_budget() {
+    let (db, def) = lower(EVERY_VARIANT);
+    let body = Body::of(&db, def);
+    let columns = body.hir_columns().expect("the body has expressions");
+    let (exprs, pats) = (columns.expr_kind.len(), columns.pat_kind.len());
+    assert_eq!(columns.expr_data.len(), exprs, "one data word per expression");
+    assert_eq!(columns.pat_data.len(), pats, "one data word per pattern");
+    assert_eq!(body.exprs().count(), exprs, "the view yields every expression");
+    assert_eq!(body.pats().count(), pats, "the view yields every pattern");
+
+    let expr_bytes = columns.expr_kind.len() + 4 * columns.expr_data.len();
+    let pat_bytes = columns.pat_kind.len() + 4 * columns.pat_data.len();
+    assert!(expr_bytes <= 12 * exprs, "{expr_bytes} bytes for {exprs} expressions");
+    assert!(pat_bytes <= 12 * pats, "{pat_bytes} bytes for {pats} patterns");
+
+    let per = |n: usize, of: usize| n as f64 / of as f64;
+    println!(
+        "{exprs} expressions, {pats} patterns: {:.2} bytes per expression in `expr_kind` and \
+         `expr_data`, {:.2} per pattern; {:.2} words of `extra` per expression ({} words, \
+         shared with the patterns); {:.2} `expr_lists` entries per expression",
+        per(expr_bytes, exprs),
+        per(pat_bytes, pats),
+        per(columns.extra.len(), exprs),
+        columns.extra.len(),
+        per(columns.expr_lists.len(), exprs),
+    );
+}
+
 #[test]
 fn your_stack_belongs_to_me() {
     cov_mark::check!(your_stack_belongs_to_me);
@@ -479,9 +780,7 @@ const fn f(x: i32) -> i32 {
 
     let body = Body::of(&db, body);
     let mtch_arms = body
-        .assert_expr_only()
-        .exprs
-        .iter()
+        .exprs()
         .find_map(|(_, expr)| {
             if let Expr::Match { arms, .. } = expr {
                 return Some(arms);
@@ -492,10 +791,10 @@ const fn f(x: i32) -> i32 {
         .unwrap();
 
     let MatchArm { pat, .. } = mtch_arms[1];
-    match body[pat] {
+    match body.pat(pat) {
         Pat::Range { start, end, range_type: _ } => {
-            let hir_start = &body[start.unwrap()];
-            let hir_end = &body[end.unwrap()];
+            let hir_start = body.expr(start.unwrap());
+            let hir_end = body.expr(end.unwrap());
 
             assert!(matches!(hir_start, Expr::Path { .. }));
             assert!(matches!(hir_end, Expr::Path { .. }));
@@ -517,7 +816,7 @@ fn f(x: char) -> bool {
     );
 
     let body = Body::of(&db, body);
-    let ranges = body.assert_expr_only().pats.iter().filter(|(_, pat)| {
+    let ranges = body.pats().filter(|(_, pat)| {
         matches!(
             pat,
             Pat::Range {

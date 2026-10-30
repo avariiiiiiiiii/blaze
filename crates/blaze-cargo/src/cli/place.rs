@@ -5,6 +5,7 @@
 
 use std::{
     ffi::OsString,
+    io,
     path::{Component, Path, PathBuf},
 };
 
@@ -44,14 +45,11 @@ pub fn manifest(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result
         }
         return Ok(path);
     }
-    let mut lowercase = false;
-    for dir in cwd.ancestors() {
-        let manifest = dir.join("Cargo.toml");
-        if std::fs::metadata(&manifest).is_ok() {
-            return Ok(manifest);
-        }
-        lowercase |= std::fs::metadata(dir.join("cargo.toml")).is_ok();
+    // One stat per directory on the way up; `cargo.toml` is looked for only once nothing was found.
+    if let Some(dir) = cwd.ancestors().find(|dir| std::fs::metadata(dir.join("Cargo.toml")).is_ok()) {
+        return Ok(dir.join("Cargo.toml"));
     }
+    let lowercase = cwd.ancestors().any(|dir| std::fs::metadata(dir.join("cargo.toml")).is_ok());
     let said = format!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display());
     match lowercase {
         true => Err(format!("{said}, but found cargo.toml please try to rename it to Cargo.toml")),
@@ -119,31 +117,40 @@ pub fn find(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result<Pla
 /// `.cargo/config` and `.cargo/config.toml` of each directory from `cwd` up that is not in
 /// the checkout, `$CARGO_HOME`'s, and each `--config` that names a file outside it
 /// (`GlobalContext::walk_tree`, `cli_args_as_table`). Never `credentials.toml`.
+///
+/// A directory without `.cargo` costs one stat; a file is read without one, its absence being the
+/// read's `NotFound`.
 pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let mut add = |path: PathBuf| {
-        if !path.starts_with(&place.root) && !paths.contains(&path) && std::fs::metadata(&path).is_ok_and(|it| it.is_file()) {
-            paths.push(path);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut add = |path: PathBuf| -> Result<(), String> {
+        if path.starts_with(&place.root) {
+            return Ok(());
         }
+        if files.iter().any(|(it, _)| Path::new(it) == path) {
+            return Ok(());
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => files.push((utf8(&path)?, bytes)),
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory) => {}
+            Err(error) => return Err(format!("reading {}: {error}", path.display())),
+        }
+        Ok(())
     };
-    for dir in place.cwd.ancestors() {
-        add(dir.join(".cargo/config"));
-        add(dir.join(".cargo/config.toml"));
+    for dir in place.cwd.ancestors().filter(|it| !it.starts_with(&place.root)) {
+        let cargo = dir.join(".cargo");
+        if std::fs::metadata(&cargo).is_ok_and(|it| it.is_dir()) {
+            add(cargo.join("config"))?;
+            add(cargo.join("config.toml"))?;
+        }
     }
     if let Some(home) = cargo_home {
-        add(home.join("config"));
-        add(home.join("config.toml"));
+        add(home.join("config"))?;
+        add(home.join("config.toml"))?;
     }
     for config in configs.iter().filter(|it| !it.is_empty()) {
-        add(normalize(&place.cwd.join(config)));
+        add(normalize(&place.cwd.join(config)))?;
     }
-    paths
-        .into_iter()
-        .map(|path| {
-            let bytes = std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
-            Ok((utf8(&path)?, bytes))
-        })
-        .collect()
+    Ok(files)
 }
 
 /// A path as the API carries it.
@@ -156,7 +163,7 @@ pub fn utf8(path: &Path) -> Result<String, String> {
 /// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its
 /// name alone: its value is never shown.
 pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(String, String)>, String> {
-    let mut env = Vec::new();
+    let mut env = Vec::with_capacity(vars.size_hint().0);
     for (name, value) in vars {
         let named = name.to_string_lossy().into_owned();
         let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
@@ -166,7 +173,7 @@ pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(Stri
         };
         env.push((name, value));
     }
-    env.sort();
+    env.sort_unstable();
     Ok(env)
 }
 

@@ -9,61 +9,60 @@ use std::collections::VecDeque;
 use hir_ty_mir::mir::BasicBlockId;
 
 use super::{
-    bitset::{BitMatrix, BitSet, union_words, words_for},
+    bitset::{BitMatrix, BitSet, Transfer, masks, union_words, words_for},
     cfg::{Cfg, index},
 };
 
-/// The effect of each block (or of anything else with a row) as a gen and a kill set.
+/// The effect of each block (or of anything else with a row) as a gen and a kill set: per
+/// word, the gen word and the kill word side by side, so applying a row reads one stream.
+/// 16 bytes per 64 bits per row.
 pub(super) struct GenKill {
     words: usize,
-    gen_: Vec<u64>,
-    kill: Vec<u64>,
+    data: Vec<[u64; 2]>,
 }
 
 impl GenKill {
     /// The identity effect for `rows` rows over sets of `domain` bits.
     pub(super) fn new(rows: usize, domain: usize) -> Self {
         let words = words_for(domain);
-        GenKill { words, gen_: vec![0; rows * words], kill: vec![0; rows * words] }
+        GenKill { words, data: vec![[0; 2]; rows * words] }
     }
 
-    fn range(&self, row: usize) -> std::ops::Range<usize> {
-        row * self.words..(row + 1) * self.words
-    }
-
-    /// Adds `bit` after what the row does so far.
-    pub(super) fn gen_bit(&mut self, row: usize, bit: usize) {
-        let at = row * self.words + bit / 64;
-        self.gen_[at] |= 1 << (bit % 64);
-        self.kill[at] &= !(1 << (bit % 64));
-    }
-
-    /// Removes `bit` after what the row does so far.
-    pub(super) fn kill_bit(&mut self, row: usize, bit: usize) {
-        let at = row * self.words + bit / 64;
-        self.kill[at] |= 1 << (bit % 64);
-        self.gen_[at] &= !(1 << (bit % 64));
-    }
-
-    /// The row's effect from what it does to the empty set (`made`) and to the full one
-    /// (`kept`): for an effect that only adds and removes bits whatever is in the set, that is
-    /// all of it.
-    pub(super) fn set_from(&mut self, row: usize, made: &BitSet, kept: &BitSet) {
-        let range = self.range(row);
-        for (at, word) in range.clone().zip(made.words()) {
-            self.gen_[at] = *word;
-        }
-        for (at, word) in range.zip(kept.words()) {
-            self.kill[at] = !*word;
-        }
+    /// The row as a [`Transfer`]: each effect applied to it comes after those before.
+    pub(super) fn row(&mut self, row: usize) -> Row<'_> {
+        Row { data: &mut self.data[row * self.words..(row + 1) * self.words] }
     }
 
     pub(super) fn apply(&self, row: usize, state: &mut [u64]) {
-        let range = self.range(row);
-        let (gen_, kill) = (&self.gen_[range.clone()], &self.kill[range]);
-        for ((word, gen_), kill) in state.iter_mut().zip(gen_).zip(kill) {
+        let data = &self.data[row * self.words..(row + 1) * self.words];
+        for (word, [gen_, kill]) in state.iter_mut().zip(data) {
             *word = (*word & !kill) | gen_;
         }
+    }
+}
+
+/// One row of a [`GenKill`], composing what is applied to it in order.
+pub(super) struct Row<'g> {
+    data: &'g mut [[u64; 2]],
+}
+
+impl Transfer for Row<'_> {
+    #[inline]
+    fn gen_range(&mut self, range: std::ops::Range<usize>) {
+        masks(range, |word, mask| {
+            let [gen_, kill] = &mut self.data[word];
+            *gen_ |= mask;
+            *kill &= !mask;
+        });
+    }
+
+    #[inline]
+    fn kill_range(&mut self, range: std::ops::Range<usize>) {
+        masks(range, |word, mask| {
+            let [gen_, kill] = &mut self.data[word];
+            *kill |= mask;
+            *gen_ &= !mask;
+        });
     }
 }
 
@@ -75,7 +74,8 @@ struct WorkQueue {
 
 impl WorkQueue {
     fn new(blocks: usize, initial: impl Iterator<Item = BasicBlockId>) -> Self {
-        let mut out = WorkQueue { queue: VecDeque::new(), queued: BitSet::new(blocks) };
+        let mut out =
+            WorkQueue { queue: VecDeque::with_capacity(blocks), queued: BitSet::new(blocks) };
         for it in initial {
             out.push(it);
         }
@@ -119,7 +119,7 @@ pub(super) fn forward(
     while let Some(at) = queue.pop() {
         out.copy_from_slice(entry.row(index(at)));
         blocks.apply(index(at), &mut out);
-        for &to in &cfg.successors[index(at)] {
+        for &to in cfg.successors(at) {
             along.copy_from_slice(&out);
             edge(at, to, &mut along);
             if union_words(entry.row_mut(index(to)), &along) {
@@ -145,7 +145,7 @@ pub(super) fn backward(
     let mut queue = WorkQueue::new(count, cfg.order.iter().rev().copied());
     while let Some(at) = queue.pop() {
         exit.fill(0);
-        for &to in &cfg.successors[index(at)] {
+        for &to in cfg.successors(at) {
             along.copy_from_slice(entry.row(index(to)));
             edge(at, to, &mut along);
             union_words(&mut exit, &along);
@@ -153,7 +153,7 @@ pub(super) fn backward(
         blocks.apply(index(at), &mut exit);
         if entry.row(index(at)) != exit.as_slice() {
             entry.row_mut(index(at)).copy_from_slice(&exit);
-            for &from in &cfg.predecessors[index(at)] {
+            for &from in cfg.predecessors(at) {
                 if cfg.reachable[index(from)] {
                     queue.push(from);
                 }
@@ -167,7 +167,7 @@ pub(super) fn backward(
 mod tests {
     use super::{GenKill, backward, forward};
     use crate::{
-        bitset::{BitSet, iter_words},
+        bitset::{BitSet, Transfer, iter_words},
         cfg::{Cfg, block, index},
     };
 
@@ -287,7 +287,7 @@ mod tests {
                 for point in &case.points[b] {
                     point.apply(&mut state);
                 }
-                for &to in &case.cfg.successors[b] {
+                for &to in case.cfg.successors(block(b)) {
                     let mut along = state.clone();
                     if let Some(it) = edge_effect(case, b, index(to)) {
                         it.apply(&mut along);
@@ -313,7 +313,7 @@ mod tests {
             let mut changed = false;
             for &b in order.iter().rev() {
                 let mut state = vec![false; case.domain];
-                for &to in &case.cfg.successors[b] {
+                for &to in case.cfg.successors(block(b)) {
                     let mut along = entry[index(to)].clone();
                     if let Some(it) = edge_effect(case, b, index(to)) {
                         it.apply(&mut along);
@@ -341,12 +341,13 @@ mod tests {
     fn composed(case: &Case, backward: bool) -> GenKill {
         let mut out = GenKill::new(case.points.len(), case.domain);
         for (b, points) in case.points.iter().enumerate() {
+            let mut row = out.row(b);
             let mut run = |point: &Effect| {
                 for &it in &point.kill {
-                    out.kill_bit(b, it);
+                    row.kill(it);
                 }
                 for &it in &point.gen_ {
-                    out.gen_bit(b, it);
+                    row.gen_(it);
                 }
             };
             if backward {
@@ -358,27 +359,33 @@ mod tests {
         out
     }
 
-    /// Each block's effect from running it on the empty and the full set, as the analyses
-    /// whose effects are written on a set build theirs.
-    fn from_runs(case: &Case) -> GenKill {
-        let mut out = GenKill::new(case.points.len(), case.domain);
-        for (b, points) in case.points.iter().enumerate() {
-            let mut made = vec![false; case.domain];
-            let mut kept = vec![true; case.domain];
-            for point in points {
-                point.apply(&mut made);
-                point.apply(&mut kept);
+    /// A block's transfer composed from single bits and ranges does to any set what applying
+    /// them to it one after another does.
+    #[test]
+    fn composed_ranges_match_walking() {
+        let mut rng = Rng(0x9e3779b97f4a7c15);
+        for round in 0..2000 {
+            let domain = 1 + rng.next(300);
+            let mut walked = BitSet::new(domain);
+            for _ in 0..rng.next(domain) {
+                walked.insert(rng.next(domain));
             }
-            let to_set = |it: &[bool]| {
-                let mut set = BitSet::new(case.domain);
-                for at in as_set(it) {
-                    set.insert(at);
-                }
-                set
-            };
-            out.set_from(b, &to_set(&made), &to_set(&kept));
+            let mut start = walked.words().to_vec();
+            let mut transfer = GenKill::new(1, domain);
+            let mut row = transfer.row(0);
+            for _ in 0..rng.next(12) {
+                let from = rng.next(domain);
+                let to = from + rng.next(domain - from + 1);
+                match rng.next(4) {
+                    0 => (walked.gen_(from), row.gen_(from)),
+                    1 => (walked.kill(from), row.kill(from)),
+                    2 => (walked.gen_range(from..to), row.gen_range(from..to)),
+                    _ => (walked.kill_range(from..to), row.kill_range(from..to)),
+                };
+            }
+            transfer.apply(0, &mut start);
+            assert_eq!(start, walked.words(), "round {round}");
         }
-        out
     }
 
     fn rows(entry: &crate::bitset::BitMatrix, blocks: usize) -> Vec<Vec<usize>> {
@@ -395,14 +402,13 @@ mod tests {
             for &it in &case.boundary {
                 boundary.insert(it);
             }
-            for blocks in [composed(&case, false), from_runs(&case)] {
-                let entry = forward(&case.cfg, &blocks, block(0), &boundary, |from, to, state| {
-                    if let Some(it) = edge_effect(&case, index(from), index(to)) {
-                        apply_words(it, case.domain, state);
-                    }
-                });
-                assert_eq!(rows(&entry, case.points.len()), want, "round {round}");
-            }
+            let blocks = composed(&case, false);
+            let entry = forward(&case.cfg, &blocks, block(0), &boundary, |from, to, state| {
+                if let Some(it) = edge_effect(&case, index(from), index(to)) {
+                    apply_words(it, case.domain, state);
+                }
+            });
+            assert_eq!(rows(&entry, case.points.len()), want, "round {round}");
         }
     }
 

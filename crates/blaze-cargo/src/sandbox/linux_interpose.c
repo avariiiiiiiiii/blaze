@@ -82,11 +82,27 @@ static void say(const char *path) {
     errno = saved;
 }
 
+static inline uint64_t mum(uint64_t a, uint64_t b) {
+    __uint128_t r = (__uint128_t)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+
+static inline uint64_t word(const char *s, size_t n) {
+    uint64_t w = 0;
+    memcpy(&w, s, n);
+    return w;
+}
+
+// `kind` and `name` hashed, sixteen bytes a multiply (wyhash's mixing).
 static uint64_t hash(char kind, const char *name) {
-    uint64_t h = 0xcbf29ce484222325ull;
-    h = (h ^ (uint8_t)kind) * 0x100000001b3ull;
-    for (; *name; name++) h = (h ^ (uint8_t)*name) * 0x100000001b3ull;
-    return h | 1;
+    uint64_t h = 0x1d8e4e27c47d124full ^ (uint8_t)kind;
+    size_t n = strlen(name), len = n;
+    for (; n > 16; name += 16, n -= 16) {
+        uint64_t a = word(name, 8), b = word(name + 8, 8);
+        h ^= mum(a ^ 0xa0761d6478bd642full, b ^ h ^ 0xe7037ed1a0b428dbull);
+    }
+    uint64_t a = word(name, n > 8 ? 8 : n), b = n > 8 ? word(name + 8, n - 8) : 0;
+    return (h ^ mum(a ^ 0x8ebc6af09c88c6e3ull ^ len, b ^ h ^ 0x589965cc75374cc3ull)) | 1;
 }
 
 // Whether `kind` and `name` are new to the thread's scope.

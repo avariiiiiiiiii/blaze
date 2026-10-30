@@ -16,13 +16,20 @@ use syntax::{ast, format_smolstr};
 /// This is because we want to show (in completions etc.) names as raw depending on the needs
 /// of the current crate, for example if it is edition 2021 complete `gen` even if the defining
 /// crate is in edition 2024 and wrote `r#gen`, and the opposite holds as well.
-#[derive(Clone, PartialEq, Eq, Hash)]
+///
+/// 8 bytes, `Copy`: the interned symbol's pointer. Equality and hashing are one pointer;
+/// ordering compares text (pointers differ between runs), equal pointers first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Name {
     symbol: Symbol,
     // If you are making this carry actual hygiene, beware that the special handling for variables and labels
     // in bodies can go.
     ctx: (),
 }
+
+const _: () = assert!(size_of::<Name>() == size_of::<Symbol>());
+const _: () = assert!(size_of::<Option<Name>>() == size_of::<Symbol>());
 
 impl fmt::Debug for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -36,6 +43,9 @@ impl fmt::Debug for Name {
 impl Ord for Name {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.symbol == other.symbol {
+            return std::cmp::Ordering::Equal;
+        }
         self.symbol.as_str().cmp(other.symbol.as_str())
     }
 }
@@ -244,10 +254,13 @@ pub trait AsName {
 
 impl AsName for ast::NameRef {
     fn as_name(&self) -> Name {
-        match self.as_tuple_field() {
-            Some(idx) => Name::new_tuple_field(idx),
-            None => Name::new_root(self.text()),
+        let text = self.text();
+        if text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && let Ok(idx) = text.parse::<usize>()
+        {
+            return Name::new_tuple_field(idx);
         }
+        Name::new_root(text)
     }
 }
 
@@ -268,7 +281,11 @@ impl AsName for ast::NameOrNameRef {
 
 impl AsName for tt::Ident {
     fn as_name(&self) -> Name {
-        Name::new_root(self.sym.as_str())
+        // A token tree keeps rawness in `is_raw`, so its symbol is already the name's.
+        if self.sym.as_str().starts_with("r#") {
+            return Name::new_root(self.sym.as_str());
+        }
+        Name::new_symbol_root(self.sym)
     }
 }
 
@@ -287,5 +304,74 @@ impl AsName for ast::FieldKind {
 impl AsName for base_db::BuiltDependency {
     fn as_name(&self) -> Name {
         Name::new_symbol_root((*self.name).clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor};
+    use syntax::{AstNode, SourceFile, TextRange, TextSize};
+
+    use super::*;
+
+    const WORDS: &[&str] =
+        &["a", "b", "Self", "self", "zeta", "Alpha", "_x", "0", "10", "9", "'a", "gen", "ü"];
+
+    #[test]
+    fn order_is_by_text() {
+        let mut names: Vec<Name> = WORDS.iter().map(|it| Name::new_root(it)).collect();
+        let mut texts: Vec<&str> = WORDS.to_vec();
+        names.sort();
+        texts.sort();
+        assert_eq!(names.iter().map(Name::as_str).collect::<Vec<_>>(), texts);
+        for (a, b) in names.iter().zip(&texts) {
+            assert_eq!(a.cmp(&Name::new_root(b)), std::cmp::Ordering::Equal);
+        }
+    }
+
+    #[test]
+    fn idents_name_their_symbol() {
+        let span = Span {
+            range: TextRange::empty(TextSize::new(0)),
+            anchor: SpanAnchor {
+                file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+                ast_id: ROOT_ERASED_FILE_AST_ID,
+            },
+            ctx: SyntaxContext::root(Edition::CURRENT),
+        };
+        for word in WORDS.iter().chain(&["r#gen", "r#fn"]) {
+            let ident = tt::Ident { sym: Symbol::intern(word), span, is_raw: tt::IdentIsRaw::No };
+            assert_eq!(ident.as_name(), Name::new_root(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn name_refs_and_tuple_fields() {
+        let file = SourceFile::parse(
+            "fn f() { x.0; x.17; x.abc; x.r#gen; x._1; x.a0; }",
+            Edition::CURRENT,
+        );
+        let names: Vec<Name> = file
+            .syntax_node()
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+            .filter(|it| it.text() != "x")
+            .map(|it| it.as_name())
+            .collect();
+        let old: Vec<Name> = file
+            .syntax_node()
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+            .filter(|it| it.text() != "x")
+            .map(|it| match it.as_tuple_field() {
+                Some(idx) => Name::new_tuple_field(idx),
+                None => Name::new_root(it.text()),
+            })
+            .collect();
+        assert_eq!(names, old);
+        assert_eq!(names[0].as_tuple_index(), Some(0));
+        assert_eq!(names[1].as_tuple_index(), Some(17));
+        assert_eq!(names[2].as_str(), "abc");
+        assert_eq!(names[3].as_str(), "gen");
     }
 }

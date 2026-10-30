@@ -9,6 +9,7 @@
 use salsa::{Cancelled, Database};
 
 use crate::setup::{Knobs, KnobsDatabase};
+use crate::sync::{mpsc, thread};
 
 #[salsa::tracked(returns(copy))]
 fn query_a(db: &dyn KnobsDatabase) -> u32 {
@@ -36,50 +37,57 @@ fn query_c(_db: &dyn KnobsDatabase) -> u32 {
 #[test]
 fn multiple_threads_blocked_on_cancelled() {
     let db = Knobs::default();
-    let db2 = db.clone();
-    let db3 = db.clone();
-    let db_signaler = db.clone();
-    let token = db.cancellation_token();
+    let db = &db;
+    thread::scope(|scope| {
+        // Thread 1: Starts computing query_a -> query_b, will be cancelled
+        let (token_tx, token_rx) = mpsc::channel();
+        let t1 = scope.spawn(move || {
+            token_tx.send(db.cancellation_token()).unwrap();
+            query_a(db)
+        });
+        let token = token_rx.recv().unwrap();
 
-    // Thread 1: Starts computing query_a -> query_b, will be cancelled
-    let t1 = std::thread::spawn(move || query_a(&db));
+        // Wait for t1 to start query_b
+        db.wait_for(1);
 
-    // Wait for t1 to start query_b
-    db_signaler.wait_for(1);
+        // Thread 2: Will block on query_a (which is blocked on query_b)
+        let t2 = scope.spawn(move || {
+            db.signal_on_will_block(2);
+            query_a(db)
+        });
 
-    // Thread 2: Will block on query_a (which is blocked on query_b)
-    db2.signal_on_will_block(2);
-    let t2 = std::thread::spawn(move || query_a(&db2));
+        // Wait for t2 to block
+        db.wait_for(2);
 
-    // Wait for t2 to block
-    db_signaler.wait_for(2);
+        // Thread 3: Also blocks on query_a
+        let t3 = scope.spawn(move || {
+            db.signal_on_will_block(3);
+            query_a(db)
+        });
 
-    // Thread 3: Also blocks on query_a
-    db3.signal_on_will_block(3);
-    let t3 = std::thread::spawn(move || query_a(&db3));
+        // Wait for t3 to block
+        db.wait_for(3);
 
-    // Wait for t3 to block
-    db_signaler.wait_for(3);
+        // Now cancel t1
+        token.cancel();
 
-    // Now cancel t1
-    token.cancel();
+        // Let t1 continue and get cancelled
+        db.signal(4);
 
-    // Let t1 continue and get cancelled
-    db_signaler.signal(4);
+        // Collect results
+        let r1 = t1.join();
+        let r2 = t2.join();
+        let r3 = t3.join();
 
-    // Collect results
-    let r1 = t1.join();
-    let r2 = t2.join();
-    let r3 = t3.join();
+        // t1 should have been cancelled
+        let r1_cancelled = r1.unwrap_err().downcast::<salsa::Cancelled>().map(|c| *c);
+        assert!(
+            matches!(r1_cancelled, Ok(Cancelled::Local)),
+            "t1 should be locally cancelled, got: {r1_cancelled:?}"
+        );
 
-    // t1 should have been cancelled
-    let r1_cancelled = r1.unwrap_err().downcast::<salsa::Cancelled>().map(|c| *c);
-    assert!(
-        matches!(r1_cancelled, Ok(Cancelled::Local)),
-        "t1 should be locally cancelled, got: {r1_cancelled:?}"
-    );
-
-    // t2 and t3 should both succeed with the correct value
-    assert_eq!(r2.unwrap(), 42, "t2 should compute the correct result");
-    assert_eq!(r3.unwrap(), 42, "t3 should compute the correct result");
+        // t2 and t3 should both succeed with the correct value
+        assert_eq!(r2.unwrap(), 42, "t2 should compute the correct result");
+        assert_eq!(r3.unwrap(), 42, "t3 should compute the correct result");
+    });
 }

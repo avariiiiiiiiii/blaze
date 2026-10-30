@@ -82,32 +82,36 @@ pub(super) fn live_loans<'db>(
     // The edges out of each region: those that hold at one point, sorted by point, and those
     // that hold everywhere, each sub once.
     let constraints = &regions.outlives;
-    let mut localized_pairs: Vec<(u32, (u32, u32))> = Vec::new();
-    let mut logical_pairs: Vec<(u32, u32)> = Vec::new();
-    let mut edges: Vec<(u32, u32)> = Vec::new();
+    let mut localized: Csr<(u32, u32)> = Csr::with_capacity(count, constraints.len());
+    let mut logical: Csr = Csr::with_capacity(count, constraints.len());
     for sup in 0..count {
-        let start = logical_pairs.len();
-        edges.clear();
         for &at in constraints.of_sup(sup) {
             let sub = constraints.sub(at as usize);
             if sub >= count {
                 continue;
             }
             match constraints.location(at as usize) {
-                Some(location) => edges.push((cfg.point(location) as u32, sub as u32)),
+                Some(location) => localized.push((cfg.point(location) as u32, sub as u32)),
                 None => {
-                    if !logical_pairs[start..].iter().any(|&(_, it)| it == sub as u32) {
-                        logical_pairs.push((sup as u32, sub as u32));
+                    if !logical.open().contains(&(sub as u32)) {
+                        logical.push(sub as u32);
                     }
                 }
             }
         }
+        let edges = localized.open_mut();
         edges.sort_unstable();
-        edges.dedup();
-        localized_pairs.extend(edges.iter().map(|&it| (sup as u32, it)));
+        let mut len = 0;
+        for at in 0..edges.len() {
+            if len == 0 || edges[at] != edges[len - 1] {
+                edges[len] = edges[at];
+                len += 1;
+            }
+        }
+        localized.truncate_open(len);
+        localized.end_node();
+        logical.end_node();
     }
-    let localized = Csr::build(count, localized_pairs);
-    let logical = Csr::build(count, logical_pairs);
     let last_of =
         |block| cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() });
 
@@ -176,7 +180,7 @@ pub(super) fn live_loans<'db>(
                     if end < last {
                         follow(end + 1, last);
                     } else {
-                        for &successor in &cfg.successors[index(block)] {
+                        for &successor in cfg.successors(block) {
                             follow(
                                 cfg.point(Location { block: successor, statement: 0 }),
                                 last_of(successor),

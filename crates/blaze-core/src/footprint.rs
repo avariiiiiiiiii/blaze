@@ -1,7 +1,9 @@
 //! The memory backstop of a spawned process on macOS (docs/v2/plan/lanes/core.md section 4, "Hard
-//! backstop"): resource limits set in the child before its program runs, and one thread for
-//! every watched process that reads its physical footprint, the number Activity Monitor and the
-//! kernel's memory pressure go by, and kills it once it passes the limit.
+//! backstop"): one thread for every watched process that reads its physical footprint, the
+//! number Activity Monitor and the kernel's memory pressure go by, and kills it once it passes
+//! the limit. No resource limit is set: macOS refuses RLIMIT_AS and RLIMIT_DATA below the
+//! address space every process reserves, and setting one would need a `fork` where the
+//! process is started with `posix_spawn`.
 
 use std::{
     io,
@@ -15,33 +17,6 @@ use std::{
 /// How often the footprint is read: a process faulting pages in as fast as it can gets tens of
 /// megabytes past its limit at most before it is killed.
 const INTERVAL: Duration = Duration::from_millis(2);
-
-/// In the child between fork and exec (system calls only, no allocation): resource limits
-/// for `limit` bytes (RLIMIT_DATA and RLIMIT_AS as macOS honours them).
-pub(crate) fn limit_self(limit: u64) -> io::Result<()> {
-    for resource in [libc::RLIMIT_DATA, libc::RLIMIT_AS] {
-        // SAFETY: all zeros is a valid `rlimit`; the call writes it.
-        let mut now: libc::rlimit = unsafe { std::mem::zeroed() };
-        // SAFETY: an `rlimit` to write.
-        if unsafe { libc::getrlimit(resource, &mut now) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let most = limit.min(now.rlim_max);
-        let wanted = libc::rlimit { rlim_cur: most, rlim_max: most };
-        // SAFETY: an `rlimit` to read.
-        if unsafe { libc::setrlimit(resource, &wanted) } == 0 {
-            continue;
-        }
-        let error = io::Error::last_os_error();
-        // macOS refuses a limit below the address space the process has reserved already,
-        // which is hundreds of gigabytes of unbacked ranges in every process: that limit is
-        // not one macOS holds, and the footprint watch holds it instead.
-        if error.raw_os_error() != Some(libc::EINVAL) {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
 
 /// One watched process.
 struct Entry {
@@ -177,17 +152,11 @@ fn footprint(pid: libc::pid_t) -> io::Result<Usage> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::CommandExt as _;
-
     use super::*;
 
-    fn spawn(script: &str, limit: Option<u64>) -> std::process::Child {
+    fn spawn(script: &str) -> std::process::Child {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", script]).env_clear().stdout(std::process::Stdio::piped());
-        if let Some(limit) = limit {
-            // SAFETY: `limit_self` makes system calls alone.
-            unsafe { command.pre_exec(move || limit_self(limit)) };
-        }
         command.spawn().unwrap()
     }
 
@@ -205,10 +174,8 @@ mod tests {
     fn a_process_past_its_limit_is_killed() {
         let limit = 32 << 20;
         // Doubles a string until it is a gigabyte, unless it is stopped first.
-        let child = spawn(
-            r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#,
-            None,
-        );
+        let child =
+            spawn(r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#);
         let watch = Watch::start(child.id() as libc::pid_t, limit);
         let (status, peak) = end(child, watch);
         assert!(libc::WIFSIGNALED(status), "it ran to its end: {status:#x}");
@@ -218,7 +185,7 @@ mod tests {
 
     #[test]
     fn a_process_within_its_limit_runs_to_its_end() {
-        let child = spawn("exit 3", None);
+        let child = spawn("exit 3");
         let watch = Watch::start(child.id() as libc::pid_t, 1 << 30);
         let (status, peak) = end(child, watch);
         assert!(!libc::WIFSIGNALED(status));
@@ -229,25 +196,14 @@ mod tests {
     /// The one thread holds each process to its own limit.
     #[test]
     fn watches_at_once_keep_their_own_limits() {
-        let grows = spawn(
-            r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#,
-            None,
-        );
-        let small = spawn("sleep 0.3; exit 0", None);
+        let grows =
+            spawn(r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#);
+        let small = spawn("sleep 0.3; exit 0");
         let small_watch = Watch::start(small.id() as libc::pid_t, 1 << 30);
         let grows_watch = Watch::start(grows.id() as libc::pid_t, 32 << 20);
         let (grew, _) = end(grows, grows_watch);
         let (stayed, _) = end(small, small_watch);
         assert!(libc::WIFSIGNALED(grew) && libc::WTERMSIG(grew) == libc::SIGKILL, "{grew:#x}");
         assert!(!libc::WIFSIGNALED(stayed) && libc::WEXITSTATUS(stayed) == 0, "{stayed:#x}");
-    }
-
-    /// The resource limits leave a program that fits them as it is.
-    #[test]
-    fn limits_set_before_exec_let_a_small_program_run() {
-        let child = spawn("echo hi", Some(1 << 30));
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, b"hi\n");
     }
 }

@@ -33,6 +33,7 @@ mod unsafety;
 
 use blaze_items::{Fact, ItemId};
 use hir::{InFile, db::HirDatabase};
+use hir_expand::MacroCallKind;
 use hir_def::{
     AdtId, DefWithBodyId, Lookup, ModuleDefId,
     expr_store::{Body, BodySourceMap, ExpressionStore},
@@ -68,6 +69,7 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
         found.extend(reachable::lints(&b));
         found.extend(patterns::lints(&b));
         found.extend(unsafety::lints(&b));
+        found.extend(reachable::after_calls(&b));
         found.extend(recursion::calls(&b));
         found.extend(liveness::lints(&b));
         found.extend(recursion::drops(&b));
@@ -116,7 +118,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         let db = cx.db;
         let (body, source_map) = Body::with_source_map(db, owner);
         let body: &'db Body = body;
-        if matches!(body[body.root_expr()], Expr::Missing) && body.params.is_empty() {
+        if matches!(body.expr(body.root_expr()), Expr::Missing) && body.params.is_empty() {
             return None;
         }
         let infer = InferenceResult::of(db, owner);
@@ -198,22 +200,54 @@ impl<'a, 'db> BodyCx<'a, 'db> {
     /// The span rustc's MIR has for what `span` is of: an expression, the end of one (the last
     /// character, rustc's `end_point` of a scope), a pattern, a binding or `self`.
     pub(crate) fn mir_span(&self, span: MirSpan) -> Option<Span> {
+        let node = self.mir_node(span)?;
+        let MirSpan::ExprEnd(_) = span else { return Some(self.cx.span_of(node)) };
+        let last = self.cx.syntax(node).value.last_token()?;
+        let end = last.text_range().end();
+        let len = TextSize::of(last.text().chars().next_back()?);
+        Some(self.cx.span(InFile::new(node.file_id, TextRange::new(end - len, end))))
+    }
+
+    /// The node what `span` is of is written as (of [`MirSpan::ExprEnd`], the whole expression).
+    pub(crate) fn mir_node(&self, span: MirSpan) -> Option<InFile<SyntaxNodePtr>> {
         match span {
-            MirSpan::ExprId(expr) => self.expr_span(expr),
-            MirSpan::ExprEnd(expr) => {
-                let node = self.expr_node(expr)?;
-                let last = self.cx.syntax(node).value.last_token()?;
-                let end = last.text_range().end();
-                let len = TextSize::of(last.text().chars().next_back()?);
-                Some(self.cx.span(InFile::new(node.file_id, TextRange::new(end - len, end))))
-            }
-            MirSpan::PatId(pat) => self.pat_span(pat),
-            MirSpan::BindingId(binding) => Some(self.cx.span_of(self.binding_node(binding)?)),
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => self.expr_node(expr),
+            MirSpan::PatId(pat) => self.pat_node(pat),
+            MirSpan::BindingId(binding) => self.binding_node(binding),
             MirSpan::SelfParam => {
                 let param = self.source_map.self_param_syntax()?;
-                Some(self.cx.span_of(param.map(|it| it.syntax_node_ptr())))
+                Some(param.map(|it| it.syntax_node_ptr()))
             }
             MirSpan::Unknown => None,
+        }
+    }
+
+    /// A type of the body as rustc prints it, through the type of its owner.
+    pub(crate) fn ty(&self, ty: hir_ty::next_solver::Ty<'db>) -> String {
+        let db = self.db();
+        let owner = match self.owner {
+            DefWithBodyId::FunctionId(it) => hir::Function::from(it).ret_type(db),
+            DefWithBodyId::ConstId(it) => hir::Const::from(it).ty(db),
+            DefWithBodyId::StaticId(it) => hir::Static::from(it).ty(db),
+            DefWithBodyId::VariantId(it) => hir::EnumVariant::from(it).parent_enum(db).ty(db),
+        };
+        self.cx.ty(&owner.derived_from_next_solver(ty))
+    }
+
+    /// rustc's `Span::in_external_macro` of `node`: written by a macro of another crate, or
+    /// by an attribute or derive macro, rather than handed to it.
+    pub(crate) fn in_external_macro(&self, node: InFile<SyntaxNodePtr>) -> bool {
+        let db = self.db();
+        let Some(call) = node.file_id.macro_file() else { return false };
+        if let Some((_, ctxt)) = node.map(|it| it.text_range()).original_node_file_range_opt(db)
+            && ctxt.is_root()
+        {
+            return false;
+        }
+        let loc = call.loc(db);
+        match loc.kind {
+            MacroCallKind::FnLike { .. } => hir::Crate::from(loc.def.krate) != self.cx.krate,
+            _ => true,
         }
     }
 
@@ -273,13 +307,13 @@ fn taints(diagnostic: &InferenceDiagnostic) -> bool {
 /// length is an anonymous const of its own, and not of the body.
 fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
     let pat = |pat: PatId, out: &mut Vec<ExprId>| store.walk_exprs_in_pat(pat, |it| out.push(it));
-    match &store[expr] {
+    match store.expr(expr) {
         Expr::Let { pat: p, expr } => {
-            out.push(*expr);
-            pat(*p, out);
+            out.push(expr);
+            pat(p, out);
         }
         Expr::Block { statements, tail, .. } => {
-            for statement in statements.iter() {
+            for statement in statements {
                 match statement {
                     Statement::Let { pat: p, initializer, else_branch, .. } => {
                         out.extend(*initializer);
@@ -290,10 +324,10 @@ fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
                     Statement::Item(_) => {}
                 }
             }
-            out.extend(*tail);
+            out.extend(tail);
         }
         Expr::Match { expr, arms } => {
-            out.push(*expr);
+            out.push(expr);
             for arm in arms.iter() {
                 pat(arm.pat, out);
                 out.extend(arm.guard);
@@ -304,13 +338,13 @@ fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
             for arg in args.iter() {
                 pat(*arg, out);
             }
-            out.push(*body);
+            out.push(body);
         }
         Expr::Assignment { target, value } => {
-            pat(*target, out);
-            out.push(*value);
+            pat(target, out);
+            out.push(value);
         }
-        Expr::Array(Array::Repeat { initializer, .. }) => out.push(*initializer),
+        Expr::Array(Array::Repeat { initializer, .. }) => out.push(initializer),
         _ => store.walk_child_exprs_without_pats(expr, |it| out.push(it)),
     }
 }
@@ -453,10 +487,10 @@ impl Late<'_, '_, '_> {
     fn expr_children(&mut self, expr: ExprId) {
         let b = self.b;
         let store = b.store();
-        match &store[expr] {
+        match store.expr(expr) {
             Expr::Let { pat, expr } => {
-                self.expr(*expr);
-                self.pat(*pat);
+                self.expr(expr);
+                self.pat(pat);
             }
             Expr::Block { statements, tail, .. } => {
                 for (index, statement) in statements.iter().enumerate() {
@@ -484,11 +518,11 @@ impl Late<'_, '_, '_> {
                     }
                 }
                 if let Some(tail) = tail {
-                    self.expr(*tail);
+                    self.expr(tail);
                 }
             }
             Expr::Match { expr: scrutinee, arms } => {
-                self.expr(*scrutinee);
+                self.expr(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
                     for pass in self.passes.iter_mut() {
                         pass.check_arm(b, expr, index, self.out);
@@ -504,13 +538,13 @@ impl Late<'_, '_, '_> {
                 for arg in args.iter() {
                     self.pat(*arg);
                 }
-                self.expr(*body);
+                self.expr(body);
             }
             Expr::Assignment { target, value } => {
-                self.pat(*target);
-                self.expr(*value);
+                self.pat(target);
+                self.expr(value);
             }
-            Expr::Array(Array::Repeat { initializer, .. }) => self.expr(*initializer),
+            Expr::Array(Array::Repeat { initializer, .. }) => self.expr(initializer),
             _ => {
                 let mut children = Vec::new();
                 store.walk_child_exprs_without_pats(expr, |it| children.push(it));
@@ -527,14 +561,14 @@ impl Late<'_, '_, '_> {
             pass.check_pat(b, pat, self.out);
         }
         let store = b.store();
-        match &store[pat] {
-            Pat::Lit(expr) | Pat::Expr(expr) => self.expr(*expr),
+        match store.pat(pat) {
+            Pat::Lit(expr) | Pat::Expr(expr) => self.expr(expr),
             Pat::Range { start, end, .. } => {
                 if let Some(it) = start {
-                    self.expr(*it);
+                    self.expr(it);
                 }
                 if let Some(it) = end {
-                    self.expr(*it);
+                    self.expr(it);
                 }
             }
             _ => {

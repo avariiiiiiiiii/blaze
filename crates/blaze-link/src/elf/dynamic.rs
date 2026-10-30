@@ -3,6 +3,8 @@
 //! `.dynamic` and `.eh_frame_hdr`. A pure function of [`Placed`]: an incremental link asks
 //! again and gets the same bytes for the same image, on any number of cores.
 
+use std::collections::hash_map::Entry;
+
 use blaze_codegen::Arch;
 use gimli::UnwindSection;
 use object::elf;
@@ -190,13 +192,6 @@ pub(crate) fn info(bind: u8, kind: SymbolKind) -> u8 {
     (bind << 4) | sym_type(kind)
 }
 
-/// The section header index of the region holding `addr`: one more than its index in
-/// [`Placed::regions`], which [`super::image`] writes one section header each, in order.
-pub(crate) fn section_of(regions: &[Region], addr: u64) -> Result<u16, LinkError> {
-    numbered(regions)?;
-    Ok(shndx(regions, addr))
-}
-
 /// Whether every region's section header has an ordinary ELF number, as [`shndx`] needs.
 pub(crate) fn numbered(regions: &[Region]) -> Result<(), LinkError> {
     if regions.len() + 1 >= usize::from(elf::SHN_LORESERVE) {
@@ -205,7 +200,9 @@ pub(crate) fn numbered(regions: &[Region]) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// [`section_of`] once [`numbered`] held: a binary search over the regions.
+/// The section header index of the region holding `addr`, once [`numbered`] held: one more
+/// than its index in [`Placed::regions`], which [`super::image`] writes one section header
+/// each, in order. A binary search over the regions.
 pub(crate) fn shndx(regions: &[Region], addr: u64) -> u16 {
     let at = regions.partition_point(|it| it.addr <= addr);
     match at.checked_sub(1).filter(|&it| addr <= regions[it].addr + regions[it].capacity) {
@@ -261,7 +258,7 @@ fn types(arch: Arch) -> Types {
 }
 
 /// One `Elf64_Rela`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct Rela {
     pub(crate) at: u64,
     pub(crate) r_type: u32,
@@ -269,7 +266,19 @@ pub(crate) struct Rela {
     pub(crate) addend: i64,
 }
 
-/// Every synthetic region's bytes, and what the headers need to know of them.
+const _: () = assert!(size_of::<Rela>() == RELA as usize);
+
+impl Rela {
+    fn bytes(&self) -> [u8; RELA as usize] {
+        let mut out = [0; RELA as usize];
+        out[0..8].copy_from_slice(&self.at.to_le_bytes());
+        out[8..16].copy_from_slice(&((u64::from(self.sym) << 32) | u64::from(self.r_type)).to_le_bytes());
+        out[16..24].copy_from_slice(&self.addend.to_le_bytes());
+        out
+    }
+}
+
+/// Every synthetic region's bytes.
 pub(crate) struct Tables {
     pub(crate) interp: Option<Vec<u8>>,
     pub(crate) note: Vec<u8>,
@@ -278,115 +287,139 @@ pub(crate) struct Tables {
     pub(crate) gnu_hash: Vec<u8>,
     pub(crate) versym: Vec<u8>,
     pub(crate) verneed: Vec<u8>,
-    /// The `Elf64_Verneed` entries in `verneed`: its section's `sh_info`.
-    pub(crate) verneeds: u32,
     pub(crate) rela: Vec<u8>,
     pub(crate) dynamic: Vec<u8>,
     pub(crate) eh_frame_hdr: Vec<u8>,
-    /// Whether `.eh_frame_hdr` indexes an `.eh_frame`, so `PT_GNU_EH_FRAME` points at it.
-    pub(crate) has_eh_frame: bool,
 }
 
 impl Tables {
     pub(crate) fn of(writer: &Elf, placed: &Placed<'_>) -> Result<Tables, LinkError> {
         let output = &writer.output;
         let shared = matches!(output.kind, OutputKind::Shared { .. });
-        for (at, import) in placed.imports.iter().enumerate() {
-            if let Some(library) = import.library
-                && library as usize >= placed.libraries.len()
-            {
-                return Err(error(format!("import {at} (`{}`) of library {library}, of no library", import.name)));
-            }
-        }
+        let libraries = placed.libraries;
+        let imports = placed.imports;
+        let exports = placed.exports;
 
         // `--as-needed`: a library none of whose symbols are imported is left out.
-        let needed: Vec<usize> = (0..placed.libraries.len())
-            .filter(|&it| {
-                !placed.libraries[it].as_needed
-                    || placed.imports.iter().any(|import| import.library == Some(it as u32))
-            })
-            .collect();
+        let mut used = vec![false; libraries.len()];
+        for (at, import) in imports.iter().enumerate() {
+            let Some(library) = import.library else { continue };
+            let Some(flag) = used.get_mut(library as usize) else {
+                return Err(error(format!("import {at} (`{}`) of library {library}, of no library", import.name)));
+            };
+            *flag = true;
+        }
+        let needed: Vec<usize> = (0..libraries.len()).filter(|&it| !libraries[it].as_needed || used[it]).collect();
 
-        let mut strings = Strings::new();
-        let needed_names: Vec<u32> = needed.iter().map(|&it| strings.add(&placed.libraries[it].name)).collect();
+        let string_bytes = libraries.iter().map(|it| it.name.len() + 1).sum::<usize>()
+            + soname(output).map_or(0, |it| it.len() + 1)
+            + imports.iter().map(|it| it.name.len() + 1 + it.version.as_ref().map_or(0, |it| it.len() + 1)).sum::<usize>()
+            + exports.iter().map(|it| it.name.len() + 1).sum::<usize>();
+        let mut strings = Strings::with_capacity(string_bytes, needed.len() + 1 + 2 * imports.len() + exports.len());
+        let needed_names: Vec<u32> = needed.iter().map(|&it| strings.add(&libraries[it].name)).collect();
         let soname = soname(output).map(|it| strings.add(it));
 
-        // Versions of imports, numbered from 2 by library in load order, then first use.
-        let mut versions: Vec<(usize, Vec<(String, u16)>)> = needed.iter().map(|&it| (it, Vec::new())).collect();
+        // Versions of imports, numbered from 2 by library in load order, then first use: one
+        // probe per import.
+        const NOT_NEEDED: u32 = u32::MAX;
+        let mut slot = vec![NOT_NEEDED; libraries.len()];
+        for (at, &library) in needed.iter().enumerate() {
+            slot[library] = at as u32;
+        }
+        let mut versions: Vec<(usize, Vec<(&str, u16)>)> = needed.iter().map(|&it| (it, Vec::new())).collect();
+        let mut version_index: FxHashMap<(u32, &str), u16> = FxHashMap::default();
         let mut next = 2u16;
-        let mut version_of = vec![elf::VER_NDX_GLOBAL; placed.imports.len()];
-        for (at, import) in placed.imports.iter().enumerate() {
+        let mut version_of = vec![elf::VER_NDX_GLOBAL; imports.len()];
+        for (at, import) in imports.iter().enumerate() {
             let (Some(library), Some(version)) = (import.library, &import.version) else { continue };
-            let Some((_, list)) = versions.iter_mut().find(|(it, _)| *it == library as usize) else { continue };
-            version_of[at] = match list.iter().find(|(name, _)| name == version) {
-                Some((_, index)) => *index,
-                None => {
+            let slot = slot[library as usize];
+            if slot == NOT_NEEDED {
+                continue;
+            }
+            version_of[at] = match version_index.entry((slot, version.as_str())) {
+                Entry::Occupied(it) => *it.get(),
+                Entry::Vacant(it) => {
                     let index = next;
                     next = next
                         .checked_add(1)
                         .filter(|&it| it < elf::VERSYM_HIDDEN)
                         .ok_or_else(|| error("more symbol versions than ELF numbers".into()))?;
-                    list.push((version.clone(), index));
-                    index
+                    versions[slot as usize].1.push((version.as_str(), index));
+                    *it.insert(index)
                 }
             };
         }
         versions.retain(|(_, list)| !list.is_empty());
 
-        // `.dynsym`: the null symbol, the imports, then the exports in GNU hash bucket order.
-        let mut symbols = vec![Sym::default()];
-        for import in placed.imports {
-            let bind = if import.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
-            symbols.push(Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() });
+        // `.gnu.hash` as mold builds it: every hash once (in parallel when there are many),
+        // then the exports in bucket order by a stable counting sort, the order a stable sort
+        // by bucket gives, in two passes.
+        let symoffset = 1 + imports.len() as u32;
+        let (buckets, mask_words) = gnu_hash_shape(exports.len() as u64);
+        let hashes: Vec<u32> = if exports.len() >= CHUNK {
+            exports.par_iter().with_min_len(CHUNK).map(|it| gnu_hash(it.name.as_bytes())).collect()
+        } else {
+            exports.iter().map(|it| gnu_hash(it.name.as_bytes())).collect()
+        };
+        let bucket_of = |hash: u32| (hash % buckets as u32) as usize;
+        let mut starts = vec![0u32; buckets as usize + 1];
+        for &hash in &hashes {
+            starts[bucket_of(hash) + 1] += 1;
         }
-        let symoffset = symbols.len() as u32;
-        let (buckets, mask_words) = gnu_hash_shape(placed.exports.len() as u64);
-        let mut exports: Vec<(u32, u32, usize)> = placed
-            .exports
-            .iter()
-            .enumerate()
-            .map(|(at, it)| {
-                let hash = gnu_hash(it.name.as_bytes());
-                (hash % buckets as u32, hash, at)
-            })
-            .collect();
-        exports.sort_by_key(|&(bucket, _, _)| bucket);
-        for &(_, _, at) in &exports {
-            let export = &placed.exports[at];
-            symbols.push(Sym {
-                name: strings.add(&export.name),
-                info: info(elf::STB_GLOBAL, export.kind),
-                shndx: section_of(placed.regions, export.addr)?,
-                value: value(placed, &export.name, export.addr, export.kind)?,
-                size: export.size,
-            });
+        for at in 1..starts.len() {
+            starts[at] += starts[at - 1];
         }
-        let mut dynsym = Vec::with_capacity(symbols.len() * SYM as usize);
-        for symbol in &symbols {
-            symbol.put(&mut dynsym);
+        let mut order = vec![0u32; exports.len()];
+        let mut fill = starts.clone();
+        for (at, &hash) in hashes.iter().enumerate() {
+            let bucket = bucket_of(hash);
+            order[fill[bucket] as usize] = at as u32;
+            fill[bucket] += 1;
         }
 
-        let mut versym = Vec::with_capacity(symbols.len() * 2);
+        // `.dynsym`: the null symbol, the imports, then the exports in bucket order.
+        let symbols = 1 + imports.len() + exports.len();
+        let mut dynsym = Vec::with_capacity(symbols * SYM as usize);
+        Sym::default().put(&mut dynsym);
+        for import in imports {
+            let bind = if import.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
+            Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() }.put(&mut dynsym);
+        }
+        numbered(placed.regions)?;
+        for &at in &order {
+            let export = &exports[at as usize];
+            Sym {
+                name: strings.add(&export.name),
+                info: info(elf::STB_GLOBAL, export.kind),
+                shndx: shndx(placed.regions, export.addr),
+                value: value(placed, &export.name, export.addr, export.kind)?,
+                size: export.size,
+            }
+            .put(&mut dynsym);
+        }
+
+        let mut versym = Vec::with_capacity(symbols * 2);
         versym.u16(elf::VER_NDX_LOCAL);
         for version in &version_of {
             versym.u16(*version);
         }
-        for _ in &exports {
-            versym.u16(elf::VER_NDX_GLOBAL);
+        versym.resize(symbols * 2, 0);
+        for pair in versym[2 * symoffset as usize..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&elf::VER_NDX_GLOBAL.to_le_bytes());
         }
 
-        let mut verneed = Vec::new();
+        let mut verneed = Vec::with_capacity(versions.iter().map(|(_, list)| 16 + 16 * list.len()).sum());
         for (at, (library, list)) in versions.iter().enumerate() {
             let last = at + 1 == versions.len();
             verneed.u16(1);
             verneed.u16(list.len() as u16);
-            verneed.u32(strings.add(&placed.libraries[*library].name));
+            verneed.u32(strings.add(&libraries[*library].name));
             verneed.u32(16);
             verneed.u32(if last { 0 } else { 16 + 16 * list.len() as u32 });
-            for (at, (name, index)) in list.iter().enumerate() {
+            for (at, &(name, index)) in list.iter().enumerate() {
                 verneed.u32(elf_hash(name.as_bytes()));
                 verneed.u16(0);
-                verneed.u16(*index);
+                verneed.u16(index);
                 verneed.u32(strings.add(name));
                 verneed.u32(if at + 1 == list.len() { 0 } else { 16 });
             }
@@ -398,35 +431,32 @@ impl Tables {
         gnu_hash.u32(mask_words as u32);
         gnu_hash.u32(BLOOM_SHIFT);
         let mut bloom = vec![0u64; mask_words as usize];
-        for &(_, hash, _) in &exports {
+        for &hash in &hashes {
             let word = (hash as u64 / 64) % mask_words;
             bloom[word as usize] |= (1 << (hash % 64)) | (1 << ((hash >> BLOOM_SHIFT) % 64));
         }
         for word in bloom {
             gnu_hash.u64(word);
         }
-        let mut first = vec![0u32; buckets as usize];
-        for (at, &(bucket, _, _)) in exports.iter().enumerate().rev() {
-            first[bucket as usize] = symoffset + at as u32;
+        for bucket in 0..buckets as usize {
+            let (start, end) = (starts[bucket], starts[bucket + 1]);
+            gnu_hash.u32(if start == end { 0 } else { symoffset + start });
         }
-        for it in first {
-            gnu_hash.u32(it);
-        }
-        for (at, &(bucket, hash, _)) in exports.iter().enumerate() {
-            let last = exports.get(at + 1).is_none_or(|next| next.0 != bucket);
+        for (at, &export) in order.iter().enumerate() {
+            let hash = hashes[export as usize];
+            let last = at as u32 + 1 == starts[bucket_of(hash) + 1];
             gnu_hash.u32((hash & !1) | last as u32);
         }
 
-        let relocations = relocations(writer, placed, shared)?;
-        let relative = relocations.iter().take_while(|it| it.r_type == types(output.arch).relative).count();
-        let mut rela = Vec::with_capacity(relocations.len() * RELA as usize);
-        for it in &relocations {
-            rela.u64(it.at);
-            rela.u64((u64::from(it.sym) << 32) | u64::from(it.r_type));
-            rela.u64(it.addend as u64);
-        }
+        let (relocations, relative) = relocations(writer, placed, shared)?;
+        let mut rela = vec![0; relocations.len() * RELA as usize];
+        rela.par_chunks_mut(RELA as usize * CHUNK).zip(relocations.par_chunks(CHUNK)).for_each(|(out, chunk)| {
+            for (out, it) in out.chunks_exact_mut(RELA as usize).zip(chunk) {
+                out.copy_from_slice(&it.bytes());
+            }
+        });
 
-        let eh = eh_frame_hdr(placed)?;
+        let eh_frame_hdr = eh_frame_hdr(placed)?;
 
         let address = |name: &'static str| {
             placed
@@ -445,7 +475,8 @@ impl Tables {
         if let Some(soname) = soname {
             entry(elf::DT_SONAME, u64::from(soname));
         }
-        let static_tls = shared && relocations.iter().any(|it| it.r_type == types(output.arch).tpoff64);
+        let tpoff64 = types(output.arch).tpoff64;
+        let static_tls = shared && relocations[relative..].iter().any(|it| it.r_type == tpoff64);
         let flags = elf::DF_BIND_NOW
             | if shared { elf::DF_SYMBOLIC } else { 0 }
             | if static_tls { elf::DF_STATIC_TLS } else { 0 };
@@ -504,36 +535,31 @@ impl Tables {
             gnu_hash,
             versym,
             verneed,
-            verneeds: versions.len() as u32,
             rela,
             dynamic,
-            eh_frame_hdr: eh.0,
-            has_eh_frame: eh.1,
+            eh_frame_hdr,
         })
     }
 
-    /// The bytes of the synthetic region `name`.
-    pub(crate) fn get(&self, name: &str) -> Option<&[u8]> {
-        Some(match name {
-            INTERP => self.interp.as_deref()?,
-            BUILD_ID => &self.note,
-            DYNSYM => &self.dynsym,
-            DYNSTR => &self.dynstr,
-            GNU_HASH => &self.gnu_hash,
-            VERSYM => &self.versym,
-            VERNEED => &self.verneed,
-            RELA_DYN => &self.rela,
-            DYNAMIC => &self.dynamic,
-            EH_FRAME_HDR => &self.eh_frame_hdr,
-            _ => return None,
+    /// The bytes of the synthetic region `name`, moved out.
+    fn take(&mut self, name: &str) -> Vec<u8> {
+        std::mem::take(match name {
+            INTERP => return self.interp.take().unwrap_or_default(),
+            BUILD_ID => &mut self.note,
+            DYNSYM => &mut self.dynsym,
+            DYNSTR => &mut self.dynstr,
+            GNU_HASH => &mut self.gnu_hash,
+            VERSYM => &mut self.versym,
+            VERNEED => &mut self.verneed,
+            RELA_DYN => &mut self.rela,
+            DYNAMIC => &mut self.dynamic,
+            EH_FRAME_HDR => &mut self.eh_frame_hdr,
+            _ => return Vec::new(),
         })
     }
 
-    pub(crate) fn regions(self, output: &Output) -> Vec<(Class, Vec<u8>)> {
-        names(output)
-            .into_iter()
-            .map(|name| (Class::Synthetic(name), self.get(name).unwrap_or_default().to_vec()))
-            .collect()
+    pub(crate) fn regions(mut self, output: &Output) -> Vec<(Class, Vec<u8>)> {
+        names(output).into_iter().map(|name| (Class::Synthetic(name), self.take(name))).collect()
     }
 }
 
@@ -547,9 +573,22 @@ fn region_at(regions: &[Region], addr: u64) -> Option<usize> {
     (addr < regions[at].addr + regions[at].size.max(regions[at].capacity)).then_some(at)
 }
 
+/// Whether the loader may write `at`: the region holding it, or an error naming a text
+/// relocation.
+fn writable(regions: &[Region], at: u64, what: &str) -> Result<usize, LinkError> {
+    let region = region_at(regions, at).ok_or_else(|| error(format!("{what} at {at:#x}, in no region of the image")))?;
+    let class = &regions[region].class;
+    if !Segment::of(class).loader_writes() {
+        return Err(error(format!("{what} at {at:#x} is in {class:?}, which the loader can't write (a text relocation)")));
+    }
+    Ok(region)
+}
+
 /// `.rela.dyn`: `RELATIVE` for every slid address (sorted, first, counted by
-/// `DT_RELACOUNT`), then what binds to imports and thread-locals, by address.
-fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Rela>, LinkError> {
+/// `DT_RELACOUNT`), then what binds to imports and thread-locals, by address; and how many
+/// are `RELATIVE`. The slid addresses, most of the table, are read in parallel into a
+/// buffer of their exact size.
+fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<Rela>, usize), LinkError> {
     let types = types(writer.output.arch);
     let import = |index: u32| -> Result<u32, LinkError> {
         if index as usize >= placed.imports.len() {
@@ -557,32 +596,34 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
         }
         Ok(1 + index)
     };
-    let writable = |at: u64, what: &str| -> Result<usize, LinkError> {
-        let region = region_at(placed.regions, at)
-            .ok_or_else(|| error(format!("{what} at {at:#x}, in no region of the image")))?;
-        let class = &placed.regions[region].class;
-        if !Segment::of(class).loader_writes() {
-            return Err(error(format!(
-                "{what} at {at:#x} is in {class:?}, which the loader can't write (a text relocation)"
-            )));
-        }
-        Ok(region)
-    };
+    let regions = placed.regions;
+    let relative_type = types.relative;
+    let other_cells = placed.binds.len() + 2 * placed.got.len();
+    let mut relative = vec![Rela::default(); placed.rebase.len()];
+    let results: Vec<Result<(), LinkError>> = relative
+        .par_chunks_mut(CHUNK)
+        .zip(placed.rebase.par_chunks(CHUNK))
+        .map(|(out, ats)| {
+            for (out, &at) in out.iter_mut().zip(ats) {
+                let region = writable(regions, at, "a slid address")?;
+                let offset = (at - regions[region].addr) as usize;
+                let value = placed
+                    .bytes(region)
+                    .get(offset..offset + 8)
+                    .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?;
+                let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
+                *out = Rela { at, r_type: relative_type, sym: 0, addend: value as i64 };
+            }
+            Ok(())
+        })
+        .collect();
+    first_error(results)?;
+    sort(&mut relative);
+    let count = relative.len();
+    relative.reserve_exact(other_cells);
 
-    let mut relative = Vec::with_capacity(placed.rebase.len());
-    for &at in placed.rebase {
-        let region = writable(at, "a slid address")?;
-        let offset = (at - placed.regions[region].addr) as usize;
-        let bytes = placed.bytes(region);
-        let value = bytes
-            .get(offset..offset + 8)
-            .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?;
-        let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
-        relative.push(Rela { at, r_type: types.relative, sym: 0, addend: value as i64 });
-    }
-    relative.sort_unstable();
-
-    let mut other = Vec::new();
+    let mut other = Vec::with_capacity(other_cells);
+    let writable = |at: u64, what: &str| writable(regions, at, what);
     for bind in placed.binds {
         writable(bind.addr, "a bound address")?;
         other.push(Rela { at: bind.addr, r_type: types.abs64, sym: import(bind.import)?, addend: bind.addend });
@@ -624,9 +665,9 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
             }
         }
     }
-    other.sort_unstable();
+    sort(&mut other);
     relative.extend(other);
-    Ok(relative)
+    Ok((relative, count))
 }
 
 /// The offset in the TLS template of the thread-local at `tp` from the thread pointer: the
@@ -679,12 +720,15 @@ fn rel32(to: u64, from: u64, what: &str) -> Result<u32, LinkError> {
 /// `.eh_frame_hdr`: the binary search table of every FDE in [`Class::EhFrame`] (the
 /// functions' and the native objects'), sorted by the address each covers. Encodings as
 /// lld writes them: `pcrel|sdata4` to `.eh_frame`, a `udata4` count, `datarel|sdata4` pairs.
-fn eh_frame_hdr(placed: &Placed<'_>) -> Result<(Vec<u8>, bool), LinkError> {
+///
+/// One pass over the section: each CIE is parsed once, where the walk meets it, and its FDEs
+/// take it from there rather than parsing it again each.
+fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     let hdr = placed
         .region(&Class::Synthetic(EH_FRAME_HDR))
         .map(|(_, it)| it.addr)
         .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?;
-    let mut table = Vec::new();
+    let mut table = Vec::with_capacity(placed.functions.len());
     let eh_frame = placed.region(&Class::EhFrame);
     if let Some((index, region)) = eh_frame {
         let mut section = gimli::EhFrame::new(placed.bytes(index), gimli::LittleEndian);
@@ -692,14 +736,25 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<(Vec<u8>, bool), LinkError> {
         let bases = gimli::BaseAddresses::default().set_eh_frame(region.addr);
         let mut entries = section.entries(&bases);
         let bad = |it: gimli::Error| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr));
+        let mut cies = FxHashMap::default();
         while let Some(entry) = entries.next().map_err(bad)? {
-            if let gimli::CieOrFde::Fde(partial) = entry {
-                let fde = partial.parse(gimli::EhFrame::cie_from_offset).map_err(bad)?;
-                table.push((fde.initial_address(), region.addr + fde.offset() as u64));
+            match entry {
+                gimli::CieOrFde::Cie(cie) => {
+                    cies.insert(cie.offset(), cie);
+                }
+                gimli::CieOrFde::Fde(partial) => {
+                    let fde = partial
+                        .parse(|section, bases, offset| match cies.get(&offset.0) {
+                            Some(cie) => Ok(cie.clone()),
+                            None => section.cie_from_offset(bases, offset),
+                        })
+                        .map_err(bad)?;
+                    table.push((fde.initial_address(), region.addr + fde.offset() as u64));
+                }
             }
         }
     }
-    table.sort_unstable();
+    sort(&mut table);
     let mut bytes = Vec::with_capacity(12 + 8 * table.len());
     bytes.u8(1);
     bytes.u8(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
@@ -712,5 +767,5 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<(Vec<u8>, bool), LinkError> {
         bytes.u32(rel32(pc, hdr, "a function from .eh_frame_hdr")?);
         bytes.u32(rel32(fde, hdr, "an FDE from .eh_frame_hdr")?);
     }
-    Ok((bytes, eh_frame.is_some()))
+    Ok(bytes)
 }

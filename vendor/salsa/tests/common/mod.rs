@@ -62,7 +62,7 @@ impl<Db: HasLogger + Database> LogDatabase for Db {}
 
 /// Database that provides logging but does not log salsa event.
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct LoggerDatabase {
     storage: Storage<Self>,
     logger: Logger,
@@ -79,7 +79,6 @@ impl Database for LoggerDatabase {}
 
 /// Database that provides logging and logs salsa events.
 #[salsa::db]
-#[derive(Clone)]
 pub struct EventLoggerDatabase {
     storage: Storage<Self>,
     logger: Logger,
@@ -108,7 +107,6 @@ impl HasLogger for EventLoggerDatabase {
 }
 
 #[salsa::db]
-#[derive(Clone)]
 pub struct DiscardLoggerDatabase {
     storage: Storage<Self>,
     logger: Logger,
@@ -143,7 +141,6 @@ impl HasLogger for DiscardLoggerDatabase {
 }
 
 #[salsa::db]
-#[derive(Clone)]
 pub struct ExecuteValidateLoggerDatabase {
     storage: Storage<Self>,
     logger: Logger,
@@ -190,7 +187,7 @@ pub trait ValueDatabase: HasValue + Database {}
 impl<Db: HasValue + Database> ValueDatabase for Db {}
 
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct DatabaseWithValue {
     storage: Storage<Self>,
     value: u32,

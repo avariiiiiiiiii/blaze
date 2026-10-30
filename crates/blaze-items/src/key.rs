@@ -330,9 +330,10 @@ fn module_item_keys<'db>(
     for (_, macros) in scope.legacy_macros() {
         ids.extend(macros.iter().map(|&it| ItemId::Macro(it)));
     }
-    // SAFETY: the static id is only compared with others inside this query, never kept.
-    let here = Siblings::Module(unsafe { module.to_static() });
-    ids.retain(|&id| siblings(db, id) == here);
+    let here = salsa::plumbing::AsId::as_id(&module);
+    ids.retain(|&id| {
+        matches!(siblings(db, id), Siblings::Module(it) if salsa::plumbing::AsId::as_id(&it) == here)
+    });
     ids.sort_unstable();
     ids.dedup();
     let entries = ids.into_iter().map(|id| (id, item_preimage(db, id))).collect();
@@ -748,14 +749,7 @@ pub fn resolve(db: &dyn HirDatabase, key: ItemKey) -> Option<Resolved> {
             return Some(*found);
         }
     }
-    for &krate in krates.iter() {
-        for &inner in &crate_items(db, krate).inner {
-            if let Some(found) = inner_items(db, inner, ()).index.get(&key) {
-                return Some(*found);
-            }
-        }
-    }
-    None
+    krates.iter().find_map(|&krate| crate_inner_items(db, krate).index.get(&key).copied())
 }
 
 type Index = std::collections::HashMap<ItemKey, Resolved, KeyHashing>;
@@ -810,19 +804,25 @@ fn crate_keys_distinct(db: &dyn HirDatabase) {
 
 /// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.
 pub(crate) fn crate_item_ids(db: &dyn HirDatabase, krate: Crate) -> Vec<ItemId> {
-    let items = crate_items(db, krate);
-    let mut ids: Vec<ItemId> = Vec::new();
-    let mut take = |items: &Items| {
-        ids.extend(items.index.values().filter_map(|it| match *it {
+    [crate_items(db, krate), crate_inner_items(db, krate)]
+        .into_iter()
+        .flat_map(|items| items.index.values())
+        .filter_map(|it| match *it {
             Resolved::Item(id) => Some(id),
             _ => None,
-        }))
-    };
-    take(items);
-    for &inner in &items.inner {
-        take(inner_items(db, inner, ()));
+        })
+        .collect()
+}
+
+/// What has a key inside a crate's stores and items' types, in one index: a key that is no
+/// module, impl or trait item is one lookup, not one per store of every crate.
+#[salsa::tracked(returns(ref))]
+fn crate_inner_items(db: &dyn HirDatabase, krate: Crate) -> Items {
+    let mut items = Items::default();
+    for &inner in &crate_items(db, krate).inner {
+        items.merge(inner_items(db, inner, ()));
     }
-    ids
+    items
 }
 
 /// Where else an item has things with keys: a store, with its closures and the items of its
@@ -886,7 +886,7 @@ fn inner_items(db: &dyn HirDatabase, inner: Inner, _: ()) -> Items {
             let mut nth = 0u32;
             for (expr, it) in exprs.exprs() {
                 let Expr::Closure { closure_kind, .. } = it else { continue };
-                let kind = *closure_kind;
+                let kind = closure_kind;
                 let resolved = Resolved::Closure { store, expr, kind };
                 match kind {
                     ClosureKind::Closure => {

@@ -6,18 +6,17 @@
 //! actual IO. See `vfs` and `project_model` in the `rust-analyzer` crate for how
 //! actual IO is done and lowered to input.
 
+use std::collections::hash_map::Entry;
 use std::error::Error;
-use std::hash::BuildHasherDefault;
 use std::str::FromStr;
+use std::sync::{Mutex, PoisonError};
 use std::{fmt, mem, ops};
 
 use blaze_ids::{ContentId, Hasher};
 use cfg::{CfgOptions, HashableCfgOptions};
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use salsa::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
@@ -135,6 +134,10 @@ impl SourceRoot {
 
     pub fn iter(&self) -> impl Iterator<Item = FileId> + '_ {
         self.file_set.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.file_set.len()
     }
 }
 
@@ -809,9 +812,11 @@ impl Crate {
     }
 }
 
-/// The mapping from [`UniqueCrateData`] to their [`Crate`] input.
+/// The mapping from [`UniqueCrateData`] to their [`Crate`] input. Read and written only by
+/// [`CrateGraphBuilder::set_in_db`], on `&mut` of the database, which locks it once for the
+/// whole graph; no query reads it.
 #[derive(Debug, Default)]
-pub struct CratesMap(DashMap<UniqueCrateData, Crate, BuildHasherDefault<FxHasher>>);
+pub struct CratesMap(Mutex<FxHashMap<UniqueCrateData, Crate>>);
 
 impl CrateGraphBuilder {
     pub fn add_crate_root(
@@ -887,12 +892,13 @@ impl CrateGraphBuilder {
         let mut visited_root_files = FxHashSet::default();
 
         let crates_map = db.crates_map();
+        let mut crates_map = crates_map.0.lock().unwrap_or_else(PoisonError::into_inner);
         // salsa doesn't compare new input to old input to see if they are the same, so here we are doing all the work ourselves.
         for krate in self.iter() {
             go(
                 &self,
                 db,
-                &crates_map,
+                &mut crates_map,
                 &mut visited,
                 &mut visited_root_files,
                 &mut all_crates,
@@ -912,7 +918,7 @@ impl CrateGraphBuilder {
         fn go(
             graph: &CrateGraphBuilder,
             db: &mut dyn SourceDatabase,
-            crates_map: &CratesMap,
+            crates_map: &mut FxHashMap<UniqueCrateData, Crate>,
             visited: &mut FxHashMap<CrateBuilderId, Crate>,
             visited_root_files: &mut FxHashSet<FileId>,
             all_crates: &mut FxIndexSet<Crate>,
@@ -967,7 +973,7 @@ impl CrateGraphBuilder {
             );
             let unique_crate_data =
                 UniqueCrateData { root_file_id: krate.basic.root_file_id, disambiguator };
-            let crate_input = match crates_map.0.entry(unique_crate_data) {
+            let crate_input = match crates_map.entry(unique_crate_data) {
                 Entry::Occupied(entry) => {
                     let old_crate = *entry.get();
                     if crate_data != *old_crate.data(db) {

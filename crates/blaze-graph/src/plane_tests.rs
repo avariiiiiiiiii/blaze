@@ -1,5 +1,9 @@
 //! The plane's tests (docs/v2/plan/lanes/core/plane.md): what each rule does alone, the plane as the machine
-//! with one request, and random requests under a seeded generator, checked after every step.
+//! with one request, and random requests under a seeded generator, checked after every step
+//! and step by step against [`reference`], the plane as it was before its state moved to
+//! columns.
+
+mod reference;
 
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +12,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
-    plane::{Budget, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats},
+    plane::{
+        Budget, Counts, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+    },
     trace::{Trace, render},
 };
 
@@ -846,24 +852,113 @@ impl Model {
         self.outputs.extend(outputs);
     }
 
-    /// A running task is done: what the plane is told, and what the model keeps of it. Its
-    /// work puts the value in the database first, and a failure too if `keep_failure`.
-    fn finish(&mut self, id: u32, outcome: &Outcome, keep_failure: bool) {
+    /// A running task is done: what the model keeps of it, and what its work puts in the
+    /// database before the plane is told: the value, and a failure too if `keep_failure`.
+    fn finish(&mut self, id: u32, outcome: &Outcome, keep_failure: bool) -> Option<(Key, Outcome)> {
         self.running.retain(|&it| it != id);
         let spec = &self.specs[&id];
         self.granted -= spec.memory;
-        if let Some(key) = spec.key {
-            self.running_keys.remove(&key);
-            if keep_failure || !matches!(outcome, Outcome::Failed { .. }) {
-                self.db.lock().unwrap().insert(key, outcome.clone());
-            }
+        let key = spec.key?;
+        self.running_keys.remove(&key);
+        (keep_failure || !matches!(outcome, Outcome::Failed { .. })).then(|| (key, outcome.clone()))
+    }
+}
+
+/// What a simulation does to its plane and database, in order, so the reference can be put
+/// through the same.
+#[derive(Debug, Clone)]
+enum Act {
+    Step(PlaneInput),
+    Cancel(u64, RequestId),
+    Release(RequestId),
+    /// The work puts a value in the database.
+    Put(Key, Outcome),
+    /// The database drops a value.
+    Drop(Key),
+}
+
+/// What a plane says of itself after an act: of requests `0..` and nodes `0..` as many as
+/// were named so far.
+#[derive(Debug, PartialEq)]
+struct Seen {
+    holding: Option<NodeId>,
+    granted: u64,
+    counts: Counts,
+    stats: Vec<Option<RequestStats>>,
+    states: Vec<Option<NodeState>>,
+}
+
+impl Seen {
+    fn of(plane: &Plane, requests: u32, nodes: u32) -> Seen {
+        Seen {
+            holding: plane.holding(),
+            granted: plane.granted(),
+            counts: plane.counts(),
+            stats: (0..requests).map(|r| plane.stats(RequestId(r))).collect(),
+            states: (0..nodes).map(|id| plane.state(NodeId(id)).cloned()).collect(),
+        }
+    }
+
+    fn of_reference(plane: &reference::Plane, requests: u32, nodes: u32) -> Seen {
+        Seen {
+            holding: plane.holding(),
+            granted: plane.granted(),
+            counts: plane.counts(),
+            stats: (0..requests).map(|r| plane.stats(RequestId(r))).collect(),
+            states: (0..nodes).map(|id| plane.state(NodeId(id)).cloned()).collect(),
         }
     }
 }
 
-/// One random run of many requests: the outputs the plane gave, and how many steps it took.
-/// With `release`, each request is released as it is opened.
-fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
+/// A simulation's plane, driven through one buffer of outputs as a long-lived caller would,
+/// and what was done to it.
+struct Driver {
+    plane: Plane,
+    db: Db,
+    buffer: Vec<PlaneOutput>,
+    requests: u32,
+    acts: Vec<(Act, Vec<PlaneOutput>, Seen)>,
+}
+
+impl Driver {
+    /// Does `act`, `nodes` ids being named so far: what the plane said.
+    fn act(&mut self, act: Act, nodes: u32) -> Vec<PlaneOutput> {
+        assert!(self.buffer.is_empty());
+        match &act {
+            Act::Step(input) => self.plane.step_into(input.clone(), &mut self.buffer).unwrap(),
+            Act::Cancel(at_ns, request) => {
+                self.plane.cancel_into(*at_ns, *request, &mut self.buffer).unwrap()
+            }
+            Act::Release(request) => self.plane.release(*request).unwrap(),
+            Act::Put(key, outcome) => _ = self.db.lock().unwrap().insert(*key, outcome.clone()),
+            Act::Drop(key) => _ = self.db.lock().unwrap().remove(key),
+        }
+        let outputs: Vec<PlaneOutput> = self.buffer.drain(..).collect();
+        let seen = Seen::of(&self.plane, self.requests, nodes);
+        self.acts.push((act, outputs.clone(), seen));
+        outputs
+    }
+}
+
+/// What one random run of many requests did.
+struct Simulated {
+    config: PlaneConfig,
+    outputs: Vec<PlaneOutput>,
+    steps: u64,
+    /// Each act, what the plane said to it, and what it said of itself after.
+    acts: Vec<(Act, Vec<PlaneOutput>, Seen)>,
+}
+
+/// Fisher-Yates, by the seeded generator.
+fn shuffle<T>(random: &mut SplitMix, items: &mut [T]) {
+    for at in (1..items.len()).rev() {
+        items.swap(at, random.below(at as u64 + 1) as usize);
+    }
+}
+
+/// One random run of many requests, checked after every step. With `release`, each request
+/// is released as it is opened.
+fn simulate(seed: u64, release: bool) -> Simulated {
     let mut random = SplitMix(seed);
     let budget = (!random.one_in(3)).then(|| 100 + random.below(900));
     let starve_after = random.below(5) as u32;
@@ -873,7 +968,7 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
         budget: budget.and_then(self::budget),
         starve_after,
     };
-    let (mut plane, db) = with_db(config);
+    let (plane, db) = with_db(config.clone());
     let keys = 1 + random.below(12) as u8;
     let memory = |random: &mut SplitMix| match budget {
         None => random.below(1000),
@@ -884,7 +979,7 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, db, ..Model::default() };
+    let mut model = Model { seed, budget, db: db.clone(), ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
@@ -894,31 +989,39 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
             batches: 1 + random.below(4) as u32,
         })
         .collect();
+    let mut driver =
+        Driver { plane, db, buffer: Vec::new(), requests: planned.len() as u32, acts: Vec::new() };
     let mut next_id = 0u32;
-    let mut new_nodes = |random: &mut SplitMix, model: &Model, request: u32, count: u64| {
-        let mut nodes: Vec<Spec> = Vec::new();
-        let mut known: Vec<u32> = model.nodes_of.get(&request).cloned().unwrap_or_default();
-        for _ in 0..count {
-            let mut deps: Vec<u32> = (0..random.below(4))
-                .filter(|_| !known.is_empty())
-                .map(|_| known[random.below(known.len() as u64) as usize])
-                .collect();
-            deps.sort_unstable();
-            deps.dedup();
-            let id = next_id;
-            next_id += 1;
-            let (key, memory, pool) = if random.one_in(2) {
-                let k = random.below(u64::from(keys)) as u8;
-                (Some(key(k)), by_key[usize::from(k)].0, by_key[usize::from(k)].1)
-            } else {
-                let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
-                (None, memory(random), pool)
-            };
-            nodes.push(node(id, &deps, pool, random.below(10), key, memory));
-            known.push(id);
-        }
-        nodes
-    };
+    // Each node after its deps, a third of the batches then shuffled: the plane puts them in
+    // order.
+    let new_nodes =
+        |random: &mut SplitMix, model: &Model, next_id: &mut u32, request: u32, count: u64| {
+            let mut nodes: Vec<Spec> = Vec::new();
+            let mut known: Vec<u32> = model.nodes_of.get(&request).cloned().unwrap_or_default();
+            for _ in 0..count {
+                let mut deps: Vec<u32> = (0..random.below(4))
+                    .filter(|_| !known.is_empty())
+                    .map(|_| known[random.below(known.len() as u64) as usize])
+                    .collect();
+                deps.sort_unstable();
+                deps.dedup();
+                let id = *next_id;
+                *next_id += 1;
+                let (key, memory, pool) = if random.one_in(2) {
+                    let k = random.below(u64::from(keys)) as u8;
+                    (Some(key(k)), by_key[usize::from(k)].0, by_key[usize::from(k)].1)
+                } else {
+                    let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
+                    (None, memory(random), pool)
+                };
+                nodes.push(node(id, &deps, pool, random.below(10), key, memory));
+                known.push(id);
+            }
+            if random.one_in(3) {
+                shuffle(random, &mut nodes);
+            }
+            nodes
+        };
     let mut at = 0u64;
     let mut steps = 0u64;
     loop {
@@ -931,7 +1034,7 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
         steps += 1;
         assert!(steps < 100_000, "seed {seed}: no end");
         at += random.below(3);
-        let holding = plane.holding();
+        let holding = driver.plane.holding();
         let roll = random.below(100);
         let live: Vec<u32> = (0..planned.len() as u32)
             .filter(|r| planned[*r as usize].opened && !model.finished.contains_key(r))
@@ -940,17 +1043,19 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
             let r = live[random.below(live.len() as u64) as usize];
             model.cancelled.insert(r);
             planned[r as usize].closed = true;
-            plane.cancel(at, RequestId(r)).unwrap()
+            driver.act(Act::Cancel(at, RequestId(r)), next_id)
         } else if roll < 8 && budget.is_some() {
             let budget = budget.unwrap_or(0);
             let bytes = if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
-            plane.step(PlaneInput::Held { at_ns: at, bytes }).unwrap()
+            driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
         } else if roll < 10 && !model.db.lock().unwrap().is_empty() {
-            let mut db = model.db.lock().unwrap();
-            let mut kept: Vec<Key> = db.keys().copied().collect();
-            kept.sort_unstable();
-            db.remove(&kept[random.below(kept.len() as u64) as usize]);
-            Vec::new()
+            let dropped = {
+                let db = model.db.lock().unwrap();
+                let mut kept: Vec<Key> = db.keys().copied().collect();
+                kept.sort_unstable();
+                kept[random.below(kept.len() as u64) as usize]
+            };
+            driver.act(Act::Drop(dropped), next_id)
         } else if roll < 45 || model.running.is_empty() {
             let unopened = planned.iter().position(|it| !it.opened);
             let unclosed: Vec<usize> =
@@ -961,31 +1066,29 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
                 let it = &mut planned[r];
                 it.opened = true;
                 let request = RequestId(r as u32);
-                let outputs = plane
-                    .step(PlaneInput::Open {
-                        at_ns: at,
-                        request,
-                        weight: it.weight,
-                        keep_going: it.keep_going,
-                    })
-                    .unwrap();
+                let open = PlaneInput::Open {
+                    at_ns: at,
+                    request,
+                    weight: it.weight,
+                    keep_going: it.keep_going,
+                };
+                let outputs = driver.act(Act::Step(open), next_id);
                 if release {
-                    plane.release(request).unwrap();
+                    assert!(driver.act(Act::Release(request), next_id).is_empty());
                 }
                 outputs
             } else if !unclosed.is_empty() {
                 let r = unclosed[random.below(unclosed.len() as u64) as usize];
+                let request = RequestId(r as u32);
                 if planned[r].batches > 0 {
                     planned[r].batches -= 1;
                     let count = 1 + random.below(8);
-                    let nodes = new_nodes(&mut random, &model, r as u32, count);
+                    let nodes = new_nodes(&mut random, &model, &mut next_id, r as u32, count);
                     model.register(r as u32, &nodes);
-                    plane
-                        .step(PlaneInput::Add { at_ns: at, request: RequestId(r as u32), nodes })
-                        .unwrap()
+                    driver.act(Act::Step(PlaneInput::Add { at_ns: at, request, nodes }), next_id)
                 } else {
                     planned[r].closed = true;
-                    plane.step(PlaneInput::Close { at_ns: at, request: RequestId(r as u32) }).unwrap()
+                    driver.act(Act::Step(PlaneInput::Close { at_ns: at, request }), next_id)
                 }
             } else {
                 assert!(
@@ -1004,13 +1107,15 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
             let r = model.request_of[&id];
             let added = if random.one_in(4) {
                 let count = 1 + random.below(3);
-                new_nodes(&mut random, &model, r, count)
+                new_nodes(&mut random, &model, &mut next_id, r, count)
             } else {
                 Vec::new()
             };
             model.register(r, &added);
             let keep_failure = random.one_in(2);
-            model.finish(id, &outcome, keep_failure);
+            if let Some((key, outcome)) = model.finish(id, &outcome, keep_failure) {
+                assert!(driver.act(Act::Put(key, outcome), next_id).is_empty());
+            }
             let group = (!random.one_in(3)).then(|| random.below(4) as u32);
             let input = PlaneInput::Done {
                 at_ns: at,
@@ -1020,9 +1125,9 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
                 group,
                 peak: random.below(1 << 20),
             };
-            plane.step(input).unwrap()
+            driver.act(Act::Step(input), next_id)
         };
-        model.take(&plane, outputs, holding);
+        model.take(&driver.plane, outputs, holding);
     }
     assert!(model.running.is_empty(), "seed {seed}");
     for (id, state) in &model.states {
@@ -1030,9 +1135,9 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
     }
     assert_eq!(model.states.len(), model.specs.len(), "seed {seed}");
     for id in model.specs.keys() {
-        assert_eq!(plane.state(NodeId(*id)).is_some(), !release, "seed {seed}: #{id}");
+        assert_eq!(driver.plane.state(NodeId(*id)).is_some(), !release, "seed {seed}: #{id}");
     }
-    (model.outputs, steps)
+    Simulated { config, outputs: std::mem::take(&mut model.outputs), steps, acts: driver.acts }
 }
 
 /// Random requests under many seeds, checked after every step: nothing runs before its deps;
@@ -1045,7 +1150,7 @@ fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
 fn random_requests_keep_the_rules() {
     let mut steps = 0;
     for seed in 0..600u64 {
-        steps += simulate(seed, false).1;
+        steps += simulate(seed, false).steps;
     }
     assert!(steps > 5_000, "{steps} steps");
 }
@@ -1053,9 +1158,9 @@ fn random_requests_keep_the_rules() {
 #[test]
 fn the_same_seed_gives_the_same_outputs() {
     for seed in 0..60u64 {
-        let (a, steps) = simulate(seed, false);
-        let (b, _) = simulate(seed, false);
-        assert_eq!(a, b, "seed {seed} after {steps} steps");
+        let a = simulate(seed, false);
+        let b = simulate(seed, false);
+        assert_eq!(a.outputs, b.outputs, "seed {seed} after {} steps", a.steps);
     }
 }
 
@@ -1064,8 +1169,229 @@ fn the_same_seed_gives_the_same_outputs() {
 #[test]
 fn releasing_requests_changes_no_output() {
     for seed in 0..300u64 {
-        let (kept, steps) = simulate(seed, false);
-        let (released, _) = simulate(seed, true);
-        assert_eq!(kept, released, "seed {seed} after {steps} steps");
+        let kept = simulate(seed, false);
+        let released = simulate(seed, true);
+        assert_eq!(kept.outputs, released.outputs, "seed {seed} after {} steps", kept.steps);
     }
+}
+
+/// Puts the reference through what `simulated` did to the plane, and checks that it says the
+/// same to each act and of itself after it.
+fn replay(seed: u64, simulated: &Simulated) {
+    let db = Db::default();
+    let memo = {
+        let db = db.clone();
+        move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
+    };
+    let mut model = reference::Plane::with_memo(simulated.config.clone(), Box::new(memo)).unwrap();
+    assert_eq!(model.config(), &simulated.config);
+    let requests = simulated.acts.first().map_or(0, |(_, _, seen)| seen.stats.len() as u32);
+    for (at, (act, said, seen)) in simulated.acts.iter().enumerate() {
+        let outputs = match act {
+            Act::Step(input) => model.step(input.clone()).unwrap(),
+            Act::Cancel(at_ns, request) => model.cancel(*at_ns, *request).unwrap(),
+            Act::Release(request) => {
+                model.release(*request).unwrap();
+                Vec::new()
+            }
+            Act::Put(key, outcome) => {
+                db.lock().unwrap().insert(*key, outcome.clone());
+                Vec::new()
+            }
+            Act::Drop(key) => {
+                db.lock().unwrap().remove(key);
+                Vec::new()
+            }
+        };
+        assert_eq!(&outputs, said, "seed {seed}: act {at}, {act:?}");
+        let theirs = Seen::of_reference(&model, requests, seen.states.len() as u32);
+        assert_eq!(&theirs, seen, "seed {seed}: act {at}, {act:?}");
+    }
+}
+
+/// The plane in columns says what the plane before them said, act by act over the random
+/// runs, kept or released: the same outputs, and after each act the same states, stats,
+/// counts, granted memory and held task. So the heaps keep the ready sets' order, the edge
+/// lists the dependents' order, the member lists the members' order, and a reused slot or
+/// buffer changes nothing.
+#[test]
+fn the_plane_says_what_the_reference_says() {
+    let mut acts = 0;
+    for seed in 0..300u64 {
+        for release in [false, true] {
+            let simulated = simulate(seed, release);
+            acts += simulated.acts.len();
+            replay(seed, &simulated);
+        }
+    }
+    assert!(acts > 10_000, "{acts} acts");
+}
+
+/// Batches given in any order, keyed or not, with deps on nodes before them or of the same
+/// batch, and some refused (an id added twice, a dep not added, a cycle, a node waiting for
+/// itself): the plane takes or refuses each as the reference does, with the same outputs, and
+/// one refused changes nothing.
+#[test]
+fn batches_in_any_order_and_refused_ones_match_the_reference() {
+    let batch = |random: &mut SplitMix, known: &[u32], next: &mut u32| {
+        let count = 1 + random.below(8) as u32;
+        let fresh: Vec<u32> = (*next..*next + count).collect();
+        *next += count;
+        let mut nodes = Vec::new();
+        for (at, &id) in fresh.iter().enumerate() {
+            let mut deps = Vec::new();
+            for _ in 0..random.below(4) {
+                let (roll, coin) = (random.below(40), random.one_in(2));
+                let dep = if roll == 0 {
+                    1_000_000
+                } else if roll <= 2 {
+                    fresh[random.below(u64::from(count)) as usize]
+                } else if !known.is_empty() && coin {
+                    known[random.below(known.len() as u64) as usize]
+                } else if at > 0 {
+                    fresh[random.below(at as u64) as usize]
+                } else {
+                    continue;
+                };
+                deps.push(dep);
+            }
+            let id = if !known.is_empty() && random.one_in(50) {
+                known[random.below(known.len() as u64) as usize]
+            } else {
+                id
+            };
+            let key = random.one_in(3).then(|| self::key(random.below(4) as u8));
+            let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
+            nodes.push(node(id, &deps, pool, random.below(10), key, 0));
+        }
+        shuffle(random, &mut nodes);
+        (nodes, fresh)
+    };
+    let mut refused = 0;
+    for seed in 0..400u64 {
+        let mut random = SplitMix(seed);
+        let config = PlaneConfig {
+            io: 1 + random.below(2) as usize,
+            work: 1 + random.below(3) as usize,
+            budget: None,
+            starve_after: 0,
+        };
+        let mut plane = Plane::new(config.clone()).unwrap();
+        let mut model = reference::Plane::new(config).unwrap();
+        let mut both = |plane: &mut Plane, model: &mut reference::Plane, input: PlaneInput| {
+            let got = plane.step(input.clone());
+            let want = model.step(input);
+            assert_eq!(got, want, "seed {seed}");
+            refused += usize::from(got.is_err());
+            got
+        };
+        let request = RequestId(0);
+        let keep_going = random.one_in(2);
+        both(&mut plane, &mut model, PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going })
+            .unwrap();
+        let (mut known, mut running, mut next, mut at) = (Vec::new(), Vec::new(), 0u32, 0u64);
+        for _ in 0..12 {
+            let (nodes, fresh) = batch(&mut random, &known, &mut next);
+            let add = PlaneInput::Add { at_ns: at, request, nodes };
+            if let Ok(out) = both(&mut plane, &mut model, add) {
+                known.extend(fresh);
+                running.extend(runs(&out));
+            }
+            for _ in 0..random.below(3) {
+                if running.is_empty() {
+                    break;
+                }
+                let id = running.swap_remove(random.below(running.len() as u64) as usize);
+                at += 1 + random.below(3);
+                let outcome = if random.one_in(8) {
+                    Outcome::Failed { why: "no".to_owned() }
+                } else {
+                    Outcome::Built
+                };
+                let (added, fresh) = if random.one_in(3) {
+                    batch(&mut random, &known, &mut next)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let input =
+                    PlaneInput::Done { at_ns: at, id: NodeId(id), outcome, added, group: None, peak: 0 };
+                match both(&mut plane, &mut model, input) {
+                    Ok(out) => {
+                        known.extend(fresh);
+                        running.extend(runs(&out));
+                    }
+                    Err(_) => running.push(id),
+                }
+            }
+        }
+        both(&mut plane, &mut model, PlaneInput::Close { at_ns: at, request }).unwrap();
+        while let Some(id) = running.pop() {
+            at += 1;
+            let out = both(&mut plane, &mut model, done(id, Outcome::Built, Vec::new())).unwrap();
+            running.extend(runs(&out));
+        }
+        for id in 0..next {
+            assert_eq!(plane.state(NodeId(id)), model.state(NodeId(id)), "seed {seed}: #{id}");
+        }
+        assert_eq!(plane.counts(), model.counts(), "seed {seed}");
+    }
+    assert!(refused > 100, "{refused} refused");
+}
+
+/// A long-lived plane reuses its rooms: requests opened, run and released one after another
+/// leave it holding no more slots than the largest of them needed, and say what a fresh plane
+/// says to each.
+#[test]
+fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
+    let mut long = Plane::new(config(2, 3)).unwrap();
+    let mut buffer = Vec::new();
+    for round in 0..50u32 {
+        let mut random = SplitMix(u64::from(round));
+        let count = 1 + random.below(40) as u32;
+        let nodes: Vec<Spec> = (0..count)
+            .map(|id| {
+                let deps: Vec<u32> = (0..id).filter(|_| random.one_in(4)).collect();
+                let key = random.one_in(2).then(|| key(random.below(6) as u8));
+                node(id, &deps, Pool::Work, random.below(10), key, 0)
+            })
+            .collect();
+        let mut fresh = Plane::new(config(2, 3)).unwrap();
+        let request = RequestId(round % 3);
+        let mut both = |input: PlaneInput, fresh: &mut Plane| {
+            let want = fresh.step(input.clone()).unwrap();
+            long.step_into(input, &mut buffer).unwrap();
+            let got: Vec<PlaneOutput> = buffer.drain(..).collect();
+            // A request's id and its nodes' ids are the same each round; only the plane's
+            // order of adding moves on, which no output says.
+            assert_eq!(got, want, "round {round}");
+            got
+        };
+        let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true };
+        both(open, &mut fresh);
+        let mut running = runs(&both(PlaneInput::Add { at_ns: 0, request, nodes }, &mut fresh));
+        both(PlaneInput::Close { at_ns: 0, request }, &mut fresh);
+        let mut at = 0;
+        let mut over = false;
+        while let Some(id) = running.pop() {
+            at += 1;
+            let input = PlaneInput::Done {
+                at_ns: at,
+                id: NodeId(id),
+                outcome: Outcome::Built,
+                added: Vec::new(),
+                group: None,
+                peak: 0,
+            };
+            let out = both(input, &mut fresh);
+            over |= !finished(&out).is_empty();
+            running.extend(runs(&out));
+        }
+        assert!(over, "round {round}");
+        long.release(request).unwrap();
+        assert_eq!(long.stats(request), None);
+    }
+    let (nodes, tasks, requests) = long.slots();
+    assert!(nodes <= 40, "{nodes} node slots");
+    assert!(tasks <= 40, "{tasks} task slots");
+    assert_eq!(requests, 1);
 }

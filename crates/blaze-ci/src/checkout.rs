@@ -79,39 +79,64 @@ impl Git {
         Ok(())
     }
 
+    /// Whether the clone has commit `commit` already, so fetching it would bring nothing: a
+    /// redelivered push, a tag on a commit a branch brought, a PR whose head was pushed as a
+    /// branch first. One local `rev-parse` instead of a token and a round trip to the remote.
+    pub fn has(&self, commit: &str) -> Result<bool, CheckoutError> {
+        argument("a commit", commit)?;
+        let object = format!("{commit}^{{commit}}");
+        let args = ["rev-parse", "--verify", "--quiet", object.as_str()];
+        let output = self
+            .git(&args)
+            .output()
+            .map_err(|error| CheckoutError::new(format!("git did not start: {error}"), Some(shown(&args))))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // `--quiet`: no such commit, said by the status alone.
+            Some(1) if output.stderr.trim_ascii().is_empty() => Ok(false),
+            _ => Err(CheckoutError::new(
+                format!("git failed ({}): {}", output.status, last_line(&output.stderr)),
+                Some(shown(&args)),
+            )),
+        }
+    }
+
     /// The ops that take the tree of commit `from` (`None`: the empty tree) to the tree of
-    /// `to`, sorted by path.
+    /// `to`, sorted by path. Git's listing is read in place: a file's path is copied once, into
+    /// its op, and its blob name not at all.
     pub fn ops(&self, from: Option<&str>, to: &str) -> Result<Vec<Op>, CheckoutError> {
         argument("a commit", to)?;
-        let changes = match from {
+        let listed = match from {
             Some(from) => {
                 argument("a commit", from)?;
                 let from = format!("{from}^{{commit}}");
                 let to = format!("{to}^{{commit}}");
                 let args =
                     ["diff-tree", "-r", "-z", "--no-renames", "--no-abbrev", from.as_str(), to.as_str()];
-                diff(&self.run(self.git(&args), &args)?.stdout)?
+                self.run(self.git(&args), &args)?.stdout
             }
             None => {
                 let to = format!("{to}^{{commit}}");
                 let args = ["ls-tree", "-r", "-z", "--full-tree", to.as_str()];
-                listing(&self.run(self.git(&args), &args)?.stdout)?
+                self.run(self.git(&args), &args)?.stdout
             }
         };
-        let blobs: Vec<&str> =
-            changes.iter().filter_map(|it| it.blob.as_ref().map(|(blob, _)| &**blob)).collect();
+        let changes = if from.is_some() { diff(&listed)? } else { listing(&listed)? };
+        let blobs: Vec<&str> = changes.iter().filter_map(|it| it.blob.map(|(blob, _)| blob)).collect();
         let mut contents = self.blobs(&blobs)?.into_iter();
         let mut ops: Vec<Op> = changes
             .into_iter()
             .map(|change| match change.blob {
                 Some((_, mode)) => Op::Write {
-                    path: change.path,
+                    path: change.path.to_owned(),
                     bytes: contents.next().expect("a blob for each written file"),
                     mode,
                 },
-                None => Op::Delete { path: change.path },
+                None => Op::Delete { path: change.path.to_owned() },
             })
             .collect();
+        // Git lists in tree order, which is path order: this only checks it (one pass over a
+        // sorted run).
         ops.sort_by(|a, b| path(a).cmp(path(b)));
         Ok(ops)
     }
@@ -202,21 +227,32 @@ impl Git {
     }
 }
 
-/// A file of the tree that changed: its new blob and mode, or `None` when it is gone.
-struct Change {
-    path: String,
-    blob: Option<(String, Mode)>,
+/// A file of the tree that changed, in git's output: its new blob and mode, or `None` when it
+/// is gone.
+struct Change<'a> {
+    path: &'a str,
+    blob: Option<(&'a str, Mode)>,
+}
+
+/// The `N` fields of `text` split at `separator`, none left over, with no allocation.
+fn fields<const N: usize>(text: &str, separator: char) -> Option<[&str; N]> {
+    let mut parts = text.split(separator);
+    let mut out = [""; N];
+    for slot in &mut out {
+        *slot = parts.next()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// `diff-tree -r -z` raw output: `:<mode> <mode> <sha> <sha> <status>\0<path>\0` each.
-fn diff(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
-    let mut fields = output.split(|it| *it == 0).filter(|it| !it.is_empty());
+fn diff(output: &[u8]) -> Result<Vec<Change<'_>>, CheckoutError> {
+    let mut fields_of = output.split(|it| *it == 0).filter(|it| !it.is_empty());
     let mut changes = Vec::new();
-    while let Some(header) = fields.next() {
+    while let Some(header) = fields_of.next() {
         let header = text(header)?;
-        let path = text(fields.next().ok_or_else(|| odd("diff-tree", header))?)?;
-        let parts: Vec<&str> = header.strip_prefix(':').unwrap_or_default().split(' ').collect();
-        let [old_mode, new_mode, old_blob, new_blob, status] = parts[..] else {
+        let path = text(fields_of.next().ok_or_else(|| odd("diff-tree", header))?)?;
+        let parts = fields::<5>(header.strip_prefix(':').unwrap_or_default(), ' ');
+        let Some([old_mode, new_mode, old_blob, new_blob, status]) = parts else {
             return Err(odd("diff-tree", header));
         };
         let blob = match status {
@@ -225,7 +261,7 @@ fn diff(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
                 if old_blob == new_blob && file_mode(old_mode, path).ok() == Some(mode) {
                     continue;
                 }
-                Some((new_blob.to_owned(), mode))
+                Some((new_blob, mode))
             }
             "D" => {
                 file_mode(old_mode, path)?;
@@ -233,22 +269,22 @@ fn diff(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
             }
             _ => return Err(odd("diff-tree", header)),
         };
-        changes.push(Change { path: path.to_owned(), blob });
+        changes.push(Change { path, blob });
     }
     Ok(changes)
 }
 
 /// `ls-tree -r -z` output: `<mode> <type> <sha>\t<path>\0` each.
-fn listing(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
+fn listing(output: &[u8]) -> Result<Vec<Change<'_>>, CheckoutError> {
     let mut changes = Vec::new();
     for entry in output.split(|it| *it == 0).filter(|it| !it.is_empty()) {
         let entry = text(entry)?;
         let (header, path) = entry.split_once('\t').ok_or_else(|| odd("ls-tree", entry))?;
-        let [mode, _, blob] = header.split(' ').collect::<Vec<_>>()[..] else {
+        let Some([mode, _, blob]) = fields::<3>(header, ' ') else {
             return Err(odd("ls-tree", entry));
         };
         let mode = file_mode(mode, path)?;
-        changes.push(Change { path: path.to_owned(), blob: Some((blob.to_owned(), mode)) });
+        changes.push(Change { path, blob: Some((blob, mode)) });
     }
     Ok(changes)
 }
@@ -275,9 +311,9 @@ fn batch(from: &mut impl BufRead, blobs: &[&str]) -> Result<Vec<Vec<u8>>, Checko
         from.read_line(&mut line)
             .map_err(|error| CheckoutError::new(format!("reading from git: {error}"), at()))?;
         let header = line.trim_end_matches('\n');
-        let size = match header.split(' ').collect::<Vec<_>>()[..] {
-            [sha, "blob", size] if sha == *blob => size.parse::<usize>().ok(),
-            [sha, "missing"] if sha == *blob => {
+        let size = match (fields::<3>(header, ' '), fields::<2>(header, ' ')) {
+            (Some([sha, "blob", size]), _) if sha == *blob => size.parse::<usize>().ok(),
+            (_, Some([sha, "missing"])) if sha == *blob => {
                 return Err(CheckoutError::new(format!("the clone has no blob {blob}"), at()));
             }
             _ => None,

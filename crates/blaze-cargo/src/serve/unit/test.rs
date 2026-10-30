@@ -120,7 +120,6 @@ pub(crate) fn start(
             return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
         };
         let unit = &units.graph.units[at];
-        let plan = &units.plans[at];
         let package = package_of(units, unit)?;
         let made = job.made.lock().unwrap_or_else(|it| it.into_inner()).get(&at).cloned().unwrap_or_default();
         let Some(context) = made.context else {
@@ -136,7 +135,17 @@ pub(crate) fn start(
             })
             .collect();
         let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
-        let env: Vec<(OsString, OsString)> = super::script::inherited(&config.invocation.env, plan);
+        if let Some(runner) = artifact.runner.first() {
+            return Err(ApiError::new(
+                format!(
+                    "the test binary `{program}` has the runner `{runner}` (`target.<triple>.runner`), and \
+                     blaze's test queue runs a test binary itself, not under a runner"
+                ),
+                None,
+            ));
+        }
+        let env: Vec<(OsString, OsString)> =
+            super::run::process_env(&config.invocation.env, artifact, std::env::consts::OS);
         let binary = Binary {
             id: artifact.content,
             name: program.clone(),

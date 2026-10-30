@@ -1,21 +1,19 @@
 //! Things related to tys in the next-trait-solver.
 
-use std::ops::ControlFlow;
+use std::{marker::PhantomData, num::NonZeroU32, ops::ControlFlow};
 
 use hir_def::{
     AdtId, HasModule, TypeParamId,
     hir::generics::{GenericParams, TypeOrConstParamData, TypeParamProvenance},
 };
 use hir_def::{TraitId, type_ref::Rawness};
-use intern::{Interned, InternedRef, impl_internable};
-use macros::GenericTypeVisitable;
 use rustc_abi::{ExternAbi, Float, Integer, Size};
 use rustc_ast_ir::{Mutability, try_visit, visit::VisitorResult};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ClosureKind, DebruijnIndex, FlagComputation, Flags, FloatTy,
     FloatVid, GenericTypeVisitable, InferTy, IntTy, IntVid, Interner, TyVid, TypeFoldable,
     TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, UintTy,
-    Upcast, WithCachedTypeInfo,
+    Upcast,
     inherent::{
         AdtDef as _, BoundExistentialPredicates, GenericArgs as _, IntoKind, ParamLike,
         Safety as _, SliceLike, Ty as _,
@@ -35,6 +33,8 @@ use crate::{
         abi::Safety,
         impl_foldable_for_interned_slice, impl_foldable_for_stored_type, impl_stored_interned,
         interned_slice,
+        interner::table,
+        persist,
         util::{CoroutineArgsExt, IntegerTypeExt},
     },
 };
@@ -51,53 +51,66 @@ pub type AliasTyKind<'db> = rustc_type_ir::AliasTyKind<DbInterner<'db>>;
 pub type AliasTermKind<'db> = rustc_type_ir::AliasTermKind<DbInterner<'db>>;
 pub type FnSigKind<'db> = rustc_type_ir::FnSigKind<DbInterner<'db>>;
 
+/// Every interned [`Ty`]. A `GenericArg` holds a row in 30 bits.
+static TYS: table::Rows = table::Rows::new("tys", table::LAST_ROW);
+
+/// A type: its row in [`TYS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Ty<'db> {
-    pub(super) interned: InternedRef<'db, TyInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[repr(align(4))] // Required for `GenericArg` bit-tagging.
-pub(super) struct TyInterned(WithCachedTypeInfo<TyKind<'static>>);
+const _: () = assert!(size_of::<Option<Ty<'static>>>() == 4);
 
-impl_internable!(gc; TyInterned);
-impl_stored_interned!(TyInterned, Ty, StoredTy);
+impl_stored_interned!(Ty, StoredTy);
 impl_foldable_for_stored_type!(StoredTy);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Ty<'static>>();
-};
 
 impl<'db> Ty<'db> {
     /// You should avoid using this if you can, since we want `Const` to be defined in `rustc_type_ir` and then this method
     /// will become more difficult to use.
     #[inline]
     pub fn new_without_interner(kind: TyKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<TyKind<'db>, TyKind<'static>>(kind) };
-        let flags = FlagComputation::for_kind(&kind);
-        let cached = WithCachedTypeInfo {
-            internee: kind,
-            flags: flags.flags,
-            outer_exclusive_binder: flags.outer_exclusive_binder,
-        };
-        Self { interned: Interned::new_gc(TyInterned(cached)) }
+        Self::intern(kind)
     }
 
     #[inline]
     pub fn new(_interner: DbInterner<'db>, kind: TyKind<'db>) -> Self {
-        Self::new_without_interner(kind)
+        Self::intern(kind)
+    }
+
+    pub(super) fn intern(kind: TyKind<'db>) -> Self {
+        let words = persist::encode(&kind);
+        Self::at(TYS.intern(&words, || {
+            let computed = FlagComputation::for_kind(&kind);
+            (computed.flags, computed.outer_exclusive_binder)
+        }))
+    }
+
+    /// This type's row: the same number for the same type, on every thread, for the life of
+    /// the process.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.index.get()
+    }
+
+    /// The type at `index`, which [`Self::index`] gave. Panics on any other number.
+    pub fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
+        match NonZeroU32::new(index) {
+            Some(index) if TYS.published(index) => Self::at(index),
+            _ => panic!("{index} is not the index of an interned type"),
+        }
     }
 
     #[inline]
-    pub fn inner(&self) -> &WithCachedTypeInfo<TyKind<'db>> {
-        let inner = &self.interned.0;
-        unsafe {
-            std::mem::transmute::<
-                &WithCachedTypeInfo<TyKind<'static>>,
-                &WithCachedTypeInfo<TyKind<'db>>,
-            >(inner)
-        }
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Ty { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
     }
 
     pub fn new_adt(interner: DbInterner<'db>, adt_id: AdtId, args: GenericArgs<'db>) -> Self {
@@ -891,7 +904,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for ReferencesOnlyTyError {
 
 impl<'db> std::fmt::Debug for Ty<'db> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner().internee.fmt(f)
+        self.kind().fmt(f)
     }
 }
 
@@ -900,13 +913,14 @@ impl<'db> IntoKind for Ty<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        self.inner().internee
+        // SAFETY: a `Ty` is a row of `TYS`.
+        persist::decode(unsafe { TYS.fields(self.index) })
     }
 }
 
 impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Ty<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(TYS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }
@@ -1099,12 +1113,16 @@ impl<'db> Relate<DbInterner<'db>> for Ty<'db> {
 }
 
 impl<'db> Flags for Ty<'db> {
+    #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        self.inner().flags
+        // SAFETY: a `Ty` is a row of `TYS`.
+        unsafe { TYS.flags(self.index) }
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        self.inner().outer_exclusive_binder
+        // SAFETY: as in `flags`.
+        unsafe { TYS.binder(self.index) }
     }
 }
 

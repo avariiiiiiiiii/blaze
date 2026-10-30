@@ -168,3 +168,17 @@ of the first one; it is the private `OFFSET`, 1000).
   map.vtable.tys().map(&mut *ty))`. The encoded bytes are unchanged.
 
 `VTableMap::id` now hashes a type once (entry API), not twice.
+
+## From safety (lane safety, 2026-10-29): `MirEvalError::MachineStop` (`crates/hir-ty/src/mir.rs`)
+
+What: a variant `MachineStop` of `MirEvalError` (no fields; `Debug`, `Hash`, `PartialEq` as the
+others, and its arm in the `Debug` impl and in every exhaustive `match` over the enum in your
+paths), with the doc "the evaluator's `Machine` (a checker of undefined behavior, `hir-ty-ub`)
+stopped the run; what it found the machine holds".
+Why: `hir-ty-mir`'s evaluator becomes generic over a `Machine` (docs/v2/plan/lanes/safety/notes.md;
+requested of codegen-mir in `v2/requests/codegen.md` "From safety" S1, since the evaluator is in
+`crates/hir-ty-mir/src/mir/eval.rs`, not in `hir-ty`). A hook that finds undefined behavior
+returns `Stop`, which the evaluator turns into this, inside its `InFunction` stack; the checker
+keeps the structured report, so the variant carries nothing (and `MirEvalError` keeps its
+`Hash` for the MIR queries' fingerprints). Const eval never produces it: its `Plain` machine
+never stops.

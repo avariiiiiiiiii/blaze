@@ -91,10 +91,13 @@ impl LexedStr<'_> {
     }
 
     /// NB: only valid to call with Output from Reparser/TopLevelEntry.
-    pub fn intersperse_trivia(
+    ///
+    /// The sink is generic, not `dyn`: it runs once per token and node, and inlined it is the
+    /// tree builder's push.
+    pub fn intersperse_trivia<F: FnMut(StrStep<'_>) + ?Sized>(
         &self,
         output: &crate::Output,
-        sink: &mut dyn FnMut(StrStep<'_>),
+        sink: &mut F,
     ) -> bool {
         self.intersperse_trivia_outline(output, &mut |step| match step {
             OutlineStrStep::Step(step) => sink(step),
@@ -107,10 +110,10 @@ impl LexedStr<'_> {
     /// As [`LexedStr::intersperse_trivia`], for the output of an outline
     /// ([`crate::TopEntryPoint::parse_outline`]) too: each node it left unparsed is one
     /// [`OutlineStrStep::Lazy`], with the trivia around it placed as a full parse places them.
-    pub fn intersperse_trivia_outline(
+    pub fn intersperse_trivia_outline<F: FnMut(OutlineStrStep<'_>) + ?Sized>(
         &self,
         output: &crate::Output,
-        sink: &mut dyn FnMut(OutlineStrStep<'_>),
+        sink: &mut F,
     ) -> bool {
         let mut builder =
             Builder { lexed: self, pos: 0, offset: 0, state: State::PendingEnter, sink };
@@ -146,13 +149,13 @@ impl LexedStr<'_> {
     }
 }
 
-struct Builder<'a, 'b> {
+struct Builder<'a, 'b, F: FnMut(OutlineStrStep<'_>) + ?Sized> {
     lexed: &'a LexedStr<'a>,
     pos: usize,
     /// Where token `pos` starts.
     offset: usize,
     state: State,
-    sink: &'b mut dyn FnMut(OutlineStrStep<'_>),
+    sink: &'b mut F,
 }
 
 enum State {
@@ -161,7 +164,7 @@ enum State {
     PendingExit,
 }
 
-impl<'a> Builder<'a, '_> {
+impl<'a, F: FnMut(OutlineStrStep<'_>) + ?Sized> Builder<'a, '_, F> {
     #[inline]
     fn step(&mut self, step: StrStep<'_>) {
         (self.sink)(OutlineStrStep::Step(step))

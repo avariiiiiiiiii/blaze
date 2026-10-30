@@ -10,6 +10,16 @@
 
 use std::ops::RangeInclusive;
 
+use cranelift_codegen::ir::{
+    Endianness, InstBuilder, MemFlagsData, Type, Value, condcodes::IntCC, types,
+};
+use hir_ty::mir::Operand;
+
+use super::{Arch, FunctionCx, MEM, Result};
+
+/// How a vector of another type is read as these bytes: as they are in memory.
+const LITTLE: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Little);
+
 /// An intrinsic as instructions on the registers [`asm::neon_function`](super::asm) loads.
 #[derive(Clone)]
 pub(super) struct Lowered {
@@ -799,6 +809,195 @@ pub(super) fn splats_c(name: &str, lane: Option<u32>) -> bool {
     Fused::parse(name, lane).is_some_and(Fused::splats_c)
 }
 
+/// An intrinsic of 16-byte vectors that is one Cranelift vector operation, or a few, which
+/// its AArch64 backend lowers to the NEON instruction LLVM selects for the intrinsic, or to a
+/// short sequence of NEON instructions where it has none: 2 bytes, a `match` per use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Vector {
+    /// `tbl`: a byte of the table per index, 0 past it (`swizzle`).
+    Table,
+    /// `tbx`: as `tbl`, the lane of the first operand past the table.
+    TableKeeping,
+    /// `umaxp` and the like: each lane two neighbours of `a` then of `b` combined, the even
+    /// and odd lanes apart (`uzp1`, `uzp2`) and then lane by lane.
+    Pairwise(Pair),
+    SaturatingAdd,
+    SaturatingSub,
+    /// `urhadd`: the rounded mean.
+    RoundedMean,
+    /// `sqrdmulh`.
+    DoublingHighRounded,
+    Abs,
+    /// `uaddlp` and `saddlp`: each lane the sum of two of the operand's, which are half as
+    /// wide, widened.
+    LongPairs,
+}
+
+const _: () = assert!(size_of::<Vector>() == 2);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Pair {
+    Max,
+    Min,
+}
+
+/// What `llvm.aarch64.neon.{name}` is of [`Vector`], the lanes of its result and whether its
+/// integers are signed. `None` for an intrinsic that is not, or not of 16-byte vectors.
+fn vector_op(name: &str) -> Option<(Vector, Type, bool)> {
+    let mut parts = name.split('.');
+    let op = parts.next()?;
+    let result = match parts.next()? {
+        "v16i8" => types::I8X16,
+        "v8i16" => types::I16X8,
+        "v4i32" => types::I32X4,
+        "v2i64" => types::I64X2,
+        _ => return None,
+    };
+    let operand = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let narrow = result.lane_bits() <= 32;
+    let signed = op.starts_with('s');
+    let vector = match op {
+        "tbl1" if result == types::I8X16 => Vector::Table,
+        "tbx1" if result == types::I8X16 => Vector::TableKeeping,
+        "umaxp" | "smaxp" if narrow => Vector::Pairwise(Pair::Max),
+        "uminp" | "sminp" if narrow => Vector::Pairwise(Pair::Min),
+        "sqadd" | "uqadd" => Vector::SaturatingAdd,
+        "sqsub" | "uqsub" => Vector::SaturatingSub,
+        "urhadd" if narrow => Vector::RoundedMean,
+        "sqrdmulh" if matches!(result, types::I16X8 | types::I32X4) => Vector::DoublingHighRounded,
+        "abs" => Vector::Abs,
+        "uaddlp" | "saddlp" => {
+            return match (result, operand) {
+                (types::I16X8, Some("v16i8")) | (types::I32X4, Some("v8i16")) => {
+                    Some((Vector::LongPairs, result, signed))
+                }
+                _ => None,
+            };
+        }
+        _ => return None,
+    };
+    if operand.is_some() {
+        return None;
+    }
+    Some((vector, result, signed))
+}
+
+/// The vector of 16 bytes of lanes half as wide as `ty`'s.
+fn halves(ty: Type) -> Option<Type> {
+    ty.lane_type().half_width()?.by(ty.lane_count() * 2)
+}
+
+/// The `shuffle` of `a` and `b` that is every even lane of the two together (`uzp1`), or
+/// every odd one (`uzp2`), of lanes of `lane` bytes.
+fn unzip(lane: u8, odd: bool) -> [u8; 16] {
+    std::array::from_fn(|at| {
+        let (index, byte) = (at as u8 / lane, at as u8 % lane);
+        (2 * index + u8::from(odd)) * lane + byte
+    })
+}
+
+impl<'db> FunctionCx<'_, 'db> {
+    /// `llvm.aarch64.neon.{name}` as Cranelift's vector instructions ([`Vector`]), in place
+    /// of a lane at a time or a call of the instruction's own function. False for one that
+    /// is not one of them.
+    pub(super) fn neon_vector(
+        &mut self,
+        name: &str,
+        args: &[Operand],
+        dst: Value,
+    ) -> Result<bool> {
+        if self.cg.target.arch != Arch::Aarch64 {
+            return Ok(false);
+        }
+        let Some((op, ty, signed)) = vector_op(name) else { return Ok(false) };
+        let arity = match op {
+            Vector::TableKeeping => 3,
+            Vector::Abs | Vector::LongPairs => 1,
+            _ => 2,
+        };
+        if args.len() != arity {
+            return Ok(false);
+        }
+        let operand = match op {
+            Vector::Table | Vector::TableKeeping => types::I8X16,
+            Vector::LongPairs => halves(ty).expect("lanes of 16 or 32 bits"),
+            _ => ty,
+        };
+        let mut values = [None; 3];
+        for (value, arg) in values.iter_mut().zip(args) {
+            let (addr, _) = self.operand(arg)?;
+            *value = Some(self.builder.ins().load(operand, MEM, addr, 0));
+        }
+        let [a, b, c] = values;
+        let a = a.expect("an operand");
+        let ins = self.builder.ins();
+        let value = match op {
+            Vector::Table => ins.swizzle(a, b.expect("indices")),
+            Vector::TableKeeping => {
+                let (table, indices) = (b.expect("a table"), c.expect("indices"));
+                let found = self.builder.ins().swizzle(table, indices);
+                let last = self.builder.ins().iconst(types::I8, 15);
+                let last = self.builder.ins().splat(types::I8X16, last);
+                let past = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, indices, last);
+                self.builder.ins().bitselect(past, a, found)
+            }
+            Vector::Pairwise(pair) => {
+                let b = b.expect("an operand");
+                let lane = ty.lane_type().bytes() as u8;
+                let (x, y) = (self.vbytes(a), self.vbytes(b));
+                let immediates = &mut self.builder.func.dfg.immediates;
+                let even = immediates.push(unzip(lane, false).to_vec().into());
+                let odd = immediates.push(unzip(lane, true).to_vec().into());
+                let even = self.builder.ins().shuffle(x, y, even);
+                let odd = self.builder.ins().shuffle(x, y, odd);
+                let (even, odd) = (self.vlanes(ty, even), self.vlanes(ty, odd));
+                let ins = self.builder.ins();
+                match (pair, signed) {
+                    (Pair::Max, true) => ins.smax(even, odd),
+                    (Pair::Max, false) => ins.umax(even, odd),
+                    (Pair::Min, true) => ins.smin(even, odd),
+                    (Pair::Min, false) => ins.umin(even, odd),
+                }
+            }
+            Vector::SaturatingAdd if signed => ins.sadd_sat(a, b.expect("an operand")),
+            Vector::SaturatingAdd => ins.uadd_sat(a, b.expect("an operand")),
+            Vector::SaturatingSub if signed => ins.ssub_sat(a, b.expect("an operand")),
+            Vector::SaturatingSub => ins.usub_sat(a, b.expect("an operand")),
+            Vector::RoundedMean => ins.avg_round(a, b.expect("an operand")),
+            Vector::DoublingHighRounded => ins.sqmul_round_sat(a, b.expect("an operand")),
+            Vector::Abs => ins.iabs(a),
+            Vector::LongPairs => {
+                let (low, high) = if signed {
+                    (self.builder.ins().swiden_low(a), self.builder.ins().swiden_high(a))
+                } else {
+                    (self.builder.ins().uwiden_low(a), self.builder.ins().uwiden_high(a))
+                };
+                self.builder.ins().iadd_pairwise(low, high)
+            }
+        };
+        self.builder.ins().store(MEM, value, dst, 0);
+        Ok(true)
+    }
+
+    /// `value` as a vector of bytes, as it is in memory.
+    fn vbytes(&mut self, value: Value) -> Value {
+        self.vlanes(types::I8X16, value)
+    }
+
+    /// `value` as a vector of `ty`, as it is in memory.
+    fn vlanes(&mut self, ty: Type, value: Value) -> Value {
+        if self.builder.func.dfg.value_type(value) == ty {
+            return value;
+        }
+        self.builder.ins().bitcast(ty, LITTLE, value)
+    }
+}
+
 /// `Lowered::text` for a list of names, for a test: each name and what it lowers to, or that
 /// it does not.
 #[cfg(test)]
@@ -1034,5 +1233,96 @@ aarch64.neon.facgt.i32.f16: facgt h0, h1, h2 [\"neon\", \"fp16\"]
         assert_eq!(lower("aarch64.crypto.xar").unwrap().features, ["neon", "sha3"]);
         assert!(lower("aarch64.neon.vcvtfxs2fp.v2f64.v2i32").is_none());
         assert!(lower("aarch64.neon.vsli.v4f32").is_none());
+    }
+
+    /// The names `core::arch` gives the intrinsics of [`Vector`] (`vqtbl1q_u8`, `vqtbx1q_u8`,
+    /// `vpmaxq_u8`, `vqaddq_s16`, `vrhaddq_u8`, `vqrdmulhq_s32`, `vabsq_s8`, `vpaddlq_u8`), and
+    /// that the 8-byte ones and those of other shapes are left to the instruction's function.
+    #[test]
+    fn vector_ops_by_name() {
+        use types::{I8X16, I16X8, I32X4, I64X2};
+        for (name, expected) in [
+            ("tbl1.v16i8", Some((Vector::Table, I8X16, false))),
+            ("tbx1.v16i8", Some((Vector::TableKeeping, I8X16, false))),
+            ("umaxp.v16i8", Some((Vector::Pairwise(Pair::Max), I8X16, false))),
+            ("sminp.v4i32", Some((Vector::Pairwise(Pair::Min), I32X4, true))),
+            ("sqadd.v8i16", Some((Vector::SaturatingAdd, I16X8, true))),
+            ("uqsub.v2i64", Some((Vector::SaturatingSub, I64X2, false))),
+            ("urhadd.v16i8", Some((Vector::RoundedMean, I8X16, false))),
+            ("sqrdmulh.v4i32", Some((Vector::DoublingHighRounded, I32X4, true))),
+            ("abs.v2i64", Some((Vector::Abs, I64X2, false))),
+            ("uaddlp.v8i16.v16i8", Some((Vector::LongPairs, I16X8, false))),
+            ("saddlp.v4i32.v8i16", Some((Vector::LongPairs, I32X4, true))),
+            ("tbl1.v8i8", None),
+            ("umaxp.v8i8", None),
+            ("umaxp.v2i64", None),
+            ("sqadd.i32", None),
+            ("sqrdmulh.v16i8", None),
+            ("uaddlp.v8i16.v8i16", None),
+            ("uaddlp.v2i64.v4i32", None),
+            ("sqadd.v8i16.v8i16", None),
+            ("umaxv.i8.v16i8", None),
+        ] {
+            assert_eq!(vector_op(name), expected, "{name}");
+        }
+    }
+
+    /// `unzip` makes exactly the masks Cranelift's AArch64 backend lowers to `uzp1` and `uzp2`.
+    #[test]
+    fn unzip_is_uzp() {
+        let masks: [(u8, u128, u128); 3] = [
+            (
+                1,
+                0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200,
+                0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301,
+            ),
+            (
+                2,
+                0x1d1c_1918_1514_1110_0d0c_0908_0504_0100,
+                0x1f1e_1b1a_1716_1312_0f0e_0b0a_0706_0302,
+            ),
+            (4, 0x1b1a1918_13121110_0b0a0908_03020100, 0x1f1e1d1c_17161514_0f0e0d0c_07060504),
+        ];
+        for (lane, even, odd) in masks {
+            assert_eq!(u128::from_le_bytes(unzip(lane, false)), even, "{lane}");
+            assert_eq!(u128::from_le_bytes(unzip(lane, true)), odd, "{lane}");
+        }
+    }
+
+    /// On a model of the vectors over seeded bytes, combining the even lanes of `a` and `b`
+    /// with their odd ones lane by lane is NEON's pairwise operation: lane `i` of the first
+    /// half is lanes `2i` and `2i + 1` of `a`, of the second half those of `b`.
+    #[test]
+    fn unzipped_lanes_are_pairwise() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        for _ in 0..500 {
+            let a: [u8; 16] = std::array::from_fn(|_| next());
+            let b: [u8; 16] = std::array::from_fn(|_| next());
+            let both: Vec<u8> = a.iter().chain(&b).copied().collect();
+            for lane in [1u8, 2, 4] {
+                let l = lane as usize;
+                let read = |bytes: &[u8], i: usize| {
+                    let mut word = [0u8; 4];
+                    word[..l].copy_from_slice(&bytes[i * l..][..l]);
+                    u32::from_le_bytes(word)
+                };
+                let gather = |mask: [u8; 16]| -> Vec<u8> {
+                    mask.iter().map(|&at| both[at as usize]).collect()
+                };
+                let (even, odd) = (gather(unzip(lane, false)), gather(unzip(lane, true)));
+                let count = 16 / l;
+                for i in 0..count {
+                    let (from, pair) = if i < count / 2 { (&a, i) } else { (&b, i - count / 2) };
+                    let neon = read(from, 2 * pair).max(read(from, 2 * pair + 1));
+                    assert_eq!(read(&even, i).max(read(&odd, i)), neon, "lanes of {lane}");
+                }
+            }
+        }
     }
 }

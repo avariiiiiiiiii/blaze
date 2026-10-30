@@ -363,6 +363,36 @@ fn a_reach_keeps_no_build_for_why() {
 }
 
 #[test]
+fn why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over() {
+    let mut world = World::new();
+    let root = world.commit(&[("src/lib.rs", "")]);
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    let built = world.db.open(View { root });
+    let replies =
+        world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some(built), out));
+    assert_eq!(replies, [done(1, 1, true)]);
+    assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(root, built)]);
+
+    world.request(1, 2, Request::Check { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    let failed = world.db.open(View { root });
+    let error = Some(ApiError::new("no".to_owned(), None));
+    world.call(|session, cx, out| session.finish_in(cx, job, false, error, Some(failed), out));
+    assert_eq!(
+        world.session.kept.iter().copied().collect::<Vec<_>>(),
+        [(root, built)],
+        "a job that could not run keeps nothing: its handed view is closed"
+    );
+}
+
+#[test]
+fn stop_is_answered_done_at_once() {
+    let mut world = World::new();
+    assert_eq!(world.request(1, 1, Request::Stop), [done(1, 1, true)]);
+}
+
+#[test]
 fn status_lists_every_connections_requests_sorted() {
     let mut world = World::new();
     world.request(2, 8, Request::Check { view: head("main"), targets: targets() });

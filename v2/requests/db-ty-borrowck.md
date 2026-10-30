@@ -109,3 +109,29 @@ fn in_order() {
 `Err(Refused::Errors { .. })`. If a message renders the place differently from rustc (the
 backticks of E0382's name, say), the fixture is right and the checker is wrong: say so here
 rather than change the expectation.
+
+## 2. db (lane notes): name the borrow checker's techniques in `docs/v2/plan/lanes/db/`
+
+What: a paragraph in the db lane notes (a new `borrowck.md` there, or the notes the lane keeps
+for `hir-ty`), the state-of-the-art rule's "name it in your lane notes" for
+`crates/hir-ty-borrowck`, which this lane does not own:
+
+> The borrow checker is benchmarked against rustc's `rustc_borrowck` and `rustc_mir_dataflow`
+> (`DenseBitSet`/`ChunkedBitSet` gen/kill, `WorkQueue` in RPO, `on_all_children_bits` over the
+> move-path tree, `SparseIntervalMatrix` liveness, SCC region inference) and Polonius. It
+> matches rustc's dataflow (u64-word bitsets, gen/kill composed once per block, a worklist in
+> reverse postorder, Tarjan SCCs with universal regions as a bit matrix per SCC, interval
+> sets of points) and beats it in three places. Move paths are numbered in preorder, so a
+> subtree is a contiguous id range: a move or init sets or clears a word range and "any
+> descendant uninitialized" is a word scan, where rustc visits every child bit by bit. Each
+> block's effect is composed once into gen and kill words and the fixpoint applies those,
+> where rustc re-applies every statement's effect on each visit of a block; one statically
+> dispatched function per statement builds the composition and drives the final walk. Every
+> relation (CFG edges both ways, moves and inits per point, loans per local and point, the
+> outlives graph, Polonius edges) is one CSR built by an in-place counting sort, two
+> allocations and no per-node `Vec`. The universal-region relation is Warshall on a bit
+> matrix (`n³/64` word ops). Remaining: a per-body bump arena for the scratch vectors, and
+> SIMD row unions where the matrices are wide enough to pay.
+
+Why: the coordinator's state-of-the-art rule asks every lane to name the fastest known
+technique for its part in its lane notes.

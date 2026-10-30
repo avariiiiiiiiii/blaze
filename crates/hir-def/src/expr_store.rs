@@ -34,6 +34,7 @@ use crate::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsm, Label, LabelId, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField,
         RecordSpread, Statement,
+        columns::{Frozen, Growing, HirColumns},
     },
     nameres::{DefMap, block_def_map},
     signatures::VariantFields,
@@ -124,8 +125,8 @@ struct ExprRoot {
 // don't store any expressions and this saves memory. Same thing for the source map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpressionOnlyStore {
-    exprs: Arena<Expr>,
-    pats: Arena<Pat>,
+    /// The expressions and patterns.
+    columns: HirColumns<Frozen>,
     bindings: Arena<Binding>,
     labels: Arena<Label>,
     /// The closure/coroutine/anon const that owns each binding, by binding: [`NO_OWNER`] for a
@@ -428,8 +429,7 @@ impl ExpressionStoreDiagnostics {
 /// The body of an item (function, const etc.).
 #[derive(Debug, Eq, PartialEq, Default)]
 pub struct ExpressionStoreBuilder {
-    pub exprs: Arena<Expr>,
-    pub pats: Arena<Pat>,
+    pub(crate) columns: HirColumns<Growing>,
     pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
     pub lifetimes: Arena<LifetimeRef>,
@@ -536,12 +536,52 @@ pub enum ExpressionStoreDiagnostics {
 }
 
 impl ExpressionStoreBuilder {
+    #[inline]
+    pub(crate) fn alloc_expr(&mut self, expr: Expr<'_>) -> ExprId {
+        self.columns.push_expr(expr)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_pat(&mut self, pat: Pat<'_>) -> PatId {
+        self.columns.push_pat(pat)
+    }
+
+    #[inline]
+    pub(crate) fn expr(&self, id: ExprId) -> Expr<'_> {
+        self.columns.expr(id)
+    }
+
+    #[inline]
+    pub(crate) fn pat(&self, id: PatId) -> Pat<'_> {
+        self.columns.pat(id)
+    }
+
+    /// Replaces an expression: read it with [`Self::expr`], build the changed view, set it.
+    #[inline]
+    pub(crate) fn set_expr(&mut self, id: ExprId, expr: Expr<'_>) {
+        self.columns.set_expr(id, expr)
+    }
+
+    #[inline]
+    pub(crate) fn set_pat(&mut self, id: PatId, pat: Pat<'_>) {
+        self.columns.set_pat(id, pat)
+    }
+
+    #[inline]
+    pub(crate) fn expr_count(&self) -> usize {
+        self.columns.expr_count()
+    }
+
+    #[inline]
+    pub(crate) fn pat_count(&self) -> usize {
+        self.columns.pat_count()
+    }
+
     pub fn finish(self) -> (ExpressionStore, ExpressionStoreSourceMap) {
         let Self {
             block_scopes,
-            mut exprs,
+            columns,
             mut labels,
-            mut pats,
             mut bindings,
             binding_owners,
             ident_hygiene,
@@ -569,9 +609,7 @@ impl ExpressionStoreBuilder {
             mut expansions,
             diagnostics,
         } = self;
-        exprs.shrink_to_fit();
         labels.shrink_to_fit();
-        pats.shrink_to_fit();
         bindings.shrink_to_fit();
         types.shrink_to_fit();
         lifetimes.shrink_to_fit();
@@ -600,8 +638,7 @@ impl ExpressionStoreBuilder {
         });
         expansions.shrink_to_fit();
 
-        let has_exprs =
-            !exprs.is_empty() || !labels.is_empty() || !pats.is_empty() || !bindings.is_empty();
+        let has_exprs = !columns.is_empty() || !labels.is_empty() || !bindings.is_empty();
 
         let store = {
             let expr_only = if has_exprs {
@@ -626,8 +663,7 @@ impl ExpressionStoreBuilder {
                 let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
                 overflow_inheriting.sort_unstable();
                 Some(Box::new(ExpressionOnlyStore {
-                    exprs,
-                    pats,
+                    columns: columns.freeze(),
                     bindings,
                     labels,
                     binding_owners,
@@ -825,8 +861,8 @@ impl ExpressionStore {
 
     pub fn walk_bindings_in_pat(&self, pat_id: PatId, mut f: impl FnMut(BindingId)) {
         self.walk_pats(pat_id, &mut |pat| {
-            if let Pat::Bind { id, .. } = &self[pat] {
-                f(*id);
+            if let Pat::Bind { id, .. } = self.pat(pat) {
+                f(id);
             }
         });
     }
@@ -834,32 +870,31 @@ impl ExpressionStore {
     pub fn visit_pat_children(&self, pat_id: PatId, mut visitor: impl StoreVisitor) {
         // Do not use `..` patterns or field accesses here, only destructuring, to ensure we cover all cases
         // (we've had multiple bugs with this in the past).
-        let pat = &self[pat_id];
-        match pat {
+        match self.pat(pat_id) {
             Pat::Range { start, end, range_type: _ } => {
-                visitor.on_expr_opt(*start);
-                visitor.on_expr_opt(*end);
+                visitor.on_expr_opt(start);
+                visitor.on_expr_opt(end);
             }
-            Pat::Lit(expr) | Pat::Expr(expr) => visitor.on_expr(*expr),
+            Pat::Lit(expr) | Pat::Expr(expr) => visitor.on_expr(expr),
             Pat::Path(path) => visitor.on_path(path),
             Pat::Wild | Pat::Missing | Pat::Rest | Pat::NotNull => {}
-            &Pat::Bind { subpat, id: _ } => visitor.on_pat_opt(subpat),
+            Pat::Bind { subpat, id: _ } => visitor.on_pat_opt(subpat),
             Pat::Or(args) | Pat::Tuple { args, ellipsis: _ } => visitor.on_pats(args),
             Pat::TupleStruct { args, ellipsis: _, path } => {
                 visitor.on_pats(args);
                 visitor.on_path(path);
             }
-            Pat::Ref { pat, mutability: _ } => visitor.on_pat(*pat),
+            Pat::Ref { pat, mutability: _ } => visitor.on_pat(pat),
             Pat::Slice { prefix, slice, suffix } => {
                 visitor.on_pats(prefix);
-                visitor.on_pat_opt(*slice);
+                visitor.on_pat_opt(slice);
                 visitor.on_pats(suffix);
             }
             Pat::Record { args, ellipsis: _, path } => {
                 args.iter().for_each(|RecordFieldPat { pat, name: _ }| visitor.on_pat(*pat));
                 visitor.on_path(path);
             }
-            Pat::Box { inner } | Pat::Deref { inner } => visitor.on_pat(*inner),
+            Pat::Box { inner } | Pat::Deref { inner } => visitor.on_pat(inner),
         }
     }
 
@@ -896,7 +931,7 @@ impl ExpressionStore {
     fn visit_expr_children_here(&self, expr_id: ExprId, mut visitor: impl StoreVisitor) {
         // Do not use `..` patterns or field accesses here, only destructuring, to ensure we cover all cases
         // (we've had multiple bugs with this in the past).
-        match &self[expr_id] {
+        match self.expr(expr_id) {
             Expr::OffsetOf(OffsetOf { container, fields: _ }) => visitor.on_type(*container),
             Expr::Path(path) => visitor.on_path(path),
             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
@@ -915,13 +950,13 @@ impl ExpressionStore {
                 })
             }
             Expr::If { condition, then_branch, else_branch } => {
-                visitor.on_expr(*condition);
-                visitor.on_expr(*then_branch);
-                visitor.on_expr_opt(*else_branch);
+                visitor.on_expr(condition);
+                visitor.on_expr(then_branch);
+                visitor.on_expr_opt(else_branch);
             }
             Expr::Let { expr, pat } => {
-                visitor.on_pat(*pat);
-                visitor.on_expr(*expr);
+                visitor.on_pat(pat);
+                visitor.on_expr(expr);
             }
             Expr::Block { statements, tail, id: _, label: _, unsafe_: _ } => {
                 for stmt in statements {
@@ -938,20 +973,20 @@ impl ExpressionStore {
                         Statement::Item(_) => (),
                     }
                 }
-                visitor.on_expr_opt(*tail);
+                visitor.on_expr_opt(tail);
             }
-            Expr::Loop { body, label: _, source: _ } => visitor.on_expr(*body),
+            Expr::Loop { body, label: _, source: _ } => visitor.on_expr(body),
             Expr::Call { callee, args } => {
-                visitor.on_expr(*callee);
+                visitor.on_expr(callee);
                 visitor.on_exprs(args);
             }
             Expr::MethodCall { receiver, args, generic_args, method_name: _ } => {
-                visitor.on_expr(*receiver);
+                visitor.on_expr(receiver);
                 visitor.on_exprs(args);
-                visitor.on_generic_args_opt(generic_args);
+                visitor.on_generic_args_opt(&generic_args);
             }
             Expr::Match { expr, arms } => {
-                visitor.on_expr(*expr);
+                visitor.on_expr(expr);
                 arms.iter().for_each(|MatchArm { pat, guard, expr }| {
                     visitor.on_expr(*expr);
                     visitor.on_expr_opt(*guard);
@@ -961,50 +996,50 @@ impl ExpressionStore {
             Expr::Break { expr, label: _ }
             | Expr::Return { expr }
             | Expr::Yield { expr }
-            | Expr::Yeet { expr } => visitor.on_expr_opt(*expr),
-            Expr::Become { expr } => visitor.on_expr(*expr),
+            | Expr::Yeet { expr } => visitor.on_expr_opt(expr),
+            Expr::Become { expr } => visitor.on_expr(expr),
             Expr::RecordLit { fields, spread, path } => {
                 for RecordLitField { name: _, expr } in fields.iter() {
                     visitor.on_expr(*expr);
                 }
                 match spread {
-                    RecordSpread::Expr(expr) => visitor.on_expr(*expr),
+                    RecordSpread::Expr(expr) => visitor.on_expr(expr),
                     RecordSpread::None | RecordSpread::FieldDefaults => {}
                 }
                 visitor.on_path(path);
             }
             Expr::Closure { body, args, arg_types, ret_type, capture_by: _, closure_kind: _ } => {
-                visitor.on_expr(*body);
+                visitor.on_expr(body);
                 visitor.on_pats(args);
                 arg_types.iter().for_each(|arg_type| visitor.on_type_opt(*arg_type));
-                visitor.on_type_opt(*ret_type);
+                visitor.on_type_opt(ret_type);
             }
             Expr::BinaryOp { lhs, rhs, op: _ } => {
-                visitor.on_expr(*lhs);
-                visitor.on_expr(*rhs);
+                visitor.on_expr(lhs);
+                visitor.on_expr(rhs);
             }
             Expr::Index { base, index } => {
-                visitor.on_expr(*base);
-                visitor.on_expr(*index);
+                visitor.on_expr(base);
+                visitor.on_expr(index);
             }
             Expr::Cast { expr, type_ref } => {
-                visitor.on_expr(*expr);
-                visitor.on_type(*type_ref);
+                visitor.on_expr(expr);
+                visitor.on_type(type_ref);
             }
             Expr::Field { expr, name: _ }
             | Expr::Await { expr }
             | Expr::Ref { expr, mutability: _, rawness: _ }
-            | Expr::UnaryOp { expr, op: _ } => visitor.on_expr(*expr),
-            Expr::Const(expr) => visitor.on_anon_const_expr(*expr),
+            | Expr::UnaryOp { expr, op: _ } => visitor.on_expr(expr),
+            Expr::Const(expr) => visitor.on_anon_const_expr(expr),
             Expr::Tuple { exprs } => visitor.on_exprs(exprs),
             Expr::Array(a) => match a {
                 Array::ElementList { elements } => visitor.on_exprs(elements),
                 Array::Repeat { initializer, repeat } => {
-                    visitor.on_expr(*initializer);
-                    visitor.on_anon_const_expr(*repeat)
+                    visitor.on_expr(initializer);
+                    visitor.on_anon_const_expr(repeat)
                 }
             },
-            &Expr::Assignment { target, value } => {
+            Expr::Assignment { target, value } => {
                 visitor.on_pat(target);
                 visitor.on_expr(value);
             }
@@ -1150,20 +1185,26 @@ impl ExpressionStore {
         }
     }
 
+    /// The expression `id`, decoded from the store's columns.
     #[inline]
-    pub fn exprs(&self) -> impl Iterator<Item = (ExprId, &Expr)> {
-        match &self.expr_only {
-            Some(it) => it.exprs.iter(),
-            None => const { &Arena::new() }.iter(),
-        }
+    pub fn expr(&self, id: ExprId) -> Expr<'_> {
+        self.assert_expr_only().columns.expr(id)
+    }
+
+    /// The pattern `id`, decoded from the store's columns.
+    #[inline]
+    pub fn pat(&self, id: PatId) -> Pat<'_> {
+        self.assert_expr_only().columns.pat(id)
     }
 
     #[inline]
-    pub fn pats(&self) -> impl Iterator<Item = (PatId, &Pat)> {
-        match &self.expr_only {
-            Some(it) => it.pats.iter(),
-            None => const { &Arena::new() }.iter(),
-        }
+    pub fn exprs(&self) -> impl Iterator<Item = (ExprId, Expr<'_>)> {
+        self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.exprs())
+    }
+
+    #[inline]
+    pub fn pats(&self) -> impl Iterator<Item = (PatId, Pat<'_>)> {
+        self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.pats())
     }
 
     #[inline]
@@ -1318,24 +1359,6 @@ pub trait StoreVisitorExt: StoreVisitor {
     }
 }
 impl<V: StoreVisitor> StoreVisitorExt for V {}
-
-impl Index<ExprId> for ExpressionStore {
-    type Output = Expr;
-
-    #[inline]
-    fn index(&self, expr: ExprId) -> &Expr {
-        &self.assert_expr_only().exprs[expr]
-    }
-}
-
-impl Index<PatId> for ExpressionStore {
-    type Output = Pat;
-
-    #[inline]
-    fn index(&self, pat: PatId) -> &Pat {
-        &self.assert_expr_only().pats[pat]
-    }
-}
 
 impl Index<LabelId> for ExpressionStore {
     type Output = Label;

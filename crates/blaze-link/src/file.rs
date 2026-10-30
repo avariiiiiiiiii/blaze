@@ -67,7 +67,8 @@ impl<'a> Stage<'a> {
         let mut parts = self.parts()?;
         let synthetic = {
             let contents: Vec<&[u8]> = self.new.spaces.iter().map(|it| self.contents(it)).collect();
-            let placed = parts.placed(&self, &contents);
+            let symbol = |name: &str| self.address_of(&parts.regions, name);
+            let placed = parts.placed(&self, &contents, &symbol);
             self.writer.synthesize(&placed)?
         };
         for (class, bytes) in synthetic {
@@ -92,7 +93,8 @@ impl<'a> Stage<'a> {
         parts.regions = self.new.regions();
         let (offsets, file) = {
             let contents: Vec<&[u8]> = self.new.spaces.iter().map(|it| self.contents(it)).collect();
-            let placed = parts.placed(&self, &contents);
+            let symbol = |name: &str| self.address_of(&parts.regions, name);
+            let placed = parts.placed(&self, &contents, &symbol);
             let offsets: Vec<Option<u64>> =
                 self.new.spaces.iter().map(|it| self.writer.offset(&placed, &it.region)).collect();
             (offsets, self.writer.file(&placed)?)

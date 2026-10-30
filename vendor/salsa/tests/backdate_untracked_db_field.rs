@@ -15,7 +15,7 @@ trait Db: salsa::Database {
 }
 
 #[salsa::db]
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct ExtraFieldDatabase {
     storage: salsa::Storage<Self>,
     extra: u32,

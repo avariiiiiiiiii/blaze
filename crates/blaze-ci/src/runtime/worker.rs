@@ -211,13 +211,16 @@ fn checkout(
     let ops = if same {
         Vec::new()
     } else {
-        let token = shared
-            .github
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .token()
-            .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
-        {
+        let had = git.has(commit).map_err(|error| {
+            format!("asking {} whether it has {commit} failed: {error}", git.dir.display())
+        })?;
+        if !had {
+            let token = shared
+                .github
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .token()
+                .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
             let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner);
             git.fetch(fetch, Some(&token)).map_err(|error| {
                 format!("fetching {} into {} failed: {error}", fetch.join(" "), git.dir.display())
@@ -228,6 +231,7 @@ fn checkout(
             format!("diffing {from} to {commit} in {} failed: {error}", git.dir.display())
         })?
     };
+    let mut cut = batches(ops, MOST_BATCH)?;
     let socket = shared.socket.display();
     let mut client = Client::unix(&shared.socket)
         .map_err(|error| format!("could not reach the daemon at {socket} to check out {commit}: {error}"))?;
@@ -236,7 +240,7 @@ fn checkout(
         None => open(&mut client, &shared.socket, ViewRef::Head(EMPTY_HEAD.to_owned()))
             .map_err(|why| format!("opening the empty tree ({EMPTY_HEAD}) failed: {why}"))?,
     };
-    let root = apply(&mut client, &shared.socket, base, &ops).map_err(|why| match from {
+    let root = apply(&mut client, &shared.socket, base, &mut cut, head.is_some()).map_err(|why| match from {
         Some(from) => format!("applying the diff from {} to root {:x} failed: {why}", from.commit, from.root),
         None => format!("writing the tree of {commit} failed: {why}"),
     })?;
@@ -244,7 +248,7 @@ fn checkout(
     let root = pin(shared, ViewRef::Root(View { root }))
         .map_err(|why| format!("holding the tree of {commit} (root {root:x}) open failed: {why}"))?;
     if let Some(head) = head
-        && let Err(why) = commit_head(&mut client, &shared.socket, head, commit, base, &ops, root)
+        && let Err(why) = commit_head(&mut client, &shared.socket, head, commit, base, cut, root)
     {
         unpin(shared, root);
         return Err(why);
@@ -257,21 +261,26 @@ fn open(client: &mut Client, socket: &std::path::Path, view: ViewRef) -> Result<
     pins::open(client, view).map_err(|error| format!("the daemon at {}: {error}", socket.display()))?
 }
 
-/// `ops` applied to `base` as what-ifs, a batch at a time, each result held on `client` until
-/// it ends.
-fn apply(client: &mut Client, socket: &std::path::Path, base: ContentId, ops: &[Op]) -> Result<ContentId, String> {
+/// `batches` applied to `base` as what-ifs, one at a time, each result held on `client` until it
+/// ends. Each batch is moved into its request, or copied when `keep` (the same ops go on to be
+/// committed), one batch at a time so a copy never holds more than one request's bytes.
+fn apply(
+    client: &mut Client,
+    socket: &std::path::Path,
+    base: ContentId,
+    batches: &mut [Vec<Op>],
+    keep: bool,
+) -> Result<ContentId, String> {
     let mut at = base;
-    for batch in batches(ops, MOST_BATCH)? {
-        if batch.is_empty() {
-            continue;
-        }
-        let view = ViewRef::WhatIf { base: Box::new(ViewRef::Root(View { root: at })), ops: batch };
+    for batch in batches.iter_mut().filter(|it| !it.is_empty()) {
+        let ops = if keep { batch.clone() } else { std::mem::take(batch) };
+        let view = ViewRef::WhatIf { base: Box::new(ViewRef::Root(View { root: at })), ops };
         at = open(client, socket, view)?;
     }
     Ok(at)
 }
 
-/// Commits `ops` to `head` from `base`, a batch at a time, and checks the head reached `root`:
+/// Commits `batches` to `head` from `base`, one at a time, and checks the head reached `root`:
 /// one that was not at `base` is rebased to a tree that is not the commit's, an error.
 fn commit_head(
     client: &mut Client,
@@ -279,12 +288,12 @@ fn commit_head(
     head: &str,
     commit: &str,
     base: ContentId,
-    ops: &[Op],
+    batches: Vec<Vec<Op>>,
     root: ContentId,
 ) -> Result<(), String> {
     let socket = socket.display();
     let mut at = base;
-    for batch in batches(ops, MOST_BATCH)? {
+    for batch in batches {
         let mut committed = None;
         let mut said = Vec::new();
         let ok = client

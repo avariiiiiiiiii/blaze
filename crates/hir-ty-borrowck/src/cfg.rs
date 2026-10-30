@@ -2,9 +2,12 @@
 //! ones of `FalseEdge` and `FalseUnwind` included, and a number for each location.
 
 use la_arena::RawIdx;
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 use hir_ty_mir::mir::{BasicBlockId, MirBody, TerminatorKind};
+
+use super::relation::Csr;
 
 /// A statement of a block, or its terminator when `statement` is the number of statements.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -13,12 +16,14 @@ pub(super) struct Location {
     pub(super) statement: usize,
 }
 
+/// The graph as two CSRs over block indices: 4 bytes per block and 4 per edge each way, a
+/// block's successors or predecessors one slice.
 pub(super) struct Cfg {
     /// The number of the first location of each block, by its index.
     starts: Vec<usize>,
     pub(super) points: usize,
-    pub(super) successors: Vec<SmallVec<[BasicBlockId; 2]>>,
-    pub(super) predecessors: Vec<SmallVec<[BasicBlockId; 4]>>,
+    successors: Csr<BasicBlockId>,
+    predecessors: Csr<BasicBlockId>,
     /// The blocks reachable from the start, in reverse postorder.
     pub(super) order: Vec<BasicBlockId>,
     pub(super) reachable: Vec<bool>,
@@ -51,27 +56,49 @@ impl Cfg {
         let count = body.basic_blocks.len();
         let mut starts = Vec::with_capacity(count);
         let mut points = 0;
-        let mut successors = vec![SmallVec::new(); count];
-        let mut predecessors = vec![SmallVec::new(); count];
+        let mut edges: Vec<(u32, BasicBlockId)> = Vec::with_capacity(count * 2);
         for (id, data) in body.basic_blocks.iter() {
             starts.push(points);
             points += data.statements.len() + 1;
             if let Some(terminator) = &data.terminator {
+                let first = edges.len();
                 for target in self::successors(&terminator.kind) {
-                    if !successors[index(id)].contains(&target) {
-                        successors[index(id)].push(target);
-                        predecessors[index(target)].push(id);
+                    if !edges[first..].iter().any(|&(_, it)| it == target) {
+                        edges.push((index(id) as u32, target));
                     }
                 }
             }
         }
+        // The edges to cleanup blocks, each once, after the block's own; those are in block
+        // order, so a block's are found by two binary searches.
+        let own = edges.len();
+        let mut unwinds: FxHashSet<(u32, BasicBlockId)> = FxHashSet::default();
         for &(from, _, cleanup) in &body.panic_unwinds {
-            if !successors[index(from)].contains(&cleanup) {
-                successors[index(from)].push(cleanup);
-                predecessors[index(cleanup)].push(from);
+            let edge = (index(from) as u32, cleanup);
+            let low = edges[..own].partition_point(|&(it, _)| it < edge.0);
+            let high = edges[..own].partition_point(|&(it, _)| it <= edge.0);
+            if !edges[low..high].contains(&edge) && unwinds.insert(edge) {
+                edges.push(edge);
             }
         }
-        let (order, reachable) = reverse_postorder(&successors, body.start_block);
+        Self::of_edges(starts, points, &edges, body.start_block)
+    }
+
+    /// The graph from its edges, each once, in the order a block's successors and a block's
+    /// predecessors are listed.
+    fn of_edges(
+        starts: Vec<usize>,
+        points: usize,
+        edges: &[(u32, BasicBlockId)],
+        start: BasicBlockId,
+    ) -> Self {
+        let count = starts.len();
+        let successors = Csr::build(count, edges.iter().copied());
+        let predecessors = Csr::build(
+            count,
+            edges.iter().map(|&(from, to)| (index(to) as u32, block(from as usize))),
+        );
+        let (order, reachable) = reverse_postorder(&successors, start);
         Cfg { starts, points, successors, predecessors, order, reachable }
     }
 
@@ -79,23 +106,27 @@ impl Cfg {
     /// tests of the analyses over it.
     #[cfg(test)]
     pub(super) fn from_edges(lens: &[usize], edges: &[(usize, usize)]) -> Self {
-        let count = lens.len();
-        let mut starts = Vec::with_capacity(count);
+        let mut starts = Vec::with_capacity(lens.len());
         let mut points = 0;
         for &len in lens {
             starts.push(points);
             points += len;
         }
-        let mut successors = vec![SmallVec::new(); count];
-        let mut predecessors = vec![SmallVec::new(); count];
+        let mut unique: Vec<(u32, BasicBlockId)> = Vec::new();
         for &(from, to) in edges {
-            if !successors[from].contains(&block(to)) {
-                successors[from].push(block(to));
-                predecessors[to].push(block(from));
+            if !unique.contains(&(from as u32, block(to))) {
+                unique.push((from as u32, block(to)));
             }
         }
-        let (order, reachable) = reverse_postorder(&successors, block(0));
-        Cfg { starts, points, successors, predecessors, order, reachable }
+        Self::of_edges(starts, points, &unique, block(0))
+    }
+
+    pub(super) fn successors(&self, block: BasicBlockId) -> &[BasicBlockId] {
+        self.successors.of(index(block))
+    }
+
+    pub(super) fn predecessors(&self, block: BasicBlockId) -> &[BasicBlockId] {
+        self.predecessors.of(index(block))
     }
 
     pub(super) fn point(&self, location: Location) -> usize {
@@ -129,7 +160,7 @@ impl Cfg {
         if location.statement > 0 {
             return smallvec::smallvec![Location { statement: location.statement - 1, ..location }];
         }
-        self.predecessors[index(location.block)]
+        self.predecessors(location.block)
             .iter()
             .filter(|it| self.is_reachable(**it))
             .map(|&block| Location { block, statement: body.basic_blocks[block].statements.len() })
@@ -141,17 +172,17 @@ impl Cfg {
 /// takes each block's successors from the last, so its reverse postorder, the order errors are
 /// found in, has a loop's exit before its body.
 fn reverse_postorder(
-    successors: &[SmallVec<[BasicBlockId; 2]>],
+    successors: &Csr<BasicBlockId>,
     start: BasicBlockId,
 ) -> (Vec<BasicBlockId>, Vec<bool>) {
-    let count = successors.len();
+    let count = successors.nodes();
     let mut reachable = vec![false; count];
     let mut postorder = Vec::with_capacity(count);
     let mut stack = vec![(start, 0usize)];
     reachable[index(start)] = true;
     while let Some((block, next)) = stack.last_mut() {
         let block = *block;
-        let all = &successors[index(block)];
+        let all = successors.of(index(block));
         if let Some(&target) = all.len().checked_sub(*next + 1).map(|it| &all[it]) {
             *next += 1;
             if !reachable[index(target)] {
@@ -183,14 +214,19 @@ const NONE: usize = usize::MAX;
 impl Dominators {
     pub(super) fn new(cfg: &Cfg) -> Self {
         let start = cfg.order.first().map(|&it| index(it));
-        Self::of_graph(cfg.reachable.len(), start, &cfg.successors, &cfg.predecessors)
+        Self::of_graph(
+            cfg.reachable.len(),
+            start,
+            |it| cfg.successors.of(it),
+            |it| cfg.predecessors.of(it),
+        )
     }
 
-    fn of_graph<S: AsRef<[BasicBlockId]>, P: AsRef<[BasicBlockId]>>(
+    fn of_graph<'g>(
         count: usize,
         start: Option<usize>,
-        successors: &[S],
-        predecessors: &[P],
+        successors: impl Fn(usize) -> &'g [BasicBlockId],
+        predecessors: impl Fn(usize) -> &'g [BasicBlockId],
     ) -> Self {
         let mut enter = vec![NONE; count];
         let mut exit = vec![NONE; count];
@@ -207,7 +243,7 @@ impl Dominators {
             pre[block] = vertex.len();
             vertex.push(block);
             parent.push(from);
-            for &next in successors[block].as_ref().iter().rev() {
+            for &next in successors(block).iter().rev() {
                 if pre[index(next)] == NONE {
                     stack.push((index(next), pre[block]));
                 }
@@ -219,7 +255,7 @@ impl Dominators {
         let mut ancestor = vec![NONE; n];
         let mut path = Vec::new();
         for w in (1..n).rev() {
-            for &pred in predecessors[vertex[w]].as_ref() {
+            for &pred in predecessors(vertex[w]) {
                 let v = pre[index(pred)];
                 if v == NONE {
                     continue;
@@ -254,10 +290,7 @@ impl Dominators {
             }
             idom[w] = x;
         }
-        let mut children = vec![Vec::new(); n];
-        for w in 1..n {
-            children[idom[w]].push(w);
-        }
+        let children = Csr::build(n, (1..n).map(|w| (idom[w] as u32, w as u32)));
         let mut time = 0;
         let mut stack = vec![(0, false)];
         while let Some((w, done)) = stack.pop() {
@@ -269,7 +302,7 @@ impl Dominators {
             enter[vertex[w]] = time;
             time += 1;
             stack.push((w, true));
-            stack.extend(children[w].iter().map(|&it| (it, false)));
+            stack.extend(children.of(w).iter().map(|&it| (it as usize, false)));
         }
         Dominators { enter, exit }
     }
@@ -368,7 +401,12 @@ mod tests {
                     }
                 }
             }
-            let fast = Dominators::of_graph(count, Some(0), &succs, &preds);
+            let fast = Dominators::of_graph(
+                count,
+                Some(0),
+                |it| succs[it].as_slice(),
+                |it| preds[it].as_slice(),
+            );
             let want = naive(count, &preds, &reachable);
             for a in 0..count {
                 for b in 0..count {

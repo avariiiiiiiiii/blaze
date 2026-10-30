@@ -8,24 +8,28 @@
 //! table.
 //!
 //! Cost, per link (full or incremental: the core asks again after every patch): `.reloc` is one
-//! pass over `Placed::rebase` (sorted by the core; sorted here only if it isn't), writing 2 bytes
-//! per address into one buffer sized up front, with a region cursor rather than a search per
-//! address; `.pdata` is one pass over `Placed::functions` merged with the objects' entries, 12
-//! bytes each. The two run in parallel. The import and export tables are linear in imports and
-//! exports, plus a sort of each, and nothing in them allocates per entry. `file` doesn't rebuild
-//! any table: it reads each directory's size from the bytes `synthesize` produced, which the
-//! core put in the regions and sized them to, so it costs the number of regions plus GOT cells.
+//! pass over `Placed::rebase` (sorted by the core; sorted here only if it isn't), 2 bytes per
+//! address, with a region cursor rather than a search per address, cut at page boundaries into
+//! pieces of 64Ki addresses written in parallel; `.pdata` is one pass over `Placed::functions`
+//! merged with the objects' entries, 12 bytes each. The two run in parallel with each other.
+//! The import and export tables are linear in imports and exports, plus a sort of each; each
+//! import's name is parsed once and borrowed, and nothing in them allocates per entry. `file`
+//! doesn't rebuild any table: it reads each directory's size from the bytes `synthesize`
+//! produced, which the core put in the regions and sized them to, so it costs the number of
+//! regions plus GOT cells.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use object::pe;
+use rayon::prelude::*;
 
 use super::coff::ImportName;
 use super::{
     DEBUG, EDATA, IDATA, OBJ_PDATA, PAGE, PDATA, Pe, RELOC, RSRC, Segment, TLS_DIR, TLS_INDEX, error, place,
     zeroed,
 };
-use crate::model::{Class, Counts, Export, File, Holds, Placed, Prot, Region, SymbolKind};
+use crate::model::{Class, Counts, Export, File, Function, Holds, Placed, Prot, Region, SymbolKind};
 use crate::{LinkError, OutputKind};
 
 /// Room for the image's file name, which the export directory and the CodeView entry hold
@@ -105,7 +109,38 @@ fn rva_of(placed: &Placed<'_>, addr: u64) -> Option<u32> {
 }
 
 fn rva(placed: &Placed<'_>, addr: u64, what: &str) -> Result<u32, LinkError> {
-    rva_of(placed, addr).ok_or_else(|| error(format!("{what} at {addr:#x} is outside the image")))
+    Image::of(placed).rva(addr, what)
+}
+
+/// What the tables made on other threads read of the placed image: `Placed` itself is not
+/// `Sync` (its `symbol` is a `dyn Fn`).
+#[derive(Clone, Copy)]
+pub(super) struct Image<'a> {
+    base: u64,
+    regions: &'a [Region],
+    contents: &'a [&'a [u8]],
+    rebase: &'a [u64],
+    functions: &'a [Function],
+}
+
+impl<'a> Image<'a> {
+    pub(super) fn of(placed: &Placed<'a>) -> Image<'a> {
+        Image {
+            base: placed.plan.base,
+            regions: placed.regions,
+            contents: placed.contents,
+            rebase: placed.rebase,
+            functions: placed.functions,
+        }
+    }
+
+    fn rva_of(self, addr: u64) -> Option<u32> {
+        addr.checked_sub(self.base).and_then(|it| u32::try_from(it).ok())
+    }
+
+    fn rva(self, addr: u64, what: &str) -> Result<u32, LinkError> {
+        self.rva_of(addr).ok_or_else(|| error(format!("{what} at {addr:#x} is outside the image")))
+    }
 }
 
 /// The time stamp of the headers and directories: from the image's ID, so the same image is
@@ -239,7 +274,8 @@ impl Tables {
             tables.push(placed, TLS_INDEX, vec![0; 8])?;
         }
 
-        let (pdata, relocations) = rayon::join(|| pdata(placed), || relocations(placed, &extra));
+        let image = Image::of(placed);
+        let (pdata, relocations) = rayon::join(|| pdata(image), || relocations(image, &extra, RELOC_PIECE));
         match placed.region(&Class::Synthetic(PDATA)) {
             Some(_) => tables.push(placed, PDATA, pdata?)?,
             None if placed.functions.iter().any(|it| it.windows.is_some()) => {
@@ -296,16 +332,23 @@ fn tls_directory(placed: &Placed<'_>) -> Result<TlsDirectory, LinkError> {
             let directory = bytes_at(placed, addr, TLS_DIRECTORY, "the CRT's TLS directory `_tls_used`")?;
             let start = u64_of(directory, 0);
             let end = u64_of(directory, 8);
-            let zero_fill = u64::from(u32_of(directory, 32));
-            if let Some(tls) = placed.tls
-                && (tls.addr != start || tls.addr + tls.size > end + zero_fill)
+            // The CRT's range runs from `_tls_start` (`.tls`, first) to `_tls_end` (`.tls$ZZZ`,
+            // whose own byte is past it); every other thread-local ranks between the two. The
+            // template's growth room and that byte are past `end`.
+            let placed_end = placed
+                .regions
+                .iter()
+                .filter(|it| matches!(it.class, Class::Tdata | Class::Tbss))
+                .map(|it| it.addr + it.size)
+                .max();
+            if let (Some(tls), Some(placed_end)) = (placed.tls, placed_end)
+                && (tls.addr != start || end < start || end > placed_end)
             {
                 return Err(error(format!(
-                    "the thread-local template {:#x}..{:#x} is not the range {start:#x}..{:#x} \
-                     the CRT's `_tls_used` states (between `_tls_start` and `_tls_end`)",
-                    tls.addr,
-                    tls.addr + tls.size,
-                    end + zero_fill
+                    "the thread-locals placed at {:#x}..{placed_end:#x} don't hold the range \
+                     {start:#x}..{end:#x} the CRT's `_tls_used` states (between `_tls_start` and \
+                     `_tls_end`)",
+                    tls.addr
                 )));
             }
             Ok(TlsDirectory::Crt(addr))
@@ -353,9 +396,15 @@ pub(super) fn alignment(align: u64) -> Result<u32, String> {
     Ok((align.trailing_zeros() + 1) << 20)
 }
 
-/// The GOT's import cells, `(library, cell, import)`, sorted by library then cell: each DLL's
-/// IAT.
-fn iat(placed: &Placed<'_>) -> Result<Vec<(u32, u64, u32)>, LinkError> {
+/// An import cell, `(library, cell, import)`: 16 bytes per import, sorted once.
+type Cell = (u32, u64, u32);
+const _: () = assert!(size_of::<Cell>() == 16);
+/// A `RUNTIME_FUNCTION`, `(begin, end, info)` RVAs: 12 bytes per function, as in the file.
+type Entry = (u32, u32, u32);
+const _: () = assert!(size_of::<Entry>() == RUNTIME_FUNCTION);
+
+/// The GOT's import cells sorted by library then cell: each DLL's IAT.
+fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
     let mut cells = Vec::with_capacity(placed.imports.len());
     for cell in placed.got {
         let Holds::Import(import) = cell.holds else { continue };
@@ -381,8 +430,21 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     }
     let mut taken: Vec<u64> = placed.got.iter().map(|it| it.addr).collect();
     taken.sort_unstable();
-    let groups: Vec<&[(u32, u64, u32)]> = cells.chunk_by(|a, b| a.0 == b.0).collect();
+    // Each DLL's run of `cells` (and of `names`, which is parallel to it).
+    let mut groups: Vec<Range<usize>> = Vec::with_capacity(placed.libraries.len());
+    for group in cells.chunk_by(|a, b| a.0 == b.0) {
+        let start = groups.last().map_or(0, |it| it.end);
+        groups.push(start..start + group.len());
+    }
+    let names = cells
+        .iter()
+        .map(|&(_, _, import)| {
+            let it = &placed.imports[import as usize];
+            ImportName::parse(&it.name, it.version.as_deref()).map_err(error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for group in &groups {
+        let group = &cells[group.clone()];
         let dll = &placed.libraries[group[0].0 as usize].name;
         for pair in group.windows(2) {
             if pair[1].1 != pair[0].1 + 8 {
@@ -408,27 +470,22 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     let mut lookup_at = descriptors;
     // The hint/name entries and DLL names are written after the lookup tables, so their
     // offsets are computed first: the names' bytes are known from the imports.
-    let mut hint_at = hint_start;
+    let hint_names: u64 = names
+        .iter()
+        .map(|it| match it {
+            ImportName::Name { name, .. } => (2 + name.len() as u64 + 1).next_multiple_of(2),
+            ImportName::Ordinal(_) => 0,
+        })
+        .sum();
+    let mut name_at = hint_start + hint_names;
     for group in &groups {
-        hint_at += group
-            .iter()
-            .map(|&(_, _, import)| {
-                let it = &placed.imports[import as usize];
-                match ImportName::parse(&it.name, it.version.as_deref()) {
-                    Ok(ImportName::Name { name, .. }) => (2 + name.len() as u64 + 1).next_multiple_of(2),
-                    Ok(ImportName::Ordinal(_)) | Err(_) => 0,
-                }
-            })
-            .sum::<u64>();
-    }
-    let mut name_at = hint_at;
-    for group in &groups {
-        let dll = &placed.libraries[group[0].0 as usize].name;
+        let first = cells[group.start];
+        let dll = &placed.libraries[first.0 as usize].name;
         out.u32(rva(placed, base + lookup_at, "an import lookup table")?);
         out.u32(0);
         out.u32(0);
         out.u32(rva(placed, base + name_at, "a DLL name")?);
-        out.u32(rva(placed, group[0].1, "an import address table")?);
+        out.u32(rva(placed, first.1, "an import address table")?);
         lookup_at += (group.len() as u64 + 1) * 8;
         name_at += dll.len() as u64 + 1;
     }
@@ -436,9 +493,8 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     out.align(8);
     let mut hint_at = hint_start;
     for group in &groups {
-        for &(_, _, import) in *group {
-            let it = &placed.imports[import as usize];
-            match ImportName::parse(&it.name, it.version.as_deref()).map_err(error)? {
+        for name in &names[group.clone()] {
+            match *name {
                 ImportName::Ordinal(ordinal) => out.u64(pe::IMAGE_ORDINAL_FLAG64 | u64::from(ordinal)),
                 ImportName::Name { name, .. } => {
                     out.u64(u64::from(rva(placed, base + hint_at, "a hint/name entry")?));
@@ -448,18 +504,15 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
         }
         out.u64(0);
     }
-    for group in &groups {
-        for &(_, _, import) in *group {
-            let it = &placed.imports[import as usize];
-            if let ImportName::Name { hint, name } = ImportName::parse(&it.name, it.version.as_deref()).map_err(error)? {
-                out.u16(hint);
-                out.string(name);
-                out.align(2);
-            }
+    for name in &names {
+        if let ImportName::Name { hint, name } = *name {
+            out.u16(hint);
+            out.string(name);
+            out.align(2);
         }
     }
     for group in &groups {
-        out.string(&placed.libraries[group[0].0 as usize].name);
+        out.string(&placed.libraries[cells[group.start].0 as usize].name);
     }
     Ok(out.0)
 }
@@ -559,12 +612,12 @@ fn debug(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
 /// `RUNTIME_FUNCTION`s: one per function codegen gave Windows unwind info (in address order, as
 /// the core gives them), merged with the native objects' `.pdata` entries (those of dropped
 /// functions read 0), sorted by start; an overlap is an error.
-fn pdata(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
-    let mut ours = Vec::with_capacity(placed.functions.len());
-    for function in placed.functions {
+fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
+    let mut ours: Vec<Entry> = Vec::with_capacity(image.functions.len());
+    for function in image.functions {
         let Some(windows) = function.windows else { continue };
         let entry = (|| {
-            Some((rva_of(placed, function.addr)?, rva_of(placed, function.addr + function.size)?, rva_of(placed, windows.info)?))
+            Some((image.rva_of(function.addr)?, image.rva_of(function.addr + function.size)?, image.rva_of(windows.info)?))
         })();
         ours.push(entry.ok_or_else(|| {
             let name = function.name.as_deref().unwrap_or("a function");
@@ -574,12 +627,12 @@ fn pdata(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     if !ours.is_sorted() {
         ours.sort_unstable();
     }
-    let mut native = Vec::new();
-    for (index, region) in placed.regions.iter().enumerate() {
+    let mut native: Vec<Entry> = Vec::new();
+    for (index, region) in image.regions.iter().enumerate() {
         if !matches!(&region.class, Class::Named { name, .. } if name == OBJ_PDATA) {
             continue;
         }
-        let bytes = placed.bytes(index);
+        let bytes = image.contents[index];
         if !bytes.len().is_multiple_of(RUNTIME_FUNCTION) {
             return Err(error(format!(
                 "the objects' .pdata at {:#x} is {} bytes, not whole RUNTIME_FUNCTIONs",
@@ -600,7 +653,7 @@ fn pdata(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     }
     let mut out = Vec::with_capacity((ours.len() + native.len()) * RUNTIME_FUNCTION);
     let (mut a, mut b) = (ours.iter().peekable(), native.iter().peekable());
-    let mut last: Option<(u32, u32, u32)> = None;
+    let mut last: Option<Entry> = None;
     loop {
         let entry = match (a.peek(), b.peek()) {
             (Some(x), Some(y)) if y < x => b.next(),
@@ -623,22 +676,85 @@ fn pdata(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     Ok(out)
 }
 
+/// Rebased addresses per piece of `.reloc` written on one thread: below this a thread costs
+/// more than the 2 bytes per address it would write.
+const RELOC_PIECE: usize = 1 << 16;
+
+fn page_of(addr: u64) -> u64 {
+    addr & !(PAGE - 1)
+}
+
 /// The base relocations: a block per 4 KiB page, a `DIR64` entry per rebased address in it,
-/// padded to 4 bytes. One pass over the rebased addresses merged with `extra`, with a cursor
-/// over the regions checking each lies in a region with bytes in the file.
-fn relocations(placed: &Placed<'_>, extra: &[u64]) -> Result<Vec<u8>, LinkError> {
-    let rebase: Cow<'_, [u64]> = if placed.rebase.is_sorted() {
-        Cow::Borrowed(placed.rebase)
+/// padded to 4 bytes. The sorted addresses are cut at page boundaries into pieces of about
+/// `piece` addresses, each written on its own thread and joined in order: a block never spans
+/// two pieces, so the bytes are the same whatever the number of threads or the piece size.
+pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Result<Vec<u8>, LinkError> {
+    let rebase: Cow<'_, [u64]> = if image.rebase.is_sorted() {
+        Cow::Borrowed(image.rebase)
     } else {
-        let mut sorted = placed.rebase.to_vec();
+        let mut sorted = image.rebase.to_vec();
         sorted.sort_unstable();
         Cow::Owned(sorted)
     };
     let mut extra = extra.to_vec();
     extra.sort_unstable();
-    let regions = placed.regions;
-    let pages = regions.iter().map(|it| it.capacity.max(it.size).div_ceil(PAGE) + 1).sum::<u64>() as usize;
-    let mut out = Vec::with_capacity((rebase.len() + extra.len()) * 2 + pages.min(rebase.len() + extra.len()) * 12);
+    let piece = piece.max(1);
+    // The first address of each piece but the first: the first of a page.
+    let mut cuts = Vec::with_capacity(rebase.len() / piece + 1);
+    let mut at = piece;
+    while at < rebase.len() {
+        let page = page_of(rebase[at]);
+        let mut cut = rebase.partition_point(|it| page_of(*it) < page);
+        if cut <= cuts.last().copied().unwrap_or(0) {
+            cut = rebase.partition_point(|it| page_of(*it) <= page);
+        }
+        if cut >= rebase.len() {
+            break;
+        }
+        cuts.push(cut);
+        at = cut + piece;
+    }
+    if cuts.is_empty() {
+        let mut out = Vec::new();
+        blocks(image, &rebase, &extra, &mut out)?;
+        return Ok(out);
+    }
+    // Each piece's addresses and the extra ones in its pages.
+    let mut pieces = Vec::with_capacity(cuts.len() + 1);
+    let (mut from, mut extra_from) = (0, 0);
+    for &cut in &cuts {
+        let page = page_of(rebase[cut]);
+        let extra_to = extra.partition_point(|it| page_of(*it) < page);
+        pieces.push((&rebase[from..cut], &extra[extra_from..extra_to]));
+        (from, extra_from) = (cut, extra_to);
+    }
+    pieces.push((&rebase[from..], &extra[extra_from..]));
+    let written: Vec<Result<Vec<u8>, LinkError>> = pieces
+        .par_iter()
+        .map(|&(rebase, extra)| {
+            let mut out = Vec::new();
+            blocks(image, rebase, extra, &mut out).map(|()| out)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(written.iter().map(|it| it.as_ref().map_or(0, Vec::len)).sum());
+    for piece in written {
+        out.extend_from_slice(&piece?);
+    }
+    Ok(out)
+}
+
+/// The blocks of sorted rebased addresses merged with sorted `extra`, appended to `out`: one
+/// pass, with a cursor over the regions checking each lies in a region with bytes in the file.
+fn blocks(image: Image<'_>, rebase: &[u64], extra: &[u64], out: &mut Vec<u8>) -> Result<(), LinkError> {
+    let regions = image.regions;
+    let count = rebase.len() + extra.len();
+    let lowest = rebase.first().into_iter().chain(extra.first()).min();
+    let highest = rebase.last().into_iter().chain(extra.last()).max();
+    let (Some(&lowest), Some(&highest)) = (lowest, highest) else {
+        return Ok(());
+    };
+    let pages = ((highest - lowest) / PAGE + 1) as usize;
+    out.reserve(count * 2 + pages.min(count) * 12);
     let (mut i, mut j) = (0, 0);
     let mut region = 0;
     let mut last = None;
@@ -673,21 +789,21 @@ fn relocations(placed: &Placed<'_>, extra: &[u64]) -> Result<Vec<u8>, LinkError>
             Some(it) if it.addr <= addr => {}
             _ => return Err(error(format!("a rebased address at {addr:#x} in no region"))),
         }
-        let page = addr & !(PAGE - 1);
+        let page = page_of(addr);
         if block.map(|it| it.0) != Some(page) {
             if let Some((_, start)) = block {
-                close(&mut out, start);
+                close(out, start);
             }
             block = Some((page, out.len()));
-            out.extend_from_slice(&rva(placed, page, "a rebased page")?.to_le_bytes());
+            out.extend_from_slice(&image.rva(page, "a rebased page")?.to_le_bytes());
             out.extend_from_slice(&[0; 4]);
         }
         out.extend_from_slice(&((pe::IMAGE_REL_BASED_DIR64 << 12) | (addr & (PAGE - 1)) as u16).to_le_bytes());
     }
     if let Some((_, start)) = block {
-        close(&mut out, start);
+        close(out, start);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Ends the block at `start`: a pad entry to 4 bytes, and its size.
@@ -719,8 +835,15 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
             .position(|it| it.iter().all(|byte| *byte == 0))
             .ok_or_else(|| error("the import directory has no null descriptor: its bytes are not in place".into()))?;
         directories[pe::IMAGE_DIRECTORY_ENTRY_IMPORT] = (at, (count as u32 + 1) * DESCRIPTOR as u32);
-        let cells = placed.got.iter().filter(|it| matches!(it.holds, Holds::Import(_))).map(|it| it.addr);
-        if let (Some(first), Some(last)) = (cells.clone().min(), cells.max()) {
+        let bounds = placed
+            .got
+            .iter()
+            .filter(|it| matches!(it.holds, Holds::Import(_)))
+            .fold(None, |bounds: Option<(u64, u64)>, it| match bounds {
+                Some((first, last)) => Some((first.min(it.addr), last.max(it.addr))),
+                None => Some((it.addr, it.addr)),
+            });
+        if let Some((first, last)) = bounds {
             directories[pe::IMAGE_DIRECTORY_ENTRY_IAT] =
                 (rva(placed, first, "the import address table")?, (last + 16 - first) as u32);
         }

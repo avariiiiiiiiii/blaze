@@ -143,13 +143,13 @@ impl<'db> ExprValidator<'db> {
 
             match expr {
                 Expr::Match { expr, arms } => {
-                    self.validate_match(id, *expr, arms);
+                    self.validate_match(id, expr, arms);
                 }
                 Expr::Call { .. } | Expr::MethodCall { .. } => {
                     self.validate_call(id, expr, &mut filter_map_next_checker);
                 }
                 Expr::Closure { body: body_expr, .. } => {
-                    self.check_for_trailing_return(*body_expr, body);
+                    self.check_for_trailing_return(body_expr, body);
                 }
                 Expr::If { .. } => {
                     self.check_for_unnecessary_else(id, expr);
@@ -165,7 +165,7 @@ impl<'db> ExprValidator<'db> {
     fn validate_call(
         &mut self,
         call_id: ExprId,
-        expr: &Expr,
+        expr: Expr<'_>,
         filter_map_next_checker: &mut Option<FilterMapNextChecker<'db>>,
     ) {
         if !self.validate_lints {
@@ -186,13 +186,13 @@ impl<'db> ExprValidator<'db> {
                 FilterMapNextChecker::new(self.infcx.interner.lang_items(), self.db())
             });
 
-            if checker.check(call_id, receiver, &callee).is_some() {
+            if checker.check(call_id, &receiver, &callee).is_some() {
                 self.diagnostics.push(BodyValidationDiagnostic::ReplaceFilterMapNextWithFindMap {
                     method_call_expr: call_id,
                 });
             }
 
-            if let Some(receiver_ty) = self.infer.type_of_expr_with_adjust(*receiver) {
+            if let Some(receiver_ty) = self.infer.type_of_expr_with_adjust(receiver) {
                 checker.prev_receiver_ty = Some(receiver_ty);
             }
         }
@@ -296,7 +296,7 @@ impl<'db> ExprValidator<'db> {
             return false;
         }
 
-        match &self.body[scrutinee_expr] {
+        match self.body.expr(scrutinee_expr) {
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => false,
             Expr::Path(path) => {
                 let value_or_partial = self.owner.resolver(db).resolve_path_in_value_ns_fully(
@@ -306,12 +306,12 @@ impl<'db> ExprValidator<'db> {
                 );
                 value_or_partial.is_none_or(|v| !matches!(v, ValueNs::StaticId(_)))
             }
-            Expr::Field { expr, .. } => match self.infer.expr_ty(*expr).kind() {
+            Expr::Field { expr, .. } => match self.infer.expr_ty(expr).kind() {
                 TyKind::Adt(adt, ..) if matches!(adt.def_id(), AdtId::UnionId(_)) => false,
-                _ => self.is_known_valid_scrutinee(*expr),
+                _ => self.is_known_valid_scrutinee(expr),
             },
-            Expr::Index { base, .. } => self.is_known_valid_scrutinee(*base),
-            Expr::Cast { expr, .. } => self.is_known_valid_scrutinee(*expr),
+            Expr::Index { base, .. } => self.is_known_valid_scrutinee(base),
+            Expr::Cast { expr, .. } => self.is_known_valid_scrutinee(expr),
             Expr::Missing => false,
             _ => true,
         }
@@ -416,13 +416,13 @@ impl<'db> ExprValidator<'db> {
     ) {
         // As rustc's `UnusedResults`: the value of the statement, through the tails of
         // blocks (`unsafe` and labeled ones too) but not into `if`, `match` or `const`.
-        while let Expr::Block { tail: Some(tail), .. } = &self.body[expr] {
-            expr = *tail;
+        while let Expr::Block { tail: Some(tail), .. } = self.body.expr(expr) {
+            expr = tail;
         }
 
-        let fn_def = match &self.body[expr] {
-            Expr::Call { callee, .. } if self.names_an_item(*callee) => {
-                let callee_ty = self.infer.expr_ty(*callee);
+        let fn_def = match self.body.expr(expr) {
+            Expr::Call { callee, .. } if self.names_an_item(callee) => {
+                let callee_ty = self.infer.expr_ty(callee);
                 if let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(func)), _) =
                     callee_ty.kind()
                 {
@@ -453,7 +453,7 @@ impl<'db> ExprValidator<'db> {
     /// Whether `callee` is a path to an item, as rustc's `check_fn_must_use` asks: a local
     /// that holds a function is not one.
     fn names_an_item(&self, callee: ExprId) -> bool {
-        let Expr::Path(path) = &self.body[callee] else { return false };
+        let Expr::Path(path) = self.body.expr(callee) else { return false };
         let db = self.db();
         let scope = ExprScopes::of(db, self.owner).scope_for(callee);
         let resolved = resolver_for_scope(db, self.owner, scope).resolve_path_in_value_ns_fully(
@@ -493,7 +493,7 @@ impl<'db> ExprValidator<'db> {
         if !self.validate_lints {
             return;
         }
-        match &body[body_expr] {
+        match body.expr(body_expr) {
             Expr::Block { statements, tail, .. } => {
                 let last_stmt = tail.or_else(|| match statements.last()? {
                     Statement::Expr { expr, .. } => Some(*expr),
@@ -504,9 +504,9 @@ impl<'db> ExprValidator<'db> {
                 }
             }
             Expr::If { then_branch, else_branch, .. } => {
-                self.check_for_trailing_return(*then_branch, body);
+                self.check_for_trailing_return(then_branch, body);
                 if let Some(else_branch) = else_branch {
-                    self.check_for_trailing_return(*else_branch, body);
+                    self.check_for_trailing_return(else_branch, body);
                 }
             }
             Expr::Match { arms, .. } => {
@@ -524,7 +524,7 @@ impl<'db> ExprValidator<'db> {
         }
     }
 
-    fn check_for_unnecessary_else(&mut self, id: ExprId, expr: &Expr) {
+    fn check_for_unnecessary_else(&mut self, id: ExprId, expr: Expr<'_>) {
         if !self.validate_lints {
             return;
         }
@@ -532,7 +532,7 @@ impl<'db> ExprValidator<'db> {
             if else_branch.is_none() {
                 return;
             }
-            if let Expr::Block { statements, tail, .. } = &self.body[*then_branch] {
+            if let Expr::Block { statements, tail, .. } = self.body.expr(then_branch) {
                 let last_then_expr = tail.or_else(|| match statements.last()? {
                     Statement::Expr { expr, .. } => Some(*expr),
                     _ => None,
@@ -648,7 +648,7 @@ pub fn record_literal_missing_fields<'db>(
     db: &'db dyn HirDatabase,
     infer: &InferenceResult<'db>,
     id: ExprId,
-    expr: &Expr,
+    expr: Expr<'_>,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
     let (fields, spread) = match expr {
         Expr::RecordLit { fields, spread, .. } => (fields, spread),
@@ -691,10 +691,10 @@ pub fn record_pattern_missing_fields<'db>(
     db: &'db dyn HirDatabase,
     infer: &InferenceResult<'db>,
     id: PatId,
-    pat: &Pat,
+    pat: Pat<'_>,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
     let (fields, ellipsis) = match pat {
-        Pat::Record { path: _, args, ellipsis } => (args, *ellipsis),
+        Pat::Record { path: _, args, ellipsis } => (args, ellipsis),
         _ => return None,
     };
 
@@ -730,8 +730,8 @@ fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResul
             true => *has_type_mismatches = true,
             false if *has_type_mismatches => (),
             false => {
-                let pat = &body[pat];
-                if let Pat::Lit(expr) = *pat {
+                let pat = body.pat(pat);
+                if let Pat::Lit(expr) = pat {
                     *has_type_mismatches |= infer.expr_has_type_mismatch(expr);
                     if *has_type_mismatches {
                         return;

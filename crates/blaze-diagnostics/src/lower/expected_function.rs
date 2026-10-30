@@ -80,11 +80,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedFunction<'db>) -> Ve
         );
     }
 
-    if let (Some(path), Some(PathResolution::Local(_))) = (&callee_path, &resolution)
+    if let (Some(path), Some(PathResolution::Local(local))) = (&callee_path, &resolution)
         && path.qualifier().is_none()
-        && let Some(name) = path.segment().and_then(|it| it.name_ref())
     {
-        shadowed_functions(cx, name.text().as_str(), &mut diag);
+        shadowed_functions(cx, local.name(cx.db), &mut diag);
     }
 
     if !bad_array(&call, &callee, &callee_span, &mut diag) {
@@ -165,12 +164,13 @@ fn defined_here<'db>(
     Some((span, label))
 }
 
-/// rustc's label on each free function with the name of the local the callee is.
-fn shadowed_functions(cx: &Cx<'_, '_>, name: &str, diag: &mut Diag) {
+/// rustc's label on each free function with the name of the local the callee is: a walk of
+/// every module's declarations, as rustc's of `hir_free_items`, comparing interned names.
+fn shadowed_functions(cx: &Cx<'_, '_>, name: hir::Name, diag: &mut Diag) {
     for module in cx.krate.modules(cx.db) {
         for decl in module.declarations(cx.db) {
             let hir::ModuleDef::Function(function) = decl else { continue };
-            if function.name(cx.db).as_str() != name {
+            if function.name(cx.db) != name {
                 continue;
             }
             if let Some(source) = function.source(cx.db) {

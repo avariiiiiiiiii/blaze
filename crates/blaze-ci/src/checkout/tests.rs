@@ -98,6 +98,29 @@ fn history(repo: &Repo) -> (String, String) {
 }
 
 #[test]
+fn needs_git_has_says_whether_the_clone_has_a_commit() {
+    let repo = Repo::new("has");
+    let (first, second) = history(&repo);
+    let git = repo.clone_of();
+    assert_eq!(git.has(&first), Ok(true));
+    assert_eq!(git.has(&second), Ok(true));
+    assert_eq!(git.has("0123456789abcdef0123456789abcdef01234567"), Ok(false));
+    let tree = repo.git(&["rev-parse", &format!("{first}^{{tree}}")]);
+    assert_eq!(git.has(&tree), Ok(false), "a tree is no commit");
+    assert!(git.has("-c").is_err());
+    let nowhere = Git { dir: repo.dir.join("no-such-clone"), remote: git.remote.clone() };
+    assert!(nowhere.has(&first).is_err(), "no clone is an error, not a missing commit");
+}
+
+#[test]
+fn split_fields_take_exactly_their_count() {
+    assert_eq!(fields::<3>("100644 blob abc", ' '), Some(["100644", "blob", "abc"]));
+    assert_eq!(fields::<3>("100644 blob", ' '), None);
+    assert_eq!(fields::<3>("100644 blob abc more", ' '), None);
+    assert_eq!(fields::<2>("abc missing", ' '), Some(["abc", "missing"]));
+}
+
+#[test]
 fn needs_git_ops_from_nothing_write_every_file_sorted() {
     let repo = Repo::new("from-nothing");
     let (first, _) = history(&repo);

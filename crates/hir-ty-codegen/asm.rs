@@ -4,10 +4,12 @@
 //! it, runs the block, and writes the outputs back.
 
 use std::{
+    cell::RefCell,
     fmt::Write,
+    hash::{BuildHasher, Hash},
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
 };
 
 use cranelift_codegen::binemit::Reloc;
@@ -16,7 +18,7 @@ use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, elf, macho, pe,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -943,15 +945,36 @@ pub(super) struct Inline {
     pub(super) options: AsmOptions,
 }
 
+/// A map shared by the threads compiling, in shards by the hash of the key: a power of two
+/// of them, at least 4 for each core, so threads at work on different keys rarely meet on one
+/// lock, which is held for one lookup or insert alone.
+struct Sharded<K, V> {
+    shards: Box<[Mutex<FxHashMap<K, V>>]>,
+}
+
+impl<K: Eq + Hash, V> Sharded<K, V> {
+    fn new() -> Sharded<K, V> {
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let count = (4 * cores).next_power_of_two();
+        Sharded { shards: (0..count).map(|_| Mutex::default()).collect() }
+    }
+
+    /// The shard of keys of `hash`. Also after a thread panicked with it: a map is whole
+    /// between any two statements.
+    fn shard(&self, hash: u64) -> MutexGuard<'_, FxHashMap<K, V>> {
+        let shard = &self.shards[hash as usize & (self.shards.len() - 1)];
+        shard.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// The blocks given to LLVM as inline assembly, by the text of their wrappers, which is what
 /// the request of the call of one says. `None` where two blocks of one wrapper are not one
-/// block.
-static INLINE: std::sync::LazyLock<Mutex<FxHashMap<String, Option<Arc<Inline>>>>> =
-    std::sync::LazyLock::new(Mutex::default);
+/// block, which a later block can find, so an entry is read under its shard's lock.
+static INLINE: LazyLock<Sharded<String, Option<Arc<Inline>>>> = LazyLock::new(Sharded::new);
 
 /// Keeps `inline` as the block the wrapper of `text` is.
 pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
-    let mut known = INLINE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut known = INLINE.shard(FxBuildHasher.hash_one(text));
     match known.get_mut(text) {
         Some(kept) => {
             if kept.as_deref() != inline.as_ref() {
@@ -964,7 +987,7 @@ pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
 
 /// The block the wrapper of `text` is, as LLVM's inline assembly.
 pub(super) fn inline_of(text: &str) -> Option<Arc<Inline>> {
-    INLINE.lock().unwrap_or_else(|e| e.into_inner()).get(text).cloned().flatten()
+    INLINE.shard(FxBuildHasher.hash_one(text)).get(text).cloned().flatten()
 }
 
 /// The block as LLVM's inline assembly, where it is one LLVM takes as rustc's LLVM does:
@@ -1299,25 +1322,52 @@ impl Assembled {
 }
 
 /// The machine code of the function that `text` defines. Each text is assembled once: the
-/// store keeps the code, as it does a compiled function's.
-pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
-    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
+/// store keeps the code, as it does a compiled function's, and the process keeps it for as
+/// long as it runs. A thread that asked for a text before has it from its own table, with no
+/// lock, no write another core sees and no hash of the text but `FxHash`; one that has not
+/// takes it from the shared table, by its SHA-256, under the lock of one shard.
+pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
+    thread_local! {
+        /// What this thread had assembled for the triple it names, by text.
+        static SEEN: RefCell<(String, FxHashMap<Box<str>, &'static Assembled>)> =
+            RefCell::default();
+    }
+    let seen = SEEN.with_borrow(|(of, seen)| match of == triple {
+        true => seen.get(text).copied(),
+        false => None,
+    });
+    if let Some(code) = seen {
+        return Ok(code);
+    }
+    let code = assembled(triple, text)?;
+    SEEN.with_borrow_mut(|(of, seen)| {
+        if of != triple {
+            triple.clone_into(of);
+            seen.clear();
+        }
+        seen.insert(text.into(), code);
+    });
+    Ok(code)
+}
+
+/// [`assemble`] of a text this thread has not asked for.
+fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
+    static ASSEMBLED: LazyLock<Sharded<[u8; 32], &'static Assembled>> =
+        LazyLock::new(Sharded::new);
     let mut hasher = Sha256::new();
     hasher.update(b"blaze asm 3");
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
     let key: [u8; 32] = hasher.finalize().into();
-    let assembled = ASSEMBLED.get_or_init(Mutex::default);
-    // Also after a thread panicked with it: the map is whole between any two statements.
-    let known =
-        |key: &[u8; 32]| assembled.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned();
-    if let Some(code) = known(&key) {
+    // A digest's bytes are as good a hash as any of them.
+    let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
+    if let Some(&code) = ASSEMBLED.shard(hash).get(&key) {
         return Ok(code);
     }
     let store = Store::global();
     let kept = store.and_then(|it| it.get(&key)).and_then(|it| Assembled::from_bytes(&it));
-    let code = Arc::new(match kept {
+    let code = match kept {
         Some(code) => code,
         None => {
             let code = Assembler::selected().assemble(triple, text, &key)?;
@@ -1326,9 +1376,11 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
             }
             code
         }
-    });
-    assembled.lock().unwrap_or_else(|e| e.into_inner()).insert(key, code.clone());
-    Ok(code)
+    };
+    // Two threads may both have assembled it: the first one kept is the one all are given,
+    // and the other's equal bytes stay unread, one copy each at most.
+    let code: &'static Assembled = Box::leak(Box::new(code));
+    Ok(*ASSEMBLED.shard(hash).entry(key).or_insert(code))
 }
 
 /// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
@@ -1344,7 +1396,9 @@ enum Assembler {
 
 impl Assembler {
     fn selected() -> Assembler {
-        if std::env::var("BLAZE_ASSEMBLER").as_deref() == Ok("cc") {
+        static CC: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").is_some_and(|it| it == "cc"));
+        if *CC {
             return Assembler::Cc;
         }
         #[cfg(feature = "llvm")]
@@ -1579,5 +1633,29 @@ mod tests {
         assert!(intel.contains("int 0x29\nmov eax, 5\n"), "{intel}");
         let att = text("movl $$7, %eax", AsmOptions::NORETURN | AsmOptions::ATT_SYNTAX);
         assert!(att.contains("movl $$7, %eax\n"), "{att}");
+    }
+
+    /// The shards are a power of two, at least four a core, and a key is in the shard of its
+    /// hash wherever it is looked up from: what one thread inserts, another finds.
+    #[test]
+    fn sharded_maps_find_what_any_thread_kept() {
+        use super::{BuildHasher, FxBuildHasher, Sharded};
+        let map: Sharded<u64, u64> = Sharded::new();
+        let count = map.shards.len();
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        assert!(count.is_power_of_two() && count >= 4 * cores, "{count}");
+        std::thread::scope(|scope| {
+            for thread in 0..4u64 {
+                let map = &map;
+                scope.spawn(move || {
+                    for key in (thread..4000).step_by(4) {
+                        map.shard(FxBuildHasher.hash_one(key)).insert(key, key * 3);
+                    }
+                });
+            }
+        });
+        for key in 0..4000u64 {
+            assert_eq!(map.shard(FxBuildHasher.hash_one(key)).get(&key), Some(&(key * 3)));
+        }
     }
 }

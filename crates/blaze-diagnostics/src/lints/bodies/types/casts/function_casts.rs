@@ -1,0 +1,49 @@
+//! `FunctionCastsAsInteger`: `function_casts_as_integer`, a function item (a function, a tuple
+//! struct's or variant's constructor) cast straight to an integer.
+//!
+//! Follows rustc's `compiler/rustc_lint/src/function_cast_as_integer.rs` and
+//! `compiler/rustc_lint/src/lints.rs` (`FunctionCastsAsIntegerDiag`,
+//! `FunctionCastsAsIntegerSugg`) (MIT or Apache-2.0).
+
+use hir_def::hir::{Expr, ExprId};
+use hir_ty::next_solver::TyKind;
+use rustc_type_ir::inherent::IntoKind as _;
+
+use super::{cast_ty_span, expr_span};
+use crate::{
+    lints::bodies::{BodyCx, LatePass},
+    lower::{Found, Phase},
+    model::{Applicability, Diag, SuggestionStyle},
+};
+
+pub(super) struct FunctionCastsAsInteger;
+
+impl LatePass for FunctionCastsAsInteger {
+    fn name(&self) -> &'static str {
+        "FunctionCastsAsInteger"
+    }
+
+    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+        let Expr::Cast { expr: from, .. } = &b.store()[expr] else { return };
+        let from = *from;
+        if matches!(b.infer.expr_ty(expr).kind(), TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::RawPtr(..)) {
+            return;
+        }
+        if !matches!(b.infer.expr_ty(from).kind(), TyKind::FnDef(..)) {
+            return;
+        }
+        let (Some(at), Some(from_span), Some(ty_span)) = (b.expr_node(expr), expr_span(b, from), cast_ty_span(b, expr))
+        else {
+            return;
+        };
+        let span = ty_span.with_lo(from_span.hi + 1);
+        let mut diag = Diag::lint("function_casts_as_integer", "direct cast of function item into an integer", span);
+        diag.suggestion_with_style(
+            vec![(from_span.shrink_to_hi(), " as *const ()".to_owned())],
+            "first cast to a pointer `as *const ()`",
+            Applicability::MachineApplicable,
+            SuggestionStyle::ShowAlways,
+        );
+        out.push(b.lint(diag, Phase::Late, at));
+    }
+}

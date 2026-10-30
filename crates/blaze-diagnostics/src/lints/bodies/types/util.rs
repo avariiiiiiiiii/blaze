@@ -71,10 +71,10 @@ pub(crate) fn fn_item(db: &dyn HirDatabase, def: FunctionId) -> Option<String> {
 /// The function `call` calls when its callee is a path naming one (rustc's `qpath_res` of the
 /// callee, `opt_def_id`), and the callee.
 pub(crate) fn called_fn(b: &BodyCx<'_, '_>, call: ExprId) -> Option<(FunctionId, ExprId)> {
-    let Expr::Call { callee, .. } = &b.store()[call] else { return None };
-    let Expr::Path(_) = &b.store()[*callee] else { return None };
-    match b.infer.expr_ty(*callee).kind() {
-        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(def)), _) => Some((def, *callee)),
+    let Expr::Call { callee, .. } = b.store().expr(call) else { return None };
+    let Expr::Path(_) = b.store().expr(callee) else { return None };
+    match b.infer.expr_ty(callee).kind() {
+        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(def)), _) => Some((def, callee)),
         _ => None,
     }
 }
@@ -88,7 +88,7 @@ pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<(St
 
 /// The arguments of the call `call`, if it is one.
 pub(crate) fn call_args<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<&'a [ExprId]> {
-    match &b.store()[call] {
+    match b.store().expr(call) {
         Expr::Call { args, .. } => Some(args),
         _ => None,
     }
@@ -97,14 +97,14 @@ pub(crate) fn call_args<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<&'a [
 /// The function a method call resolved to (rustc's `type_dependent_def_id`): the trait's
 /// method for a method of a trait.
 pub(crate) fn method_fn(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> {
-    let Expr::MethodCall { .. } = &b.store()[expr] else { return None };
+    let Expr::MethodCall { .. } = b.store().expr(expr) else { return None };
     b.infer.method_resolution(expr).map(|(def, _)| def)
 }
 
 /// What the path `expr` names in the value namespace (rustc's `qpath_res`): an associated item
 /// as type checking resolved it, else as the scope of `expr` resolves it.
 pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
-    let Expr::Path(path) = &b.store()[expr] else { return None };
+    let Expr::Path(path) = b.store().expr(expr) else { return None };
     if let Some((assoc, _)) = b.infer.assoc_resolutions_for_expr(expr) {
         return Some(match assoc {
             CandidateId::FunctionId(it) => ValueNs::FunctionId(it),
@@ -130,23 +130,23 @@ pub(crate) fn path_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
 
 /// rustc's `Expr::peel_blocks`: through each block with a tail to its tail.
 pub(crate) fn peel_blocks(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
-    while let Expr::Block { tail: Some(tail), .. } = &b.store()[expr] {
-        expr = *tail;
+    while let Expr::Block { tail: Some(tail), .. } = b.store().expr(expr) {
+        expr = tail;
     }
     expr
 }
 
 /// rustc's `Expr::peel_borrows`: through each `&`, `&mut` and `&raw` to what it borrows.
 pub(crate) fn peel_borrows(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
-    while let Expr::Ref { expr: inner, .. } = &b.store()[expr] {
-        expr = *inner;
+    while let Expr::Ref { expr: inner, .. } = b.store().expr(expr) {
+        expr = inner;
     }
     expr
 }
 
 /// The literal `expr` is, if it is one.
 pub(crate) fn literal<'a>(b: &'a BodyCx<'_, '_>, expr: ExprId) -> Option<&'a Literal> {
-    match &b.store()[expr] {
+    match b.store().expr(expr) {
         Expr::Literal(it) => Some(it),
         _ => None,
     }
@@ -169,13 +169,22 @@ pub(crate) fn syntax(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<InFile<SyntaxNo
 
 /// rustc's span of `expr`: where it is written, with the parentheses around it, which rustc's
 /// lowering gives the expression in them (`rustc_ast_lowering`, `ExprKind::Paren`).
+/// Parentheses a macro put around an expression it was handed are not written, and are left
+/// out.
 pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
-    let node = syntax(b, expr)?;
-    let mut at = node.value.clone();
+    let node = b.expr_node(expr)?;
+    let mut span = b.cx.span_of(node);
+    let InFile { file_id, value } = b.cx.syntax(node);
+    let mut at = value;
     while let Some(parent) = at.parent().filter(|it| ast::ParenExpr::can_cast(it.kind())) {
+        let outer = b.cx.span(InFile::new(file_id, parent.text_range()));
+        if !b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')')) {
+            break;
+        }
+        span = outer;
         at = parent;
     }
-    Some(b.cx.span(node.with_value(at.text_range())))
+    Some(span)
 }
 
 /// rustc's printing of `ty`, a type of the body, as a type of the body's owner (that of the

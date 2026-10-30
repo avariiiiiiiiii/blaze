@@ -391,11 +391,12 @@ impl<'a> Stage<'a> {
         relocs: &[Reloc],
         syms: &[Sym],
         function: Option<InstanceKey>,
+        in_code: bool,
     ) -> Result<(Vec<Fixup>, Vec<Sym>), LinkError> {
         let mut fixups = Vec::with_capacity(relocs.len());
         let mut weak = Vec::new();
         for (reloc, sym) in relocs.iter().zip(syms) {
-            let apply = reloc::of_kind(reloc.kind, self.arch()).map_err(|it| error(function, it))?;
+            let apply = reloc::of_kind(reloc.kind, self.arch(), in_code).map_err(|it| error(function, it))?;
             if self.target_key(&reloc.target).1 {
                 weak.push(*sym);
             }
@@ -409,7 +410,12 @@ impl<'a> Stage<'a> {
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {
         let key = Some(function.key);
         let body = syms[0];
-        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.len()], key)?;
+        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.len()], key, true)?;
+        if self.arch() == Arch::Wasm32 {
+            let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
+                .map_err(|it| error(key, format!("its wasm header: {it}")))?;
+            self.wasm_imports(code.imports);
+        }
         let mut at = 1 + function.relocs.len();
         for data in &function.data {
             let sym = syms[at];
@@ -508,14 +514,16 @@ impl<'a> Stage<'a> {
             }
             None => {}
         }
+        let (class, rank) = self.writer.own(&Class::Text);
         let mut piece = self.piece(
             body,
-            Class::Text,
+            class,
             u64::from(function.align),
             function.code.len() as u64,
             fixups,
             What::Function(Arc::new(info)),
         );
+        piece.rank = rank;
         piece.weak = weak.into();
         self.make(piece, Cow::Borrowed(&function.code));
         if self.table {
@@ -560,10 +568,11 @@ impl<'a> Stage<'a> {
         if self.new.home(sym).is_some() {
             return Ok(());
         }
-        let (fixups, weak) = self.fixups(&data.relocs, relocs, function)?;
-        let class = if fixups.is_empty() { Class::Rodata } else { Class::RelRo };
+        let (fixups, weak) = self.fixups(&data.relocs, relocs, function, false)?;
+        let (class, rank) = self.writer.own(if fixups.is_empty() { &Class::Rodata } else { &Class::RelRo });
         let mut piece =
             self.piece(sym, class, u64::from(data.align), data.bytes.len() as u64, fixups, What::Shared);
+        piece.rank = rank;
         piece.weak = weak.into();
         self.make(piece, Cow::Borrowed(&data.bytes));
         Ok(())
@@ -586,24 +595,24 @@ impl<'a> Stage<'a> {
         };
         let keys: Vec<SymKey> = relocs.iter().map(|r| self.target_key(&r.target).0).collect();
         let syms = self.symbols.intern_all(keys);
-        let (fixups, weak) = self.fixups(relocs, &syms, None)?;
+        let (fixups, weak) = self.fixups(relocs, &syms, None, false)?;
+        if self.arch() == Arch::Wasm32 {
+            self.wasm_imports(it.imports.clone());
+        }
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
         let (class, rank) = match &it.section {
             Some(name) => self
                 .writer
                 .section(name, it.mutable || !fixups.is_empty(), false, it.thread_local)
                 .map_err(static_error)?,
-            None => (
-                match (it.thread_local, it.mutable, zero, fixups.is_empty()) {
-                    (true, _, false, _) => Class::Tdata,
-                    (true, _, true, _) => Class::Tbss,
-                    (false, true, true, _) => Class::Bss,
-                    (false, true, false, _) => Class::Data,
-                    (false, false, _, true) => Class::Rodata,
-                    (false, false, _, false) => Class::RelRo,
-                },
-                0,
-            ),
+            None => self.writer.own(&match (it.thread_local, it.mutable, zero, fixups.is_empty()) {
+                (true, _, false, _) => Class::Tdata,
+                (true, _, true, _) => Class::Tbss,
+                (false, true, true, _) => Class::Bss,
+                (false, true, false, _) => Class::Data,
+                (false, false, _, true) => Class::Rodata,
+                (false, false, _, false) => Class::RelRo,
+            }),
         };
         let zeroed = crate::state::zeroed(&class);
         let bytes = match (zero, zeroed) {
@@ -819,15 +828,22 @@ impl<'a> Stage<'a> {
     pub fn needs(&mut self) -> Result<(), LinkError> {
         let mut cells: Vec<(GotKind, Sym)> = Vec::new();
         let mut plt: Vec<Sym> = Vec::new();
+        let mut got_names: Vec<String> = Vec::new();
         for id in &self.write {
             let Some(piece) = self.new.piece(*id) else { continue };
             for fixup in piece.fixups.iter() {
                 if let Some(kind) = reloc::got_kind(fixup.apply) {
                     cells.push((kind, self.got_target(fixup)));
-                } else if reloc::is_branch(fixup.apply) && self.imported(fixup.target) {
+                } else if self.through_plt(fixup) {
                     plt.push(fixup.target);
+                } else if let Some(crate::model::Special::Got(name)) = self.special_of(fixup.target) {
+                    got_names.push(name.clone());
                 }
             }
+        }
+        for name in got_names {
+            let target = self.sym(SymKey::Name(name.as_str().into()));
+            cells.push((GotKind::Address, target));
         }
         plt.sort_unstable();
         plt.dedup();
@@ -871,7 +887,43 @@ impl<'a> Stage<'a> {
             let piece = self.piece(sym, Class::Plt, 16, code.len() as u64, fixups, What::Plt { target });
             self.make(piece, Cow::Owned(code));
         }
+        if self.plan.got_by_library {
+            self.iat_ends();
+        }
         Ok(())
+    }
+
+    /// The zero cell after each needed DLL's import address table cells, which the GOT's
+    /// layout puts after them ([`Stage::iat_end`]); those of DLLs no longer needed removed.
+    fn iat_ends(&mut self) {
+        let libraries: FxHashSet<Box<str>> =
+            self.new.resolved.libraries.iter().map(|it| it.name.as_str().into()).collect();
+        let stale: Vec<PieceId> = self
+            .new
+            .live_pieces()
+            .filter(|(_, it)| matches!(self.symbols.key(it.sym), SymKey::IatEnd(name) if !libraries.contains(name)))
+            .map(|(id, _)| id)
+            .collect();
+        for id in stale {
+            self.unmake(id);
+        }
+        let mut names: Vec<Box<str>> = libraries.into_iter().collect();
+        names.sort();
+        for name in names {
+            let sym = self.sym(SymKey::IatEnd(name));
+            if self.new.home(sym).is_some() {
+                continue;
+            }
+            let mut piece = self.piece(sym, Class::Got, 8, 8, Vec::new(), What::Fixed);
+            piece.order = [u32::MAX, 0, 0];
+            self.make(piece, Cow::Owned(vec![0; 8]));
+        }
+    }
+
+    /// Of an import address table's zero cell, the index of its DLL in the image's libraries.
+    pub fn iat_end(&self, sym: Sym) -> Option<u32> {
+        let SymKey::IatEnd(name) = self.symbols.key(sym) else { return None };
+        self.new.resolved.libraries.iter().position(|it| *it.name == **name).map(|it| it as u32)
     }
 
     /// What a GOT cell of a fixup holds the address of: a thread-local static's TLV
@@ -887,15 +939,56 @@ impl<'a> Stage<'a> {
         fixup.target
     }
 
-    fn imported(&self, mut sym: Sym) -> bool {
+    fn imported(&self, sym: Sym) -> bool {
+        self.import_of(sym).is_some()
+    }
+
+    /// The import a symbol is, through its aliases.
+    pub fn import_of(&self, mut sym: Sym) -> Option<u32> {
         for _ in 0..64 {
             match self.new.def(sym) {
-                Def::Import(_) => return true,
+                Def::Import(at) => return Some(at),
                 Def::Alias(to) => sym = to,
-                _ => return false,
+                _ => return None,
             }
         }
-        false
+        None
+    }
+
+    /// The linker's symbol a symbol is, through its aliases.
+    pub fn special_of(&self, mut sym: Sym) -> Option<&crate::model::Special> {
+        for _ in 0..64 {
+            match self.new.def(sym) {
+                Def::Special(at) => return self.new.specials.get(at as usize),
+                Def::Alias(to) => sym = to,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether a fixup reaches its target at the target's PLT stub: a branch to an import,
+    /// and where imports are reached only through their GOT cells (PE), any reference to an
+    /// imported function that is not through its cell, as link.exe's import thunk.
+    pub fn through_plt(&self, fixup: &Fixup) -> bool {
+        let Some(at) = self.import_of(fixup.target) else { return false };
+        if reloc::is_branch(fixup.apply) {
+            return true;
+        }
+        self.plan.got_by_library
+            && matches!(fixup.apply, Apply::Abs64 | Apply::ImageRel32 | Apply::Rel32)
+            && self.new.resolved.imports.get(at as usize).is_some_and(|it| it.kind == crate::model::SymbolKind::Function)
+    }
+
+    /// Records what codegen says names are imported as on wasm.
+    fn wasm_imports(&mut self, imports: Vec<(String, blaze_codegen::wasm::Import)>) {
+        if imports.is_empty() {
+            return;
+        }
+        let known = Arc::make_mut(&mut self.new.wasm_imports);
+        for (name, import) in imports {
+            known.insert(name.into_boxed_str(), import);
+        }
     }
 
     /// A GOT cell's fixups: the core writes what it can; an import's cells are the loader's.

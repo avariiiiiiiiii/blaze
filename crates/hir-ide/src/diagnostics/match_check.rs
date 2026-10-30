@@ -130,16 +130,16 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
         let mut ty = self.infer.pat_ty(pat);
         let variant = self.infer.variant_resolution_for_pat(pat);
 
-        let kind = match self.body[pat] {
+        let kind = match self.body.pat(pat) {
             hir_def::hir::Pat::Wild => PatKind::Wild,
 
             hir_def::hir::Pat::Lit(expr) => self.lower_lit(expr),
 
-            hir_def::hir::Pat::Path(ref path) => {
+            hir_def::hir::Pat::Path(path) => {
                 return self.lower_path(pat, path);
             }
 
-            hir_def::hir::Pat::Tuple { ref args, ellipsis } => {
+            hir_def::hir::Pat::Tuple { args, ellipsis } => {
                 let arity = match ty.kind() {
                     TyKind::Tuple(tys) => tys.len(),
                     _ => {
@@ -172,13 +172,13 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
                 PatKind::Binding { name: name.clone(), subpattern: self.lower_opt_pattern(subpat) }
             }
 
-            hir_def::hir::Pat::TupleStruct { ref args, ellipsis, .. } if variant.is_some() => {
+            hir_def::hir::Pat::TupleStruct { args, ellipsis, .. } if variant.is_some() => {
                 let expected_len = variant.unwrap().fields(self.db).fields().len();
                 let subpatterns = self.lower_tuple_subpats(args, expected_len, ellipsis);
                 self.lower_variant_or_leaf(pat, ty, subpatterns)
             }
 
-            hir_def::hir::Pat::Record { ref args, .. } if variant.is_some() => {
+            hir_def::hir::Pat::Record { args, .. } if variant.is_some() => {
                 let variant_data = variant.unwrap().fields(self.db);
                 let subpatterns = args
                     .iter()
@@ -203,7 +203,7 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
                 PatKind::Wild
             }
 
-            hir_def::hir::Pat::Or(ref pats) => PatKind::Or { pats: self.lower_patterns(pats) },
+            hir_def::hir::Pat::Or(pats) => PatKind::Or { pats: self.lower_patterns(pats) },
 
             _ => {
                 self.errors.push(PatternError::Unimplemented);
@@ -292,8 +292,8 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
     fn lower_lit(&mut self, expr: hir_def::hir::ExprId) -> PatKind<'db> {
         use hir_def::hir::{Expr, Literal::Bool};
 
-        match self.body[expr] {
-            Expr::Literal(Bool(value)) => PatKind::LiteralBool { value },
+        match self.body.expr(expr) {
+            Expr::Literal(&Bool(value)) => PatKind::LiteralBool { value },
             _ => {
                 self.errors.push(PatternError::Unimplemented);
                 PatKind::Wild

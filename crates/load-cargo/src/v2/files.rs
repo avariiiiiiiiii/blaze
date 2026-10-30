@@ -1,6 +1,8 @@
 //! Where each path cargo names is (its mount's root and its path under that root), and the
 //! walk that reads a directory's files through the tree, following symlinks as the disk would.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use blaze_ids::ContentId;

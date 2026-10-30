@@ -70,39 +70,45 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 fn test_iteration_mismatch() {
     crate::sync::check(|| {
         tracing::debug!("Starting new run");
-        let db_t1 = Knobs::default();
-        let db_t2 = db_t1.clone();
-        let db_t3 = db_t1.clone();
-        let db_t4 = db_t1.clone();
+        let db = Knobs::default();
+        let db = &db;
 
-        // Thread 1: Starts with query_a - main cycle head
-        let t1 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
-            query_a(&db_t1)
+        let (r_t1, r_t2, r_t3, r_t4) = thread::scope(|scope| {
+            // Thread 1: Starts with query_a - main cycle head
+            let t1 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
+                query_a(db)
+            });
+
+            // Thread 2: Starts with query_d - separate cycle that will have different iteration
+            let t2 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
+                query_d(db)
+            });
+
+            // Thread 3: Starts with query_f after others have started
+            let t3 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
+                query_f(db)
+            });
+
+            // Thread 4: Queries b which depends on multiple cycles
+            let t4 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t4", thread_id = ?thread::current().id()).entered();
+                query_b(db)
+            });
+
+            (
+                t1.join().unwrap(),
+                t2.join().unwrap(),
+                t3.join().unwrap(),
+                t4.join().unwrap(),
+            )
         });
-
-        // Thread 2: Starts with query_d - separate cycle that will have different iteration
-        let t2 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
-            query_d(&db_t2)
-        });
-
-        // Thread 3: Starts with query_f after others have started
-        let t3 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
-            query_f(&db_t3)
-        });
-
-        // Thread 4: Queries b which depends on multiple cycles
-        let t4 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t4", thread_id = ?thread::current().id()).entered();
-            query_b(&db_t4)
-        });
-
-        let r_t1 = t1.join().unwrap();
-        let r_t2 = t2.join().unwrap();
-        let r_t3 = t3.join().unwrap();
-        let r_t4 = t4.join().unwrap();
 
         // All queries should converge to the same value
         assert_eq!(r_t1, r_t2);

@@ -344,7 +344,7 @@ impl ExprCollector<'_> {
         };
 
         let idx = self.alloc_expr(
-            Expr::InlineAsm(InlineAsm {
+            Expr::InlineAsm(&InlineAsm {
                 operands: operands.into_boxed_slice(),
                 template: template.map(Vec::into_boxed_slice),
                 options,

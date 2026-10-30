@@ -11,6 +11,11 @@ Changes, each marked `blaze:` in build.rs:
    rlib.
 2. A static LLVM on Linux links libstdc++ statically, from the C++ compiler's own `libstdc++.a`
    (`$CXX -print-file-name`), so a release binary needs no C++ runtime where it runs.
+3. `wrappers/passes.cpp` (built with `llvm-config --cxxflags`, declared in
+   `src/transforms/pass_builder.rs` as `LLVMBlaze*Passes`): the pass builder, analysis managers,
+   standard instrumentation and parsed pipelines `LLVMRunPasses` makes on every call, kept per
+   target machine instead. blaze runs passes over one small module per function.
+   `cargo:rerun-if-changed` is printed for both wrappers.
 
 Why here and not in hir-ty-codegen's build.rs: rustc names a crate's native libraries right after
 that crate's rlib, and GNU ld takes from an archive only what earlier inputs asked for. Libraries

@@ -12,6 +12,13 @@ use blaze_units::{
 
 use super::unit_target;
 
+/// How the program of an artifact that runs is run, as cargo runs it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Runs {
+    pub(crate) runner: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
 /// The artifact of `unit`, its main file `path` of content `content`.
 pub(crate) fn artifact(
     unit: &Unit,
@@ -20,7 +27,13 @@ pub(crate) fn artifact(
     path: &str,
     content: ContentId,
     fresh: bool,
+    runs: Runs,
 ) -> Artifact {
+    let executable = executable(unit, plan);
+    let runs = match executable {
+        Some(_) => runs,
+        None => Runs::default(),
+    };
     Artifact {
         package: unit.pkg_id.clone(),
         kind: kind(unit),
@@ -31,9 +44,64 @@ pub(crate) fn artifact(
         profile: profile(unit),
         features: unit.features.clone(),
         filenames: filenames(unit, plan),
-        executable: executable(unit, plan),
+        executable,
         fresh,
+        runner: runs.runner,
+        env: runs.env,
+        harness: plan.harness,
     }
+}
+
+/// The variable of the dynamic library search path on `os` (cargo's `dylib_path_envvar`).
+pub(crate) fn dylib_var(os: &str) -> &'static str {
+    match os {
+        "windows" => "PATH",
+        "macos" | "ios" | "tvos" | "watchos" | "visionos" => "DYLD_FALLBACK_LIBRARY_PATH",
+        "aix" => "LIBPATH",
+        _ => "LD_LIBRARY_PATH",
+    }
+}
+
+/// What cargo sets for running a unit's program (`Compilation::fill_env` for a target
+/// process): `CARGO`, the package's `CARGO_MANIFEST_*` and `CARGO_PKG_*`, `OUT_DIR` of a package
+/// with a build script, what its script set with `rustc-env`, and the dynamic library search
+/// path of the build's native directories under the profile's (`native`), then `deps` and the
+/// profile's own. `plan` is the unit's, `os` the host's.
+pub(crate) fn run_env(
+    plan: &UnitPlan,
+    cargo: &str,
+    script: &[(String, String)],
+    native: &[String],
+    os: &str,
+) -> Vec<(String, String)> {
+    let mut env = vec![("CARGO".to_owned(), cargo.to_owned())];
+    for (name, value) in &plan.env {
+        let kept = name == "CARGO_MANIFEST_DIR"
+            || name == "CARGO_MANIFEST_PATH"
+            || name == "OUT_DIR"
+            || name.starts_with("CARGO_PKG_");
+        if kept {
+            env.push((name.clone(), value.clone()));
+        }
+    }
+    for (name, value) in script {
+        env.retain(|(it, _)| it != name);
+        env.push((name.clone(), value.clone()));
+    }
+    let deps = made(plan).into_iter().map(dir_of).find(|it| it.ends_with("/deps"));
+    if let Some(deps) = deps {
+        let root = dir_of(deps);
+        let mut search: Vec<&str> = native.iter().map(String::as_str).filter(|it| super::files::under(it, root).is_some()).collect();
+        search.push(deps);
+        search.push(root);
+        let separator = match os {
+            "windows" => ";",
+            _ => ":",
+        };
+        env.push((dylib_var(os).to_owned(), search.join(separator)));
+    }
+    env.sort();
+    env
 }
 
 /// What the artifact is, as the agent API names it.

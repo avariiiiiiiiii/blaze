@@ -1,4 +1,4 @@
-//! Proc-macro servers blaze keeps warm (docs/v2/plan/lanes/usercode.md section 6.5, #804, #805): each
+//! Proc-macro servers blaze keeps warm (docs/v2/plan/lanes/usercode.md, #804, #805): each
 //! started once, in a sandbox that traces what it reads, by the daemon's pool
 //! ([`blaze_usercode::pool`]), and talked to over the Unix socket the pool listens on
 //! ([`Link`], [`Bridge`]).
@@ -26,17 +26,24 @@ use std::{
     fs::File,
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, mpsc},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
 };
 
 use blaze_core::{Command, Completion, Conn, Done, Effect, Sandbox, Tag, Traced};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher, Idx, Interner, Sharded};
 use blaze_usercode::{
     confine::LIVE,
     inputs::Disk,
     pool::{SOCKET, WarmKey},
     trace::{self, Line, Seen},
 };
+
+#[cfg(test)]
+use std::{collections::VecDeque, sync::Mutex};
 
 use crate::{ServerError, process::ProcessExit};
 
@@ -153,13 +160,14 @@ enum Ask {
 pub struct BridgeLink {
     asks: mpsc::Sender<Ask>,
     wake: Box<dyn Fn() + Send + Sync>,
-    ended: Arc<Mutex<Option<String>>>,
+    /// Set once, by [`Bridge::end`]: the first reason wins.
+    ended: Arc<OnceLock<String>>,
 }
 
 impl BridgeLink {
     fn ask(&self, ask: impl FnOnce(mpsc::Sender<io::Result<Vec<u8>>>) -> Ask) -> io::Result<Vec<u8>> {
-        if let Some(why) = self.ended() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, why));
+        if let Some(why) = self.ended.get() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, why.clone()));
         }
         let (answer, answered) = mpsc::channel();
         self.asks.send(ask(answer)).map_err(|_| gone())?;
@@ -182,7 +190,7 @@ impl Link for BridgeLink {
     }
 
     fn ended(&self) -> Option<String> {
-        self.ended.lock().unwrap_or_else(|it| it.into_inner()).clone()
+        self.ended.get().cloned()
     }
 }
 
@@ -195,7 +203,7 @@ pub struct Bridge {
     next: u64,
     asks: mpsc::Receiver<Ask>,
     waiting: HashMap<Tag, mpsc::Sender<io::Result<Vec<u8>>>>,
-    ended: Arc<Mutex<Option<String>>>,
+    ended: Arc<OnceLock<String>>,
 }
 
 impl Bridge {
@@ -204,7 +212,7 @@ impl Bridge {
     /// [`Bridge::effects`].
     pub fn new(conn: Conn, tags: u64, wake: Box<dyn Fn() + Send + Sync>) -> (Bridge, Arc<BridgeLink>) {
         let (sender, asks) = mpsc::channel();
-        let ended = Arc::new(Mutex::new(None));
+        let ended = Arc::new(OnceLock::new());
         let link = Arc::new(BridgeLink { asks: sender, wake, ended: ended.clone() });
         let bridge = Bridge { conn, tags, next: 0, asks, waiting: HashMap::new(), ended };
         (bridge, link)
@@ -217,11 +225,11 @@ impl Bridge {
     /// What the threads asked since the last call.
     pub fn effects(&mut self, effects: &mut Vec<Effect>) {
         while let Ok(ask) = self.asks.try_recv() {
-            if let Some(why) = self.ended.lock().unwrap_or_else(|it| it.into_inner()).clone() {
+            if let Some(why) = self.ended.get() {
                 let answer = match ask {
                     Ask::Send(_, answer) | Ask::Recv(_, answer) => answer,
                 };
-                _ = answer.send(Err(io::Error::new(io::ErrorKind::BrokenPipe, why)));
+                _ = answer.send(Err(io::Error::new(io::ErrorKind::BrokenPipe, why.clone())));
                 continue;
             }
             assert!(self.next < 1 << 32, "the bridge has used every tag it was given");
@@ -260,7 +268,8 @@ impl Bridge {
     /// The server ended, or its connection did, as `why` says: what is asked of it from now
     /// on, and what is waiting, fails with that.
     pub fn end(&mut self, why: String) {
-        *self.ended.lock().unwrap_or_else(|it| it.into_inner()) = Some(why.clone());
+        _ = self.ended.set(why);
+        let why = self.ended.get().expect("set just now, or before");
         for (_, answer) in self.waiting.drain() {
             _ = answer.send(Err(io::Error::new(io::ErrorKind::BrokenPipe, why.clone())));
         }
@@ -317,9 +326,22 @@ fn set() -> Vec<(OsString, OsString)> {
 /// The environment the expansions of warm servers are given, besides the variables of the
 /// crate they expand for: what blaze sets for a server ([`SET`]) and what the user's shell
 /// passes through, as the daemon was last told ([`Environment::pass`]).
-#[derive(Default, Debug)]
+///
+/// Every environment passed is kept once, by its content ID, in a table whose values never
+/// move, and the one in use is its index behind one atomic: an expansion borrows it with one
+/// acquire load, and a `pass` publishes another with one release store. A shell has few
+/// environments, so keeping each is what lets a reader never wait or copy.
+#[derive(Default)]
 pub struct Environment {
-    passed: RwLock<Vec<(String, String)>>,
+    all: Sharded<Vec<(String, String)>>,
+    /// The index of the one in use, plus one; 0 before the first `pass`.
+    now: AtomicU32,
+}
+
+impl std::fmt::Debug for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Environment").field("passed", &self.passed()).finish()
+    }
 }
 
 impl Environment {
@@ -348,21 +370,34 @@ impl Environment {
             }
         }
         passed.sort();
-        *self.passed.write().unwrap_or_else(|it| it.into_inner()) = passed;
+        let mut id = Hasher::new("blaze v2 passed environment 1");
+        id.update(&(passed.len() as u64).to_le_bytes());
+        for (name, value) in &passed {
+            id.part(name.as_bytes()).part(value.as_bytes());
+        }
+        let at = self.all.intern(id.finish(), || passed);
+        self.now.store(at.raw() + 1, Ordering::Release);
         Ok(())
     }
 
     /// The passed-through variables now: one expansion sends and is checked against one
-    /// snapshot of them.
-    pub fn passed(&self) -> Vec<(String, String)> {
-        self.passed.read().unwrap_or_else(|it| it.into_inner()).clone()
+    /// snapshot of them, borrowed where it is kept.
+    pub fn passed(&self) -> &[(String, String)] {
+        match self.now.load(Ordering::Acquire) {
+            0 => &[],
+            at => self.all.get(Idx::from_raw(at - 1)).as_slice(),
+        }
     }
 
     /// The environment an expansion sees that is sent `passed` and `call`: the server's own,
     /// then `passed` over it, then `call` over that, as the server sets them in order.
-    pub fn seen(passed: &[(String, String)], call: &[(String, String)]) -> Vec<(OsString, OsString)> {
+    pub fn seen<'a>(
+        passed: &[(String, String)],
+        call: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<(OsString, OsString)> {
         let mut seen: BTreeMap<OsString, OsString> = set().into_iter().collect();
-        for (name, value) in passed.iter().chain(call) {
+        let passed = passed.iter().map(|(name, value)| (name.as_str(), value.as_str()));
+        for (name, value) in passed.chain(call) {
             seen.insert(name.into(), value.into());
         }
         seen.into_iter().collect()
@@ -480,7 +515,7 @@ pub struct Warm {
 #[cfg(test)]
 pub(crate) struct Script {
     pub(crate) sent: Mutex<Vec<u8>>,
-    pub(crate) answers: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    pub(crate) answers: Mutex<VecDeque<Vec<u8>>>,
     pub(crate) ended: Mutex<Option<String>>,
 }
 
@@ -610,7 +645,7 @@ mod tests {
     fn the_environment_is_the_servers_then_the_shells_then_the_crates() {
         let passed = [("PATH".to_owned(), "/a".to_owned()), ("X".to_owned(), "shell".to_owned())];
         let call = vec![("X".to_owned(), "crate".to_owned())];
-        let seen = Environment::seen(&passed, &call);
+        let seen = Environment::seen(&passed, call.iter().map(|(n, v)| (n.as_str(), v.as_str())));
         let get = |name: &str| seen.iter().find(|it| it.0 == name).map(|it| it.1.clone());
         assert_eq!(get("X"), Some("crate".into()));
         assert_eq!(get("PATH"), Some("/a".into()));
@@ -637,6 +672,42 @@ mod tests {
         assert!(matches!(server.command().sandbox, Sandbox::On { trace: true, network: false, .. }));
         let other = Server { read: vec!["/other".into()], ..server.clone() };
         assert_ne!(other.key(), before);
+    }
+
+    #[test]
+    fn what_was_passed_stays_borrowable_after_the_next_pass_and_one_seen_again_is_kept_once() {
+        let environment = Environment::new();
+        assert!(environment.passed().is_empty());
+        environment.pass(vec![("B".into(), "2".into()), ("A".into(), "1".into())]).unwrap();
+        let first = environment.passed();
+        assert_eq!(first, [("A".to_owned(), "1".to_owned()), ("B".to_owned(), "2".to_owned())]);
+        environment.pass(vec![("A".into(), "other".into())]).unwrap();
+        assert_eq!(environment.passed(), [("A".to_owned(), "other".to_owned())]);
+        assert_eq!(first[0].1, "1");
+        environment.pass(vec![("A".into(), "1".into()), ("B".into(), "2".into())]).unwrap();
+        assert!(std::ptr::eq(environment.passed(), first));
+        assert_eq!(environment.all.len(), 2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 0..100 {
+                    environment.pass(vec![("N".into(), (n % 3).to_string().into())]).unwrap();
+                }
+            });
+            for _ in 0..100 {
+                let passed = environment.passed();
+                assert!(passed.len() <= 2, "{passed:?}");
+            }
+        });
+        assert_eq!(environment.all.len(), 5);
+    }
+
+    #[test]
+    fn the_first_reason_a_bridge_ended_is_the_one_told() {
+        let (mut bridge, link) = Bridge::new(Conn(2), 0, Box::new(|| {}));
+        assert_eq!(link.ended(), None);
+        bridge.end("it exited with 1".to_owned());
+        bridge.end("its connection closed".to_owned());
+        assert_eq!(link.ended().as_deref(), Some("it exited with 1"));
     }
 
     #[cfg(unix)]

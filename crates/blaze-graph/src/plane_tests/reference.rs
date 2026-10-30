@@ -1,5 +1,5 @@
 //! The plane as core-plane wrote it, before its state moved to columns: nodes and tasks as
-//! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports, as the
+//! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
 //! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`).
 
 use std::{cmp::Reverse, collections::BTreeSet};
@@ -82,7 +82,7 @@ struct Request {
     stats: RequestStats,
 }
 
-pub struct Plane {
+pub(crate) struct Plane {
     config: PlaneConfig,
     nodes: Vec<Node>,
     index: FxHashMap<NodeId, usize>,
@@ -125,12 +125,12 @@ fn gb(bytes: u64) -> String {
 impl Plane {
     /// A plane with no database: every node with a key runs, joined only to a task of its key
     /// that has not settled. For one build of a graph, as [`crate::machine::Machine`] is.
-    pub fn new(config: PlaneConfig) -> Result<Plane, Error> {
+    pub(crate) fn new(config: PlaneConfig) -> Result<Plane, Error> {
         Plane::build(config, None)
     }
 
     /// A plane that asks `memo` before it runs a node with a key.
-    pub fn with_memo(config: PlaneConfig, memo: Box<dyn Memo + Send>) -> Result<Plane, Error> {
+    pub(crate) fn with_memo(config: PlaneConfig, memo: Box<dyn Memo + Send>) -> Result<Plane, Error> {
         Plane::build(config, Some(memo))
     }
 
@@ -164,32 +164,32 @@ impl Plane {
         })
     }
 
-    pub fn config(&self) -> &PlaneConfig {
+    pub(crate) fn config(&self) -> &PlaneConfig {
         &self.config
     }
 
-    pub fn counts(&self) -> Counts {
+    pub(crate) fn counts(&self) -> Counts {
         self.counts
     }
 
     /// The memory granted to the tasks running now.
-    pub fn granted(&self) -> u64 {
+    pub(crate) fn granted(&self) -> u64 {
         self.granted
     }
 
     /// The state of `id`, if it was added.
-    pub fn state(&self, id: NodeId) -> Option<&NodeState> {
+    pub(crate) fn state(&self, id: NodeId) -> Option<&NodeState> {
         Some(&self.nodes[*self.index.get(&id)?].state)
     }
 
     /// What `request` did so far, if it is known: open, or finished and not released.
-    pub fn stats(&self, request: RequestId) -> Option<RequestStats> {
+    pub(crate) fn stats(&self, request: RequestId) -> Option<RequestStats> {
         Some(self.requests[*self.request_index.get(&request)?].stats)
     }
 
     /// A node of the task that holds back every other task with memory until it fits, if one
     /// does.
-    pub fn holding(&self) -> Option<NodeId> {
+    pub(crate) fn holding(&self) -> Option<NodeId> {
         let task = &self.tasks[self.hold?];
         if task.running {
             return None;
@@ -200,7 +200,7 @@ impl Plane {
     /// Gives back the room of `request` once it has finished (now, if it has): its nodes are
     /// no longer known, by [`Plane::state`] or as deps, and its id is unknown, so it may be
     /// opened again. What a long-lived plane holds is then what its open requests hold.
-    pub fn release(&mut self, request: RequestId) -> Result<(), Error> {
+    pub(crate) fn release(&mut self, request: RequestId) -> Result<(), Error> {
         let &r = self.request_index.get(&request).ok_or(Error::UnknownRequest(request.0))?;
         self.requests[r].release = true;
         if self.requests[r].finished {
@@ -240,7 +240,7 @@ impl Plane {
         self.next_seq
     }
 
-    pub fn step(&mut self, input: PlaneInput) -> Result<Vec<PlaneOutput>, Error> {
+    pub(crate) fn step(&mut self, input: PlaneInput) -> Result<Vec<PlaneOutput>, Error> {
         // A time before the last is the last: completions race the clock that stamps them.
         let at = input.at_ns().max(self.last_ns);
         let mut out = Vec::new();
@@ -330,7 +330,7 @@ impl Plane {
     /// and that task runs on for the rest. Once what it runs is done the request finishes,
     /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
     /// does nothing.
-    pub fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+    pub(crate) fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
         let at = at_ns.max(self.last_ns);
         let r = self.open_request(request)?;
         let mut out = Vec::new();

@@ -19,6 +19,7 @@
 //! [RFC]: <https://github.com/rust-lang/rfcs/pull/2256>
 //! [Swift]: <https://github.com/apple/swift/blob/13d593df6f359d0cb2fc81cfaac273297c539455/lib/Syntax/README.md>
 
+#![deny(unsafe_code)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
 #[cfg(not(feature = "in-rust-tree"))]
@@ -30,6 +31,8 @@ extern crate rustc_lexer;
 
 mod parsing;
 mod ptr;
+#[allow(unsafe_code)]
+mod raw;
 mod syntax_error;
 mod syntax_node;
 #[cfg(test)]
@@ -44,7 +47,7 @@ pub mod hacks;
 pub mod syntax_editor;
 pub mod utils;
 
-use std::{marker::PhantomData, ops::Range};
+use std::marker::PhantomData;
 
 use stdx::format_to;
 use triomphe::Arc;
@@ -135,7 +138,6 @@ impl<T> Parse<T> {
             return errors;
         };
         let tree = self.tree.as_ref().unwrap().flat();
-        let source = tree.source();
         let lazies: Vec<_> = tree.lazies().map(|at| (tree.range(at), at)).collect();
         validation::validate_outline(
             &root,
@@ -144,8 +146,7 @@ impl<T> Parse<T> {
                 if !all_bodies && !tree.is_parsed(at) {
                     return false;
                 }
-                let kind = <RustLanguage as syntax_tree::Language>::kind_from_raw(tree.kind(at));
-                errors.extend(parsing::body_parser_errors(kind, source, tree.range(at), edition));
+                errors.extend(parsing::body_errors(tree, at, edition));
                 true
             },
             &mut errors,
@@ -234,11 +235,15 @@ impl Parse<SourceFile> {
     }
 
     fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
-        let mut text = self.tree.as_ref().unwrap().flat().source().to_string();
-        text.replace_range(Range::<usize>::from(delete), insert);
+        let source = self.tree.as_ref().unwrap().flat().source();
+        let text = raw::joined(&[
+            &source[..usize::from(delete.start())],
+            insert,
+            &source[usize::from(delete.end())..],
+        ]);
         match self.outline {
-            Some(_) => SourceFile::parse_outline(text.into(), edition),
-            None => SourceFile::parse_shared(text.into(), edition),
+            Some(_) => SourceFile::parse_outline(text, edition),
+            None => SourceFile::parse_shared(text, edition),
         }
     }
 }

@@ -109,7 +109,7 @@ instance and holds no name itself. What codegen must do:
   on its code hash: `const C: &str = f::<A>()` keeps its code hash when `A` is renamed while
   its bytes change.
 
-Why: otherwise a rename keeps a stale `type_name` string or `TypeId` (docs/v2/items.md 6.1:
+Why: otherwise a rename keeps a stale `type_name` string or `TypeId` (docs/v2/plan/lanes/items.md 6.1:
 names are in a hash only where the program observes them, and here it does, one instance away).
 
 > forwarded to codegen
@@ -168,6 +168,7 @@ sorted for range scans".
 > ContentId)` is one kind's range about one subject; `contains(&Fact)`. It is for a query's
 > read set (which facts it depends on), not for a fact's value: the four places above hash
 > in their own order and stay as they are.
+> applied: answered by items above; nothing to change (facts.rs keeps its own orders).
 
 ## items-hirty: 4-byte interned ids (db, `vendor/salsa`)
 
@@ -180,6 +181,8 @@ collected. That halves every impl column, and every other long-lived id array to
 beside the columns say `<= 8` today, so they keep holding when ids shrink; tighten them to
 `== 4` then. Why: docs/v2/plan/design/data.md, "a type is a `u32`" and the size budgets.
 
+> forwarded to db: `base-db`'s `impl_intern_key!`, `hir-def` and `vendor/salsa` are lane db's. The `<= 8` asserts in `method_resolution.rs` (items DONE, now mine) tighten to `== 4` once ids shrink.
+
 ## items-hirty: simplified self types as `u32` (db, type tables)
 
 The self type column of the impl tables keeps the `SimplifiedType<SolverDefId>` (16 to 24 bytes)
@@ -188,6 +191,8 @@ type tables give each simplified type a `u32` (a tag byte plus the def's 4-byte 
 the self type column becomes that `u32`, sorted directly, and the hash column goes away. Asked:
 a `u32` encoding of `rustc_type_ir::fast_reject::SimplifiedType` from db, or `Ord` on it and on
 `SolverDefId` in `vendor/rustc_type_ir`. Nothing waits on this; the tables are correct without it.
+
+> forwarded to db: the type tables and `vendor/rustc_type_ir` are lane db's.
 
 ## speed-types: read vtables with `VTableMap::tys` (`form.rs` 2092-2099, `facts.rs` 497-510)
 
@@ -208,6 +213,7 @@ first.
 
 > applied by items-facts: the `facts.rs` half, as written (`FIRST_ID`, then `tys()`). The
 > `form.rs` half is items-form's.
+> applied: both halves are in: `facts.rs` by items-facts, `form.rs` `Cx::allocation` reads `f.len(map.vtable.tys().len())` then `tys()`.
 
 ## items-facts, for lane items: `#![forbid(unsafe_code)]` on blaze-items (`src/lib.rs`, `src/key.rs`)
 
@@ -221,3 +227,127 @@ have no `unsafe` and need none.
 
 Why: docs/v2/plan/design/unsafe.md, "Crates with no unsafe module get
 `#![forbid(unsafe_code)]`".
+
+> applied (items): `module_item_keys` compares the module by its salsa id
+> (`salsa::plumbing::AsId::as_id`), and `lib.rs` has `#![forbid(unsafe_code)]`. salsa's
+> macros expand to `unsafe` from `salsa-macro-rules`, an external macro, which the lint does not
+> report; the first build confirms it.
+
+## items-hirty: impl attribute bits in the item scope (format, `hir-def`)
+
+Building `TraitImpls` (`method_resolution.rs`, `collect_def_map`) calls `AttrFlags::query` on
+every trait impl of every crate to drop `#[rustc_reservation_impl]` ones, which is a memo
+lookup and an edge per impl (std and windows-sys have tens of thousands). Asked: keep the
+`ItemScope`'s impls as two CSR lists (trait impls, inherent impls) in place of `(ImplId, bool)`
+filtered on each call, with a bitset column beside the trait impls for "reservation impl",
+filled when the item tree is collected. Then the collection reads one bit per impl and adds no
+edges. Same impls, same order; faster because it drops one query read per impl, the filter
+branch, and the edges (docs/v2/plan/design/data.md: flags as bitsets, lists as CSR).
+
+> forwarded to db: `ItemScope` (`hir-def/src/nameres`) is lane db's, not format's. The reader in `method_resolution.rs` `collect_def_map` (now mine) moves to the bitset once it exists.
+
+## items-hirty: candidate assembly across crates (db, `next_solver`)
+
+Following my earlier request (`next_solver/solver.rs:235-254`): the solver walks
+`TraitImpls::for_crate_and_deps` and does one search per loaded crate for each goal, so a
+binary with 300 dependencies makes 300 binary searches per trait goal. The narrow query
+`TraitImpls::in_crate_and_deps_for_trait_and_self_ty(krate, trait, self_ty)` answers it with
+one memo lookup and gives the same impls in the same order: each crate's impls, then its
+derives, crate by crate, which is the order the walk gives today. Asked: use it (and
+`blanket_in_crate_and_deps`) there. Faster per goal, and an edit adding an impl of another
+trait no longer reruns the goal.
+
+> forwarded to db: `next_solver/solver.rs` is lane db's; the narrow queries it should call are in `method_resolution.rs`.
+
+## speed-hir-store: blaze-items onto the HIR column views (from speed-hir-store-tools)
+
+From speed-hir-store-tools, 2026-10-29. 4 sites in 4 files of `crates/blaze-items/src/`, all the
+same edit. The rule is "## format-hir: expressions and patterns become columns" in
+`v2/requests/format.md` (contract: `~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md`).
+These land together with the format-hir change. `store.exprs()` / `body.exprs()` now yields
+`(ExprId, Expr<'_>)`, so `Expr::Closure { closure_kind, .. }` binds `ClosureKind` by value. The
+closure keys hash a closure's place in `exprs()` order (`key.rs`, `nth`); the columns keep ids
+dense and in allocation order, so that order and the key bytes are unchanged. No site builds an
+`Expr`, uses the builder, or stores, hashes or compares a view.
+
+Files that import the HIR types and need no change: `facts.rs` (`ExprId` and
+`walk_child_exprs` only), `form.rs` (`ClosureKind`, `MirSpan::ExprId`).
+
+> applied: the four sites (`key.rs` `let kind = closure_kind;`, `tests/{facts,form,hashes}.rs` `kind: closure_kind`). They compile with format-hir's `exprs()` yielding `Expr<'_>`.
+
+### crates/blaze-items/src/key.rs  (1 site)
+- ~L889  `let kind = *closure_kind;`  ->  `let kind = closure_kind;`
+
+### crates/blaze-items/src/tests/facts.rs  (1 site)
+- ~L259  `InternedClosure { owner: owner.into(), expr, kind: *closure_kind },`  ->  `InternedClosure { owner: owner.into(), expr, kind: closure_kind },`
+
+### crates/blaze-items/src/tests/form.rs  (1 site; file of speed-types-form)
+- ~L40  `InternedClosure { owner: owner.into(), expr, kind: *closure_kind },`  ->  `InternedClosure { owner: owner.into(), expr, kind: closure_kind },`
+
+### crates/blaze-items/src/tests/hashes.rs  (1 site)
+- ~L322  `InternedClosure { owner: owner.into(), expr, kind: *closure_kind },`  ->  `InternedClosure { owner: owner.into(), expr, kind: closure_kind },`
+
+## items-form, for lane items: auto-trait checks of one type in one inference context (`crates/hir-ty/src/traits.rs`)
+
+What: next to `implements_trait_unique`:
+
+```rust
+/// For each of `traits`, whether `ty` implements it: what `implements_trait_unique` answers
+/// for each, from one interner and one inference context.
+pub fn implements_traits_unique<'db>(
+    ty: Ty<'db>,
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    traits: &[TraitId],
+) -> Vec<bool> {
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    traits
+        .iter()
+        .map(|&trait_| {
+            infcx.probe(|_| {
+                let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
+                let trait_ref = rustc_type_ir::TraitRef::new_from_args(interner, trait_.into(), args);
+                if trait_ref.self_ty().is_ty_error() {
+                    return false;
+                }
+                let obligation =
+                    Obligation::new(interner, ObligationCause::dummy(), env.param_env, trait_ref);
+                infcx.predicate_must_hold_modulo_regions(&obligation)
+            })
+        })
+        .collect()
+}
+```
+
+Why faster: `form.rs` `Cx::auto_traits` asks every auto trait of the loaded crates (`Send`,
+`Sync`, `Unpin`, `UnwindSafe`, `RefUnwindSafe`, `Freeze` and the crates' own) of each
+`impl Trait` hidden type. Today each check builds its own `DbInterner` and `InferCtxt`; this
+builds one for all of them. Each check runs in its own `probe`, so nothing one leaves behind
+reaches the next, and the answers are the same as the one-at-a-time calls. Once it lands,
+`auto_traits_form` calls it once and writes `f.item(..)` and `f.bool(..)` per trait in the
+same order, so the form is bit-identical.
+
+> items-hirty, to items-form: landed in `crates/hir-ty/src/traits.rs`, one definition (a second copy added at the same time is removed). Checked against the solver: `probe` restores the universe, every variable table, region constraints, region obligations and assumptions, and opaque types; `evaluate_obligation` measures opaque types and regions against its own inner snapshot; the evaluation context's taint is per root goal, and `InferCtxt::tainted_by_errors` is never read while solving. Same `TypingMode::non_body_analysis()` and `env.param_env` as `implements_trait_unique`, and both go through one `trait_ref_holds`, so they cannot drift. Test: `implements_traits_unique_answers_as_one_at_a_time` (with an auto trait, a negative impl, a generic type and a trait asked twice).
+> applied: `hir_ty::traits::implements_traits_unique` as written, its check being the existing `trait_ref_holds` inside `infcx.probe`. `form.rs` `auto_traits_form` calls it once and writes `f.item`, `f.bool` per trait in the same order, so the form is unchanged; `tests/narrow.rs` already compares it with one-at-a-time.
+
+## items-form, for db: the symbol attributes gated on their flags (`crates/hir-def/src/attrs.rs`)
+
+What:
+1. `AttrFlags::export_name`, `link_name`, `link_section` and `linkage` return `None`
+   without making their tracked query when `AttrFlags::query(db, owner)` lacks
+   `HAS_EXPORT_NAME`, `HAS_LINK_NAME`, `HAS_LINK_SECTION` or `HAS_LINKAGE`. That is how
+   `lang_item_with_attrs` and `unstable_feature` already work: an outer `#[inline]` fn checks
+   the bit and calls the inner tracked fn.
+2. `AttrFlags::is_rustc_nounwind` reads `AttrFlags::query(db, owner.into())
+   .contains(AttrFlags::RUSTC_NOUNWIND)` instead of walking the attributes. It is not tracked,
+   so today every call re-walks the item's attribute syntax.
+
+Why faster: the flags are set by the same attribute pass, with the same one-segment match
+(`name_text` and `is1` both strip `r#`), so a missing bit means the query finds nothing. Today
+every item that asks, including blaze-items' forms for every fn, static and ADT and the link's
+symbol names, creates four memos that hold `None`, and every fn form re-walks its attributes
+for `rustc_nounwind`. `form.rs` already gates on the bits itself (`Cx::attrs`). This makes
+every other caller cheaper too, with the same answers.
+
+> forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.

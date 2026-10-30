@@ -14,8 +14,6 @@
 //! Dev builds only (Cranelift units with [`crate::settings::Spec::fold`]): a varying function
 //! becomes an indirect call in the body.
 
-use std::collections::BTreeMap;
-
 use blaze_ids::{ContentId, Hasher};
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +39,8 @@ pub enum Constant {
 /// A prepared function's IR with its constants masked: what [`groups`] compares.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Masked {
-    /// The IR's canonical bytes, each constant written as its index among `constants`.
+    /// The IR's canonical form with its constants left out, or a content hash of it (the
+    /// Cranelift backend's): equal for two functions exactly when their masked IR is.
     pub shape: Vec<u8>,
     /// Its constants, in the order the shape names them.
     pub constants: Vec<Constant>,
@@ -65,7 +64,7 @@ pub struct Group {
 }
 
 pub const FOLDED_DOMAIN: &str = "blaze v2 folded 1";
-const MASKED_DOMAIN: &str = "blaze v2 masked 1";
+const MASKED_DOMAIN: &str = "blaze v2 masked 2";
 const FOLD_SHAPE_DOMAIN: &str = "blaze v2 fold shape 1";
 
 impl Group {
@@ -83,10 +82,20 @@ impl Group {
     /// The parameter of the merged body each of `varying` reads, and how many parameters
     /// there are: varying constants whose values are equal for every member are one.
     pub fn parameters(&self) -> (Vec<u32>, u32) {
-        let columns: Vec<Vec<Constant>> = (0..self.varying.len())
-            .map(|at| self.constants.iter().map(|it| it[at]).collect())
-            .collect();
-        parameters(&columns)
+        let mut reads: Vec<u32> = Vec::with_capacity(self.varying.len());
+        let mut params = 0;
+        for at in 0..self.varying.len() {
+            let equal = |other: usize| self.constants.iter().all(|it| it[other] == it[at]);
+            let param = match (0..at).find(|&other| equal(other)) {
+                Some(other) => reads[other],
+                None => {
+                    params += 1;
+                    params - 1
+                }
+            };
+            reads.push(param);
+        }
+        (reads, params)
     }
 
     /// The references of member `member`'s thunk: the member's own, then the merged body,
@@ -96,23 +105,6 @@ impl Group {
         refs.push(Target::Direct(self.key()));
         refs
     }
-}
-
-/// For each column of values, the parameter it is: the first column equal to it.
-fn parameters(columns: &[Vec<Constant>]) -> (Vec<u32>, u32) {
-    let mut params: Vec<&Vec<Constant>> = Vec::new();
-    let mut reads = Vec::with_capacity(columns.len());
-    for column in columns {
-        let param = match params.iter().position(|&it| it == column) {
-            Some(param) => param,
-            None => {
-                params.push(column);
-                params.len() - 1
-            }
-        };
-        reads.push(param as u32);
-    }
-    (reads, params.len() as u32)
 }
 
 /// What [`groups`] makes a group of.
@@ -190,31 +182,205 @@ fn kind(constant: &Constant) -> [u8; 2] {
     }
 }
 
+/// A candidate of [`groups`], with its bucket: its settings and `masked_id`, the hash of its
+/// masked IR, size and constants' kinds.
+#[derive(Clone, Copy)]
 struct Candidate<'a> {
     key: InstanceKey,
+    settings: Settings,
+    masked_id: ContentId,
     masked: &'a Masked,
+    refs: &'a Refs,
+}
+
+/// One bucket's first-fit split, its buffers reused for the next bucket.
+///
+/// A part is its first member and, for each of the bucket's `n` constants, whether it varies
+/// among the part's members and its class: two constants of one class have equal values in
+/// every member of the part. A part's parameters are its varying constants' classes, so
+/// whether a member fits is one pass over its constants, not a plan of the part with it.
+#[derive(Default)]
+struct Split<'a> {
+    /// Sorted and deduplicated by key.
+    members: Vec<Candidate<'a>>,
+    /// `cells[m * n + at]`: member `m`'s constant `at` as members are compared.
     cells: Vec<Cell>,
+    /// Per member, its part.
+    part_of: Vec<u32>,
+    /// Per part, its first member.
+    firsts: Vec<u32>,
+    /// `varying[p * n + at]` and `classes[p * n + at]` of part `p`.
+    varying: Vec<bool>,
+    classes: Vec<u32>,
+    /// The constants that start a new parameter in [`Split::params_with`].
+    reps: Vec<u32>,
+    positions: Vec<u32>,
+    /// Per part, its members in bucket order: `flat[starts[p]..starts[p + 1]]`.
+    starts: Vec<u32>,
+    flat: Vec<u32>,
+    param_of: Vec<u32>,
 }
 
-/// What a set of members would fold as.
-struct Plan {
-    varying: Vec<u32>,
-    reads: Vec<u32>,
-    params: u32,
-}
+impl Split<'_> {
+    /// The groups of `self.members`, one bucket, into `out`.
+    fn groups(&mut self, limits: &Limits, out: &mut Vec<Group>) {
+        let n = self.members[0].masked.constants.len();
+        self.cells.clear();
+        for member in &self.members {
+            let cells = member.masked.constants.iter().map(|&it| cell(member.key, it, member.refs));
+            self.cells.extend(cells);
+        }
+        self.part_of.clear();
+        self.firsts.clear();
+        self.varying.clear();
+        self.classes.clear();
+        for member in 0..self.members.len() {
+            let mut fits = None;
+            for part in 0..self.firsts.len() {
+                if self.params_with(part, member, n, limits.max_params) <= limits.max_params {
+                    fits = Some(part);
+                    break;
+                }
+            }
+            let part = fits.unwrap_or_else(|| {
+                self.firsts.push(member as u32);
+                self.varying.resize(self.varying.len() + n, false);
+                self.classes.resize(self.classes.len() + n, 0);
+                self.firsts.len() - 1
+            });
+            self.add(part, member, n);
+            self.part_of.push(part as u32);
+        }
 
-fn plan(bucket: &[Candidate<'_>], members: &[usize]) -> Plan {
-    let first = &bucket[members[0]];
-    let varying: Vec<u32> = (0..first.cells.len())
-        .filter(|&at| members.iter().any(|&it| bucket[it].cells[at] != first.cells[at]))
-        .map(|at| at as u32)
-        .collect();
-    let columns: Vec<Vec<Constant>> = varying
-        .iter()
-        .map(|&at| members.iter().map(|&it| bucket[it].masked.constants[at as usize]).collect())
-        .collect();
-    let (reads, params) = parameters(&columns);
-    Plan { varying, reads, params }
+        let parts = self.firsts.len();
+        self.starts.clear();
+        self.starts.resize(parts + 1, 0);
+        for &part in &self.part_of {
+            self.starts[part as usize + 1] += 1;
+        }
+        for part in 0..parts {
+            self.starts[part + 1] += self.starts[part];
+        }
+        self.flat.clear();
+        self.flat.resize(self.members.len(), 0);
+        self.positions.clear();
+        self.positions.extend_from_slice(&self.starts[..parts]);
+        for (member, &part) in self.part_of.iter().enumerate() {
+            let at = &mut self.positions[part as usize];
+            self.flat[*at as usize] = member as u32;
+            *at += 1;
+        }
+
+        for part in 0..parts {
+            let members = &self.flat[self.starts[part] as usize..self.starts[part + 1] as usize];
+            if members.len() < limits.min_members as usize {
+                continue;
+            }
+            let (varying_of, classes) = (&self.varying[part * n..][..n], &self.classes[part * n..][..n]);
+            self.param_of.clear();
+            self.param_of.resize(n, u32::MAX);
+            let (mut varying, mut reads, mut params) = (Vec::new(), Vec::new(), 0u32);
+            for at in 0..n {
+                if !varying_of[at] {
+                    continue;
+                }
+                let param = &mut self.param_of[classes[at] as usize];
+                if *param == u32::MAX {
+                    *param = params;
+                    params += 1;
+                }
+                varying.push(at as u32);
+                reads.push(*param);
+            }
+            let first = self.members[members[0] as usize];
+            if params == 0 || !profitable(first.masked.size, members.len(), params, limits) {
+                continue;
+            }
+            let mut hasher = Hasher::new(FOLD_SHAPE_DOMAIN);
+            hasher.id(&first.masked_id);
+            let mut reads_of = varying.iter().zip(&reads).peekable();
+            let first_cells = &self.cells[members[0] as usize * n..][..n];
+            for (at, it) in first_cells.iter().enumerate() {
+                if let Some((_, param)) = reads_of.next_if(|(v, _)| **v as usize == at) {
+                    hasher.update(&[5]).update(&param.to_le_bytes());
+                } else {
+                    cell_into(&mut hasher, it);
+                }
+            }
+            let constants = members
+                .iter()
+                .map(|&it| {
+                    let constants = &self.members[it as usize].masked.constants;
+                    varying.iter().map(|&at| constants[at as usize]).collect()
+                })
+                .collect();
+            out.push(Group {
+                shape: hasher.finish(),
+                settings: first.settings,
+                varying,
+                members: members.iter().map(|&it| self.members[it as usize].key).collect(),
+                constants,
+            });
+        }
+    }
+
+    /// How many parameters `part` would take with `member` in it; past `max`, any count
+    /// above it.
+    fn params_with(&mut self, part: usize, member: usize, n: usize, max: u32) -> u32 {
+        let first = self.firsts[part] as usize;
+        let varying = &self.varying[part * n..][..n];
+        let classes = &self.classes[part * n..][..n];
+        let (mine, firsts) = (&self.cells[member * n..][..n], &self.cells[first * n..][..n]);
+        let values = &self.members[member].masked.constants;
+        self.reps.clear();
+        for at in 0..n {
+            if !varying[at] && mine[at] == firsts[at] {
+                continue;
+            }
+            let class = classes[at];
+            let known = self.reps.iter().any(|&rep| {
+                let rep = rep as usize;
+                classes[rep] == class && values[rep] == values[at]
+            });
+            if !known {
+                self.reps.push(at as u32);
+                if self.reps.len() > max as usize {
+                    break;
+                }
+            }
+        }
+        self.reps.len() as u32
+    }
+
+    /// Puts `member` in `part`: the constants it makes vary, and the classes split by its
+    /// values.
+    fn add(&mut self, part: usize, member: usize, n: usize) {
+        let first = self.firsts[part] as usize;
+        for at in 0..n {
+            if self.cells[member * n + at] != self.cells[first * n + at] {
+                self.varying[part * n + at] = true;
+            }
+        }
+        let values = &self.members[member].masked.constants;
+        let classes = &mut self.classes[part * n..][..n];
+        self.positions.clear();
+        self.positions.extend(0..n as u32);
+        self.positions.sort_unstable_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            (classes[a], values[a]).cmp(&(classes[b], values[b]))
+        });
+        let mut class = 0;
+        let mut last = None;
+        for &at in &self.positions {
+            let at = at as usize;
+            let was = (classes[at], values[at]);
+            if last.is_some_and(|last| last != was) {
+                class += 1;
+            }
+            last = Some(was);
+            classes[at] = class;
+        }
+    }
 }
 
 /// Relax's test: the bodies folded away save more than the thunks cost, and the body grows
@@ -240,73 +406,56 @@ pub fn groups(
     candidates: &[(InstanceKey, Settings, &Masked, &Refs)],
     limits: &Limits,
 ) -> Vec<Group> {
-    let mut buckets: BTreeMap<(Settings, ContentId), Vec<Candidate<'_>>> = BTreeMap::new();
+    let mut all: Vec<Candidate<'_>> = Vec::with_capacity(candidates.len());
     for &(key, settings, masked, refs) in candidates {
+        for constant in &masked.constants {
+            if let Constant::Place(at) = *constant
+                && at as usize >= refs.len()
+            {
+                panic!("{key:?}'s masked IR names place {at} of its {} references", refs.len());
+            }
+        }
         let mut hasher = Hasher::new(MASKED_DOMAIN);
         hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
         hasher.update(&(masked.constants.len() as u64).to_le_bytes());
         for constant in &masked.constants {
             hasher.update(&kind(constant));
         }
-        let cells = masked.constants.iter().map(|&it| cell(key, it, refs)).collect();
-        buckets.entry((settings, hasher.finish())).or_default().push(Candidate {
-            key,
-            masked,
-            cells,
-        });
+        all.push(Candidate { key, settings, masked_id: hasher.finish(), masked, refs });
     }
+    // One sort makes every bucket a run, its members in key order. Stable, so of candidates
+    // given twice under one key in one bucket, the first given stays.
+    let mut order: Vec<u32> = (0..all.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&all[a as usize], &all[b as usize]);
+        (a.settings, a.masked_id, a.key).cmp(&(b.settings, b.masked_id, b.key))
+    });
+    let mut split = Split::default();
     let mut groups = Vec::new();
-    for ((settings, masked_id), mut bucket) in buckets {
-        bucket.sort_by_key(|it| it.key);
-        bucket.dedup_by_key(|it| it.key);
+    let mut start = 0;
+    while start < order.len() {
+        let head = all[order[start] as usize];
+        let len = order[start..]
+            .iter()
+            .position(|&it| {
+                let it = &all[it as usize];
+                it.settings != head.settings || it.masked_id != head.masked_id
+            })
+            .unwrap_or(order.len() - start);
+        let bucket = &order[start..start + len];
+        start += len;
         if bucket.len() < limits.min_members as usize {
             continue;
         }
-        let mut parts: Vec<Vec<usize>> = Vec::new();
-        for member in 0..bucket.len() {
-            let fits = parts.iter().position(|part| {
-                let mut with = part.clone();
-                with.push(member);
-                plan(&bucket, &with).params <= limits.max_params
-            });
-            match fits {
-                Some(at) => parts[at].push(member),
-                None => parts.push(vec![member]),
+        split.members.clear();
+        for &it in bucket {
+            let it = all[it as usize];
+            if split.members.last().is_none_or(|last| last.key != it.key) {
+                split.members.push(it);
             }
         }
-        for part in parts {
-            if part.len() < limits.min_members as usize {
-                continue;
-            }
-            let Plan { varying, reads, params } = plan(&bucket, &part);
-            let size = bucket[part[0]].masked.size;
-            if params == 0 || !profitable(size, part.len(), params, limits) {
-                continue;
-            }
-            let mut hasher = Hasher::new(FOLD_SHAPE_DOMAIN);
-            hasher.id(&masked_id);
-            let mut reads_of = varying.iter().zip(&reads).peekable();
-            for (at, it) in bucket[part[0]].cells.iter().enumerate() {
-                if let Some((_, param)) = reads_of.next_if(|(v, _)| **v as usize == at) {
-                    hasher.update(&[5]).update(&param.to_le_bytes());
-                } else {
-                    cell_into(&mut hasher, it);
-                }
-            }
-            let constants = part
-                .iter()
-                .map(|&it| {
-                    let constants = &bucket[it].masked.constants;
-                    varying.iter().map(|&at| constants[at as usize]).collect()
-                })
-                .collect();
-            groups.push(Group {
-                shape: hasher.finish(),
-                settings,
-                varying,
-                members: part.iter().map(|&it| bucket[it].key).collect(),
-                constants,
-            });
+        if split.members.len() >= limits.min_members as usize {
+            split.groups(limits, &mut groups);
         }
     }
     groups.sort_by_key(|it| it.members[0]);
@@ -500,6 +649,202 @@ mod tests {
             let permuted: Vec<_> = order.iter().map(|&it| candidates[it]).collect();
             assert_eq!(groups(&permuted, &Limits::default()), want);
         }
+    }
+
+    /// `groups` and `Group::parameters` as they were before buckets became sorted runs and
+    /// the split incremental: the model the differential tests hold them to.
+    mod reference {
+        use std::collections::BTreeMap;
+
+        use super::super::*;
+
+        pub(super) fn parameters(columns: &[Vec<Constant>]) -> (Vec<u32>, u32) {
+            let mut params: Vec<&Vec<Constant>> = Vec::new();
+            let mut reads = Vec::with_capacity(columns.len());
+            for column in columns {
+                let param = match params.iter().position(|&it| it == column) {
+                    Some(param) => param,
+                    None => {
+                        params.push(column);
+                        params.len() - 1
+                    }
+                };
+                reads.push(param as u32);
+            }
+            (reads, params.len() as u32)
+        }
+
+        struct Candidate<'a> {
+            key: InstanceKey,
+            masked: &'a Masked,
+            cells: Vec<Cell>,
+        }
+
+        struct Plan {
+            varying: Vec<u32>,
+            reads: Vec<u32>,
+            params: u32,
+        }
+
+        fn plan(bucket: &[Candidate<'_>], members: &[usize]) -> Plan {
+            let first = &bucket[members[0]];
+            let varying: Vec<u32> = (0..first.cells.len())
+                .filter(|&at| members.iter().any(|&it| bucket[it].cells[at] != first.cells[at]))
+                .map(|at| at as u32)
+                .collect();
+            let columns: Vec<Vec<Constant>> = varying
+                .iter()
+                .map(|&at| {
+                    members.iter().map(|&it| bucket[it].masked.constants[at as usize]).collect()
+                })
+                .collect();
+            let (reads, params) = parameters(&columns);
+            Plan { varying, reads, params }
+        }
+
+        pub(super) fn groups(
+            candidates: &[(InstanceKey, Settings, &Masked, &Refs)],
+            limits: &Limits,
+        ) -> Vec<Group> {
+            let mut buckets: BTreeMap<(Settings, ContentId), Vec<Candidate<'_>>> = BTreeMap::new();
+            for &(key, settings, masked, refs) in candidates {
+                let mut hasher = Hasher::new(MASKED_DOMAIN);
+                hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
+                hasher.update(&(masked.constants.len() as u64).to_le_bytes());
+                for constant in &masked.constants {
+                    hasher.update(&kind(constant));
+                }
+                let cells = masked.constants.iter().map(|&it| cell(key, it, refs)).collect();
+                buckets.entry((settings, hasher.finish())).or_default().push(Candidate {
+                    key,
+                    masked,
+                    cells,
+                });
+            }
+            let mut groups = Vec::new();
+            for ((settings, masked_id), mut bucket) in buckets {
+                bucket.sort_by_key(|it| it.key);
+                bucket.dedup_by_key(|it| it.key);
+                if bucket.len() < limits.min_members as usize {
+                    continue;
+                }
+                let mut parts: Vec<Vec<usize>> = Vec::new();
+                for member in 0..bucket.len() {
+                    let fits = parts.iter().position(|part| {
+                        let mut with = part.clone();
+                        with.push(member);
+                        plan(&bucket, &with).params <= limits.max_params
+                    });
+                    match fits {
+                        Some(at) => parts[at].push(member),
+                        None => parts.push(vec![member]),
+                    }
+                }
+                for part in parts {
+                    if part.len() < limits.min_members as usize {
+                        continue;
+                    }
+                    let Plan { varying, reads, params } = plan(&bucket, &part);
+                    let size = bucket[part[0]].masked.size;
+                    if params == 0 || !profitable(size, part.len(), params, limits) {
+                        continue;
+                    }
+                    let mut hasher = Hasher::new(FOLD_SHAPE_DOMAIN);
+                    hasher.id(&masked_id);
+                    let mut reads_of = varying.iter().zip(&reads).peekable();
+                    for (at, it) in bucket[part[0]].cells.iter().enumerate() {
+                        if let Some((_, param)) = reads_of.next_if(|(v, _)| **v as usize == at) {
+                            hasher.update(&[5]).update(&param.to_le_bytes());
+                        } else {
+                            cell_into(&mut hasher, it);
+                        }
+                    }
+                    let constants = part
+                        .iter()
+                        .map(|&it| {
+                            let constants = &bucket[it].masked.constants;
+                            varying.iter().map(|&at| constants[at as usize]).collect()
+                        })
+                        .collect();
+                    groups.push(Group {
+                        shape: hasher.finish(),
+                        settings,
+                        varying,
+                        members: part.iter().map(|&it| bucket[it].key).collect(),
+                        constants,
+                    });
+                }
+            }
+            groups.sort_by_key(|it| it.members[0]);
+            groups
+        }
+    }
+
+    /// SplitMix64.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % n
+        }
+    }
+
+    /// Candidates over three shapes, few values and few targets, so buckets are large, many
+    /// constants vary alike, keys repeat (with other constants) and settings differ.
+    fn random(rng: &mut Rng) -> Vec<(InstanceKey, Settings, Masked, Vec<Target>)> {
+        let count = 1 + rng.below(48);
+        (0..count)
+            .map(|_| {
+                let shape = rng.below(3) as u8;
+                let constants = (0..2 + 3 * shape as usize)
+                    .map(|at| match (at + shape as usize) % 4 {
+                        _ if rng.below(16) == 0 => Constant::F32(rng.below(2) as u32),
+                        0 => int(u128::from(rng.below(3))),
+                        1 => Constant::Place(rng.below(3) as u32),
+                        2 => Constant::Data(ContentId([rng.below(3) as u8; 32])),
+                        _ => int(u128::from(rng.below(2) * 8)),
+                    })
+                    .collect();
+                let refs = (0..3).map(|_| Target::Function(key(100 + rng.below(3) as u8))).collect();
+                let size = if rng.below(8) == 0 { 4 } else { [40, 400, 4000][shape as usize] };
+                let masked = Masked { shape: vec![shape], constants, size };
+                let settings = settings(if rng.below(8) == 0 { 2 } else { 1 });
+                (key(rng.below(40) as u8), settings, masked, refs)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn groups_are_the_reference_groups() {
+        let limits = [
+            Limits::default(),
+            Limits { max_params: 1, min_members: 2, thunk_size: 0 },
+            Limits { max_params: 2, min_members: 3, thunk_size: 0 },
+            Limits { max_params: 3, min_members: 2, thunk_size: 6 },
+        ];
+        let mut rng = Rng(1292);
+        let mut found = 0;
+        for _ in 0..400 {
+            let items = random(&mut rng);
+            let candidates: Vec<_> =
+                items.iter().map(|(k, s, m, r)| (*k, *s, m, r.as_slice())).collect();
+            for limits in &limits {
+                let want = reference::groups(&candidates, limits);
+                found += want.len();
+                assert_eq!(groups(&candidates, limits), want, "{limits:?}");
+                for group in &want {
+                    let columns: Vec<Vec<Constant>> = (0..group.varying.len())
+                        .map(|at| group.constants.iter().map(|it| it[at]).collect())
+                        .collect();
+                    assert_eq!(group.parameters(), reference::parameters(&columns));
+                }
+            }
+        }
+        assert!(found > 400, "the inputs make groups: {found}");
     }
 
     #[test]

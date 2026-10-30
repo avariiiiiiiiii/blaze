@@ -3,9 +3,9 @@
 //! tables of its own, which are in [`seh`].
 
 use cranelift_codegen::{
-    Context, FinalizedMachExceptionHandler,
+    CompiledCode, Context, FinalizedMachExceptionHandler,
     gimli::{
-        self, Encoding, Format, RunTimeEndian, SectionId,
+        self, RunTimeEndian, SectionId,
         write::{
             Address, CallFrameInstruction, CieId, EhFrame, EndianVec, FrameDescriptionEntry,
             FrameTable, Result as WriteResult, Writer,
@@ -23,12 +23,12 @@ use cranelift_object::{
     },
 };
 
+#[cfg(test)]
 mod gcc_except_table;
+mod lsda;
 pub(super) mod seh;
 
-use gcc_except_table::{
-    Action, ActionKind, ActionTable, CallSite, CallSiteTable, GccExceptTable, TypeInfoTable,
-};
+use lsda::CallEntry;
 
 /// Exception tag of a landing pad that runs destructors and resumes unwinding.
 pub(super) const CLEANUP: u32 = 0;
@@ -136,51 +136,41 @@ impl FunctionUnwind {
             }
             _ => return Ok(None),
         };
-
-        let mut table = GccExceptTable {
-            call_sites: CallSiteTable(vec![]),
-            actions: ActionTable::new(),
-            type_info: TypeInfoTable::new(gimli::DW_EH_PE_udata4),
-        };
-        let catch_type = table.type_info.add(Address::Constant(0));
-        let catch_action =
-            table.actions.add(Action { kind: ActionKind::Catch(catch_type), next_action: None });
+        let mut lands = false;
         for call_site in code.buffer.call_sites() {
-            let start = u64::from(call_site.ret_addr - 1);
-            if call_site.exception_handlers.is_empty() {
-                table.call_sites.0.push(CallSite {
-                    start,
-                    length: 1,
-                    landing_pad: 0,
-                    action_entry: None,
-                });
-            }
             for handler in call_site.exception_handlers {
-                let &FinalizedMachExceptionHandler::Tag(tag, landing_pad) = handler else {
+                let FinalizedMachExceptionHandler::Tag(..) = handler else {
                     return Err("unexpected exception handler".to_owned());
                 };
-                table.call_sites.0.push(CallSite {
-                    start,
-                    length: 1,
-                    landing_pad: u64::from(landing_pad),
-                    action_entry: (tag.as_u32() == CATCH).then_some(catch_action),
-                });
+                lands = true;
             }
         }
-        let encoding = Encoding {
-            format: Format::Dwarf32,
-            version: 1,
-            address_size: isa.frontend_config().pointer_bytes(),
-        };
-        let mut writer = WriterRelocate::new();
-        table.write(&mut writer, encoding).map_err(|e| e.to_string())?;
-        debug_assert!(writer.relocs.is_empty());
-        Ok(Some(FunctionUnwind {
-            frame: Frame::Cranelift(info),
-            landing_pads: Some(writer.writer.into_vec()),
-        }))
+        // Where no call lands anywhere, an unwind goes on through each to the caller, as it
+        // does through a frame without the entry: its personality is not asked, and LLVM
+        // writes none for such a function of rustc's either.
+        let landing_pads = lands.then(|| lsda::write(|| call_entries(code)));
+        Ok(Some(FunctionUnwind { frame: Frame::Cranelift(info), landing_pads }))
     }
+}
 
+/// The rows of the call-site table of `code`: one for each call, or one for each of its
+/// handlers where it has some.
+fn call_entries(code: &CompiledCode) -> impl Iterator<Item = CallEntry> + '_ {
+    code.buffer.call_sites().flat_map(|call_site| {
+        let start = call_site.ret_addr - 1;
+        let handlers = call_site.exception_handlers;
+        let plain = handlers.is_empty().then_some(CallEntry { start, landing_pad: 0, catch: false });
+        let handled = handlers.iter().filter_map(move |handler| match *handler {
+            FinalizedMachExceptionHandler::Tag(tag, landing_pad) => {
+                Some(CallEntry { start, landing_pad, catch: tag.as_u32() == CATCH })
+            }
+            _ => None,
+        });
+        plain.into_iter().chain(handled)
+    })
+}
+
+impl FunctionUnwind {
     /// The unwind information of code that came with its own.
     #[cfg(feature = "llvm")]
     pub(super) fn from_rows(rows: FrameRows, landing_pads: Option<Vec<u8>>) -> Self {

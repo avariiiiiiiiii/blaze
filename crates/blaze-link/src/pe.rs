@@ -18,7 +18,6 @@ mod image;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use blaze_codegen::Arch;
@@ -82,8 +81,9 @@ pub(crate) struct Pe {
     pub(crate) output: Output,
     /// The DLL each long-format import library names by its `__IMPORT_DESCRIPTOR_<lib>`,
     /// from the descriptor members of the archives read so far: a long import member names
-    /// only the descriptor.
-    pub(crate) descriptors: Mutex<BTreeMap<String, String>>,
+    /// only the descriptor. Written once per archive that has descriptors; read once per long
+    /// import member the core reads on its own (an import library read whole uses its own).
+    pub(crate) descriptors: Mutex<coff::Descriptors>,
 }
 
 impl Pe {

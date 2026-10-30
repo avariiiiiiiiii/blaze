@@ -16,16 +16,23 @@ use blaze_codegen::{
     plan::{Mode as BuildMode, OptLevel, Origin, Override, Policy, Profile},
     settings::{DebugInfo, Panic, Toolchain},
 };
+use blaze_build_script::{
+    apply::{Compile, GraphUnit, Linked as LinkedTo, to_link},
+    unit as bs,
+};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, Output};
-use blaze_units::schema::{self, Mode, Unit};
+use blaze_units::{
+    query::Units,
+    schema::{self, Mode, Unit},
+};
 use hir_ty::db::HirDatabase;
 use hir_ty_codegen::v2::{
     Backends, BuildTime, Databases, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
 };
 
-use super::{Job, files::Mounted};
+use super::{Job, files::Mounted, script};
 
 /// What a unit makes, as the linker sees it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -290,31 +297,88 @@ pub(crate) struct Linked {
     names: BTreeSet<String>,
 }
 
-/// The native libraries `unit` links, in rustc's order: each crate of its closure, what depends
-/// first, its build script's `rustc-link-lib`s then its `#[link]`s; and where to look for them,
-/// every build script's `rustc-link-search` of the closure.
-fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
-    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
-    let mut libs = Vec::new();
-    let mut search = Vec::new();
-    for at in closure(job, unit) {
-        let u = job.unit(at).map_err(|it| it.what)?;
-        for dep in &u.dependencies {
-            if let Some(applied) = scripts.get(&dep.index) {
-                libs.extend(applied.libs.iter().cloned());
-                for dir in &applied.search {
-                    if !search.contains(dir) {
-                        search.push(dir.clone());
-                    }
-                }
-            }
-        }
-        if let Some(krate) = job.lowered.krate(at) {
-            let linked = frontend.linked(krate).map_err(|it| it.what)?;
-            libs.extend(linked);
+/// `unit` as cargo's `build_map` reads it: its dependencies sorted by package id, its package's
+/// script runs, whether it is built for the host, whether it links into what depends on it.
+fn graph_unit(units: &Units, unit: usize) -> GraphUnit<usize, usize> {
+    let all = &units.graph.units;
+    let Some(it) = all.get(unit) else {
+        return GraphUnit { deps: Vec::new(), own_runs: Vec::new(), for_host: false, linkable: false };
+    };
+    let mut deps: Vec<usize> = it.dependencies.iter().map(|dep| dep.index).collect();
+    deps.sort_by(|a, b| all[*a].pkg_id.cmp(&all[*b].pkg_id));
+    let own_runs = match it.target.is_custom_build() {
+        true => Vec::new(),
+        false => deps
+            .iter()
+            .copied()
+            .filter(|dep| all[*dep].mode == Mode::RunCustomBuild && all[*dep].pkg_id == it.pkg_id)
+            .collect(),
+    };
+    let linkable = it.target.is_lib()
+        && it.target.crate_types.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"));
+    GraphUnit { deps, own_runs, for_host: it.target.is_custom_build() || it.target.is_proc_macro(), linkable }
+}
+
+/// What rustc is given for `unit` from the build scripts it is linked with
+/// ([`blaze_build_script::apply::Compile`]).
+fn given(job: &Job, unit: usize, scripts: &BTreeMap<usize, script::Applied>) -> Result<Compile, String> {
+    let units = job.units();
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let mut memo = rustc_hash::FxHashMap::default();
+    let to_link = to_link(unit, &|at: &usize| graph_unit(units, *at), &mut memo).to_link;
+    let mut linked = Vec::new();
+    let mut own = Vec::new();
+    for run in to_link {
+        let applied = scripts.get(&run).ok_or_else(|| {
+            format!("the build script run of `{}` that `{}` is linked with has not run", units.graph.units[run].pkg_id, u.target.name)
+        })?;
+        let mine = units.graph.units[run].pkg_id == u.pkg_id;
+        linked.push(LinkedTo { own: mine, output: &applied.output });
+        if mine {
+            own.push(&applied.output);
         }
     }
-    Ok((libs, search))
+    let package = bs::Package { targets: script::targets(units, &u.pkg_id), ..bs::Package::default() };
+    Ok(Compile::of(&package, &script::target_of(u), matches!(u.mode, Mode::Test), &linked, &own))
+}
+
+/// The native libraries `unit` links, in rustc's order: each linked crate of its closure, what
+/// depends first, the `-l`s its rustc is given (its build script's `rustc-link-lib`s) then its
+/// `#[link]`s, then the unit's own `rustc-link-arg`s; and where to look for them, the unit's
+/// `-L`s.
+fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
+    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
+    let units = job.units();
+    let mine = given(job, unit, &scripts)?;
+    // The crates linked in: the unit's, and each library reached through libraries, not through
+    // a build script or proc macro, which are built for the host.
+    let mut linked_in = BTreeSet::from([unit]);
+    let mut pending = vec![unit];
+    while let Some(at) = pending.pop() {
+        for dep in graph_unit(units, at).deps {
+            let node = graph_unit(units, dep);
+            if node.linkable && !node.for_host && linked_in.insert(dep) {
+                pending.push(dep);
+            }
+        }
+    }
+    let mut libs = Vec::new();
+    for at in closure(job, unit).into_iter().filter(|it| linked_in.contains(it)) {
+        let compile = match at == unit {
+            true => mine.clone(),
+            false => given(job, at, &scripts)?,
+        };
+        for lib in &compile.libs {
+            libs.push(link_lib(lib)?);
+        }
+        if let Some(krate) = job.lowered.krate(at) {
+            libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
+        }
+    }
+    for arg in &mine.link_args {
+        libs.push(link_arg(arg)?);
+    }
+    Ok((libs, mine.search))
 }
 
 /// The bytes of a file, by its path.
@@ -458,7 +522,8 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
         "link-arg" => return Err(format!("`-l {value}`: blaze's linker takes no raw link argument")),
         other => return Err(format!("`-l {value}`: unknown library kind `{other}`")),
     };
-    let name = name.split_once(':').map_or(name, |it| it.0);
+    // `NAME:RENAME` links `RENAME` where the crate's `#[link]` says `NAME`.
+    let name = name.split_once(':').map_or(name, |it| it.1);
     if name.is_empty() {
         return Err(format!("`-l {value}` names no library"));
     }

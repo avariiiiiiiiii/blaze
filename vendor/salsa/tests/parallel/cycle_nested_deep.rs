@@ -54,37 +54,43 @@ fn initial(_db: &dyn KnobsDatabase, _id: salsa::Id) -> CycleValue {
 fn the_test() {
     crate::sync::check(|| {
         tracing::debug!("Starting new run");
-        let db_t1 = Knobs::default();
-        let db_t2 = db_t1.clone();
-        let db_t3 = db_t1.clone();
-        let db_t4 = db_t1.clone();
+        let db = Knobs::default();
+        let db = &db;
 
-        let t1 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
-            let result = query_a(&db_t1);
-            db_t1.signal(1);
-            result
-        });
-        let t2 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t4", thread_id = ?thread::current().id()).entered();
-            db_t4.wait_for(1);
-            query_b(&db_t4)
-        });
-        let t3 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
-            db_t2.wait_for(1);
-            query_d(&db_t2)
-        });
-        let t4 = thread::spawn(move || {
-            let _span = tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
-            db_t3.wait_for(1);
-            query_e(&db_t3)
-        });
+        let (r_t1, r_t2, r_t3, r_t4) = thread::scope(|scope| {
+            let t1 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t1", thread_id = ?thread::current().id()).entered();
+                let result = query_a(db);
+                db.signal(1);
+                result
+            });
+            let t2 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t4", thread_id = ?thread::current().id()).entered();
+                db.wait_for(1);
+                query_b(db)
+            });
+            let t3 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t2", thread_id = ?thread::current().id()).entered();
+                db.wait_for(1);
+                query_d(db)
+            });
+            let t4 = scope.spawn(move || {
+                let _span =
+                    tracing::debug_span!("t3", thread_id = ?thread::current().id()).entered();
+                db.wait_for(1);
+                query_e(db)
+            });
 
-        let r_t1 = t1.join().unwrap();
-        let r_t2 = t2.join().unwrap();
-        let r_t3 = t3.join().unwrap();
-        let r_t4 = t4.join().unwrap();
+            (
+                t1.join().unwrap(),
+                t2.join().unwrap(),
+                t3.join().unwrap(),
+                t4.join().unwrap(),
+            )
+        });
 
         assert_eq!((r_t1, r_t2, r_t3, r_t4), (MAX, MAX, MAX, MAX));
     });

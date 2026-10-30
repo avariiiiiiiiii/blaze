@@ -14,8 +14,9 @@
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
 
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 /// How many peaks under a prediction, in a row, bring it down a step.
@@ -27,7 +28,7 @@ pub const WINDOW: u32 = 64;
 #[serde(transparent)]
 pub struct TaskKind(pub u32);
 
-/// What tasks of one kind held.
+/// What tasks of one kind held: 40 bytes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Estimate {
     /// How many were measured.
@@ -43,6 +44,8 @@ pub struct Estimate {
     #[serde(default)]
     pub below_most: u64,
 }
+
+const _: () = assert!(size_of::<Estimate>() == 40);
 
 impl Estimate {
     fn observe(&mut self, peak: u64) {
@@ -73,12 +76,44 @@ impl Estimate {
     }
 }
 
-/// Each kind's [`Estimate`], learned as tasks finish.
+/// Each kind's [`Estimate`], learned as tasks finish. A predict or an observe is one Fx hash of
+/// the kind's `u32` and one probe; an observe of a kind seen before allocates nothing. Kinds
+/// are written in order of their numbers, by [`Estimates::encode`] and by serde alike.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Estimates {
-    pub by_kind: BTreeMap<TaskKind, Estimate>,
+    #[serde(with = "in_order")]
+    pub by_kind: FxHashMap<TaskKind, Estimate>,
     /// What a task of a kind never measured is predicted to hold.
     pub unseen: u64,
+}
+
+/// [`Estimates::by_kind`] for serde, its kinds in order, so the same estimates give the same
+/// bytes whatever order their kinds were first seen in.
+mod in_order {
+    use rustc_hash::FxHashMap;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{Estimate, TaskKind};
+
+    pub(super) fn serialize<S: Serializer>(
+        by_kind: &FxHashMap<TaskKind, Estimate>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(super::sorted(by_kind))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<FxHashMap<TaskKind, Estimate>, D::Error> {
+        FxHashMap::deserialize(deserializer)
+    }
+}
+
+/// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
+fn sorted(by_kind: &FxHashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
+    let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
+    kinds.sort_unstable_by_key(|it| it.0);
+    kinds
 }
 
 /// The first bytes of [`Estimates::encode`]'s bytes, its version with them.
@@ -89,7 +124,7 @@ const KIND_BYTES: usize = 4 + 4 + 8 * 4;
 impl Estimates {
     /// No kind measured yet, each predicted to hold `unseen`.
     pub fn new(unseen: u64) -> Estimates {
-        Estimates { by_kind: BTreeMap::new(), unseen }
+        Estimates { by_kind: FxHashMap::default(), unseen }
     }
 
     /// The peak a task of `kind` is predicted to hold, in bytes.
@@ -113,7 +148,7 @@ impl Estimates {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&self.unseen.to_le_bytes());
         bytes.extend_from_slice(&(self.by_kind.len() as u64).to_le_bytes());
-        for (kind, estimate) in &self.by_kind {
+        for (kind, estimate) in sorted(&self.by_kind) {
             bytes.extend_from_slice(&kind.0.to_le_bytes());
             bytes.extend_from_slice(&estimate.below.to_le_bytes());
             for it in [estimate.seen, estimate.most, estimate.predicted, estimate.below_most] {
@@ -147,7 +182,8 @@ impl Estimates {
         if count.checked_mul(KIND_BYTES as u64) != Some(rest as u64) {
             return Err(DecodeError::Length { count, bytes: bytes.len() });
         }
-        let mut by_kind = BTreeMap::new();
+        let mut by_kind = FxHashMap::default();
+        by_kind.reserve(count as usize);
         let mut last: Option<u32> = None;
         for chunk in bytes[MAGIC.len() + 16..].chunks_exact(KIND_BYTES) {
             let u32_at = |at: usize| u32::from_le_bytes(chunk[at..at + 4].try_into().expect("4"));
@@ -218,6 +254,8 @@ pub trait Arena {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     struct SplitMix(u64);
@@ -350,6 +388,79 @@ mod tests {
             let (a, b) = (run(), run());
             assert_eq!(a, b, "seed {seed}");
             assert_eq!(a.encode(), b.encode(), "seed {seed}");
+        }
+    }
+
+    /// The bytes [`Estimates::encode`] gave while the kinds were a `BTreeMap`: kinds in order.
+    fn encoded(model: &BTreeMap<TaskKind, Estimate>, unseen: u64) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&unseen.to_le_bytes());
+        bytes.extend_from_slice(&(model.len() as u64).to_le_bytes());
+        for (kind, estimate) in model {
+            bytes.extend_from_slice(&kind.0.to_le_bytes());
+            bytes.extend_from_slice(&estimate.below.to_le_bytes());
+            for it in [estimate.seen, estimate.most, estimate.predicted, estimate.below_most] {
+                bytes.extend_from_slice(&it.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// The hashed table predicts what the ordered map it replaced predicted, after every
+    /// observation of kinds far apart (query kinds, the daemon's own, `u32::MAX`), and its
+    /// bytes are the map's.
+    #[test]
+    fn the_hashed_table_says_what_the_ordered_map_said() {
+        let kinds = [0, 1, 7, 300, 0x6000, 0x1_0001, 0x1_0004, u32::MAX];
+        for seed in 0..100u64 {
+            let mut random = SplitMix(seed);
+            let unseen = random.below(1 << 24);
+            let mut estimates = Estimates::new(unseen);
+            let mut model: BTreeMap<TaskKind, Estimate> = BTreeMap::new();
+            for _ in 0..1500 {
+                let kind = TaskKind(kinds[random.below(kinds.len() as u64) as usize]);
+                let peak = peak(&mut random);
+                estimates.observe(kind, peak);
+                model.entry(kind).or_default().observe(peak);
+                let asked = TaskKind(kinds[random.below(kinds.len() as u64) as usize]);
+                let want = model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
+                assert_eq!(estimates.predict(asked), want, "seed {seed}");
+            }
+            assert_eq!(estimates.by_kind.len(), model.len(), "seed {seed}");
+            assert_eq!(estimates.encode(), encoded(&model, unseen), "seed {seed}");
+        }
+    }
+
+    /// The same estimates, their kinds first seen in another order, give the same bytes, by
+    /// [`Estimates::encode`] and by serde, and come back from both.
+    #[test]
+    fn the_order_kinds_came_in_changes_no_byte() {
+        for seed in 0..50u64 {
+            let mut random = SplitMix(seed);
+            let runs: Vec<(TaskKind, Vec<u64>)> = (0..1 + random.below(40))
+                .map(|kind| {
+                    let kind = TaskKind((kind as u32).wrapping_mul(0x9e37_79b9));
+                    (kind, (0..1 + random.below(200)).map(|_| peak(&mut random)).collect())
+                })
+                .collect();
+            let mut forward = Estimates::new(5);
+            for (kind, peaks) in &runs {
+                for &peak in peaks {
+                    forward.observe(*kind, peak);
+                }
+            }
+            let mut backward = Estimates::new(5);
+            for (kind, peaks) in runs.iter().rev() {
+                for &peak in peaks {
+                    backward.observe(*kind, peak);
+                }
+            }
+            assert_eq!(forward, backward, "seed {seed}");
+            assert_eq!(forward.encode(), backward.encode(), "seed {seed}");
+            let json = serde_json::to_vec(&forward).unwrap();
+            assert_eq!(json, serde_json::to_vec(&backward).unwrap(), "seed {seed}");
+            assert_eq!(serde_json::from_slice::<Estimates>(&json).unwrap(), forward, "seed {seed}");
+            assert_eq!(Estimates::decode(&forward.encode()), Ok(forward), "seed {seed}");
         }
     }
 

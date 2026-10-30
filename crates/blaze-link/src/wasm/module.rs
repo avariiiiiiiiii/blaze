@@ -10,7 +10,6 @@
 //! `u32` columns (its type, the CSR range of its fixups' types). Nothing is allocated per
 //! function but the output itself.
 
-use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
 
 use rayon::prelude::*;
@@ -107,6 +106,8 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
         .enumerate()
         .filter(|(_, it)| matches!(it.class, Class::Text | Class::Patch))
         .collect();
+    // `Placed` is not `Sync` (its `symbol` lookup isn't): the closure takes its contents.
+    let contents: &'a [&'a [u8]] = placed.contents;
     let mut units: Vec<Unit<'a>> = placed
         .functions
         .par_iter()
@@ -122,7 +123,7 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
                         function.addr
                     )
                 })?;
-            let bytes = placed.bytes(index);
+            let bytes = contents[index];
             let at = (function.addr - region.addr) as usize;
             let piece = usize::try_from(function.size)
                 .ok()
@@ -247,38 +248,15 @@ struct Imported<'a> {
     ty: Sig<'a>,
 }
 
-/// What each import is imported as: what the core says (its type encoded into `arena`), or
-/// what a code piece that calls it says.
-fn imports<'a>(
-    placed: &'a Placed<'a>,
-    units: &[Unit<'a>],
-    arena: &'a [u8],
-    spans: &[Option<(usize, usize)>],
-) -> Result<Vec<Imported<'a>>, String> {
-    let mut said: FxHashMap<&'a str, Imported<'a>> = FxHashMap::default();
-    if spans.iter().any(Option::is_none) {
-        for header in units.iter().filter_map(|it| it.header) {
-            for (name, module, field, ty) in header.imports() {
-                said.entry(name).or_insert(Imported { module, field, ty });
-            }
-        }
-    }
+/// What each import is imported as, as the core says (its type encoded into `arena`).
+fn imports<'a>(placed: &'a Placed<'a>, arena: &'a [u8], spans: &[(usize, usize)]) -> Vec<Imported<'a>> {
     placed
         .imports
         .iter()
         .zip(spans)
-        .map(|(import, span)| match (&import.wasm, span) {
-            (Some(wasm), Some((start, end))) => Ok(Imported {
-                module: &wasm.module,
-                field: &wasm.field,
-                ty: &arena[*start..*end],
-            }),
-            _ => said.get(import.name.as_str()).copied().ok_or_else(|| {
-                format!(
-                    "the import `{}`: nothing that refers to it says its module, field and type",
-                    import.name
-                )
-            }),
+        .map(|(import, &(start, end))| {
+            let wasm = import.wasm.as_ref().expect("checked when the spans were made");
+            Imported { module: &wasm.module, field: &wasm.field, ty: &arena[start..end] }
         })
         .collect()
 }
@@ -337,21 +315,26 @@ fn producers(payloads: &[u8]) -> Result<Vec<u8>, String> {
 /// The target_features sections of the objects as one: every feature one uses, an error when
 /// another disallows it.
 fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
-    let mut used = BTreeSet::new();
-    let mut disallowed = BTreeSet::new();
+    // Every object repeats the same few features: collected, then one sort and dedup each.
+    let mut used: Vec<&str> = Vec::new();
+    let mut disallowed: Vec<&str> = Vec::new();
     let mut r = Reader::new(payloads);
     while !r.done() {
         for _ in 0..r.count()? {
             let prefix = r.u8()?;
             let feature = r.name()?;
             match prefix {
-                b'+' | b'=' => used.insert(feature),
-                b'-' => disallowed.insert(feature),
+                b'+' | b'=' => used.push(feature),
+                b'-' => disallowed.push(feature),
                 other => return Err(format!("the target feature prefix {other:#04x}")),
             };
         }
     }
-    if let Some(feature) = used.intersection(&disallowed).next() {
+    for list in [&mut used, &mut disallowed] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    if let Some(feature) = used.iter().find(|it| disallowed.binary_search(it).is_ok()) {
         return Err(format!("the target feature `{feature}` is used by one object and disallowed by another"));
     }
     let mut out = Vec::with_capacity(payloads.len());
@@ -453,13 +436,36 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
                 import.name, import.kind
             ));
         }
-        spans.push(import.wasm.as_ref().map(|wasm| {
-            let start = arena.len();
-            wasm.ty.encode(&mut arena);
-            (start, arena.len())
-        }));
+        // The core makes every wasm import from what an input says it is imported as.
+        let wasm = import.wasm.as_ref().ok_or_else(|| {
+            format!("the import `{}`: no module, field and type for it", import.name)
+        })?;
+        let start = arena.len();
+        wasm.ty.encode(&mut arena);
+        spans.push((start, arena.len()));
     }
-    let imports = imports(placed, &units, &arena, &spans)?;
+    let imports = imports(placed, &arena, &spans);
+    // The core keeps one import per name: a function that says another must not call it.
+    let mut by_name: Option<FxHashMap<&str, Imported<'_>>> = None;
+    for unit in &units {
+        let Some(header) = unit.header else { continue };
+        for (name, module, field, ty) in header.imports() {
+            let by_name = by_name.get_or_insert_with(|| {
+                placed.imports.iter().map(|it| it.name.as_str()).zip(imports.iter().copied()).collect()
+            });
+            if let Some(it) = by_name.get(name)
+                && (it.module, it.field, it.ty) != (module, field, ty)
+            {
+                return Err(format!(
+                    "`{name}` is imported as `{}.{}`, and the function {} says `{module}.{field}` \
+                     or another type",
+                    it.module,
+                    it.field,
+                    unit.name.unwrap_or("?")
+                ));
+            }
+        }
+    }
 
     // Types and the columns of the function bodies: one serial pass over the headers.
     let mut types = Types::with_capacity(imports.len() + 64);
@@ -890,6 +896,7 @@ mod tests {
                 tls: None,
                 id: [0; 16],
                 debug: &self.debug,
+                symbol: &|_| None,
             })
         }
 
@@ -942,6 +949,7 @@ mod tests {
             live: None,
             tags: 0,
             stack: None,
+            windows_subsystem: false,
         };
         let writer = super::super::writer(&output).unwrap();
         let init = piece(&Code { ty: sig(&[], &[]), ..Code::default() }, &[0x00, 0x0b]);
@@ -1006,7 +1014,7 @@ mod tests {
                 version: None,
                 kind: SymbolKind::Function,
                 weak: false,
-                wasm: None,
+                wasm: Some(fd_write()),
             }],
             exports: Vec::new(),
             functions: vec![function(init_at, &init, "init"), function(start_at, &start, "_start")],
@@ -1154,6 +1162,31 @@ mod tests {
         assert_eq!(command().module().unwrap(), command().module().unwrap());
     }
 
+    fn on_threads<R: Send>(threads: usize, run: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(run)
+    }
+
+    #[test]
+    fn one_thread_and_many_write_the_same() {
+        let one = on_threads(1, || command().module().unwrap());
+        assert_eq!(on_threads(8, || command().module().unwrap()), one);
+
+        // Segments of several chunks, and one that ends in a partial chunk.
+        let sources: Vec<Vec<u8>> = [3 * CHUNK + 7, CHUNK, 1]
+            .iter()
+            .enumerate()
+            .map(|(at, &len)| (0..len).map(|it| (it * 7 + at) as u8).collect())
+            .collect();
+        let copied = |threads| {
+            let mut out: Vec<Vec<u8>> = sources.iter().map(|it| vec![0; it.len()]).collect();
+            let jobs = out.iter_mut().map(Vec::as_mut_slice).zip(sources.iter().map(Vec::as_slice));
+            on_threads(threads, || copy_all(jobs.collect()));
+            out
+        };
+        assert_eq!(copied(1), sources);
+        assert_eq!(copied(8), sources);
+    }
+
     #[test]
     fn a_reactor_exports_functions_and_data() {
         let mut image = command();
@@ -1162,7 +1195,6 @@ mod tests {
             exports: vec!["init".to_owned(), "__heap_base".to_owned()],
         };
         image.entry = None;
-        image.imports[0].wasm = Some(fd_write());
         let init = image.functions[0].addr;
         image.exports = vec![
             Export { name: "init".to_owned(), addr: init, size: 4, kind: SymbolKind::Function },
@@ -1285,19 +1317,16 @@ mod tests {
 
     #[test]
     fn imports_need_a_module() {
-        // Neither the core nor any code piece says what `fd_write` is imported as.
         let mut image = command();
-        let code = Code { ty: sig(&[], &[]), export: Some("_start".to_owned()), ..Code::default() };
-        let start = piece(&code, &[0x00, 0x0b]);
-        let init = image.contents[1][..image.functions[0].size as usize].to_vec();
-        image.functions[1].size = start.len() as u64;
-        image.contents[1] = [init, start].concat();
-        image.regions[1].size = image.contents[1].len() as u64;
-        image.regions[1].capacity = image.regions[1].size;
+        image.imports[0].wasm = None;
         let what = image.module().unwrap_err();
         assert!(what.contains("`fd_write`"), "{what}");
-        image.imports[0].wasm = Some(fd_write());
-        image.module().unwrap();
+
+        // `_start`'s header imports `fd_write` from `wasi_snapshot_preview1`.
+        let mut image = command();
+        image.imports[0].wasm.as_mut().unwrap().module = "env".to_owned();
+        let what = image.module().unwrap_err();
+        assert!(what.contains("`env.fd_write`"), "{what}");
     }
 
     #[test]

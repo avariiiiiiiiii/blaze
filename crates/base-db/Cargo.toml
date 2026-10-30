@@ -14,9 +14,9 @@ doctest = false
 
 [dependencies]
 la-arena.workspace = true
-dashmap.workspace = true
 salsa.workspace = true
 rustc-hash.workspace = true
+smallvec.workspace = true
 triomphe.workspace = true
 semver.workspace = true
 tracing.workspace = true

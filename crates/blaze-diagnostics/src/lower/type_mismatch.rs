@@ -25,11 +25,15 @@
 //! The front end does not say why the types had to agree (rustc's `ObligationCause`, requested
 //! in `v2/requests/diagnostics.md`): it is found again here from the syntax around the
 //! expression, which the front end reports at the innermost tail of a block as rustc does.
+//!
+//! Cost: nothing until type checking reports the mismatch. Then O(the syntax from the
+//! expression up to the item, and a `match`'s earlier arms, each typed once): suggestions
+//! compare types as interned ids, never printed.
 
 use base_db::{CrateOrigin, LangCrateOrigin};
 use hir::{AsAssocItem as _, InFile};
 use syntax::{
-    AstNode, SyntaxNode, TextRange,
+    AstNode, SyntaxNode, TextRange, TextSize,
     ast::{self, HasArgList as _, HasName as _},
 };
 
@@ -70,7 +74,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>) -> Vec<Found> {
 /// the syntax shows them.
 enum Context {
     /// An arm after the first that does not diverge: `MatchExpressionArm`.
-    MatchArm { match_expr: ast::MatchExpr, index: usize },
+    /// `prior` is the arms before it that do not diverge, as `block_span` gives them.
+    MatchArm { match_expr: ast::MatchExpr, prior: Vec<TextRange> },
     /// The `else` of an `if`: `IfExpression`.
     Else { if_expr: ast::IfExpr },
     /// The initializer of a `let` with a type.
@@ -100,25 +105,19 @@ fn mismatch(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: &InFile<SyntaxNode
     diag.span_label(span.clone(), sorts(cx, &d.expected, &d.actual));
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     match &context {
-        Context::MatchArm { match_expr, index } => {
-            let arms: Vec<ast::MatchArm> =
-                match_expr.match_arm_list().map(|it| it.arms().collect()).unwrap_or_default();
-            let prior: Vec<Span> = arms[..*index]
-                .iter()
-                .filter_map(|arm| arm.expr())
-                .filter(|expr| !cx.sema.type_of_expr(expr).is_some_and(|it| it.original.is_never()))
-                .map(|expr| in_file(block_span(&expr)))
-                .collect();
+        Context::MatchArm { match_expr, prior } => {
             let t = cx.ty(&d.expected);
             let mut multiline = is_multiline(cx, &span);
             if prior.len() <= 4 {
-                for at in &prior {
-                    multiline |= is_multiline(cx, at);
-                    diag.span_label(at.clone(), format!("this is found to be of type `{t}`"));
+                for &range in prior {
+                    let at = in_file(range);
+                    multiline |= is_multiline(cx, &at);
+                    diag.span_label(at, format!("this is found to be of type `{t}`"));
                 }
-            } else if let Some(at) = prior.last() {
-                multiline |= is_multiline(cx, at);
-                diag.span_label(at.clone(), format!("this and all prior arms are found to be of type `{t}`"));
+            } else if let Some(&range) = prior.last() {
+                let at = in_file(range);
+                multiline |= is_multiline(cx, &at);
+                diag.span_label(at, format!("this and all prior arms are found to be of type `{t}`"));
             }
             let whole = in_file(match_expr.syntax().text_range());
             let outer = match match_expr.expr() {
@@ -264,13 +263,16 @@ fn context(cx: &Cx<'_, '_>, outer: &SyntaxNode) -> Context {
         && arm.expr().is_some_and(|it| it.syntax() == outer)
         && let Some(match_expr) = arm.syntax().parent().and_then(|it| it.parent()).and_then(ast::MatchExpr::cast)
     {
-        let arms: Vec<ast::MatchArm> =
-            match_expr.match_arm_list().map(|it| it.arms().collect()).unwrap_or_default();
-        let index = arms.iter().position(|it| it == &arm).unwrap_or(0);
-        let prior = arms[..index].iter().filter_map(|it| it.expr()).any(|expr| {
-            !cx.sema.type_of_expr(&expr).is_some_and(|it| it.original.is_never())
-        });
-        return if prior { Context::MatchArm { match_expr, index } } else { Context::Plain };
+        let prior: Vec<TextRange> = match_expr
+            .match_arm_list()
+            .into_iter()
+            .flat_map(|it| it.arms())
+            .take_while(|it| it != &arm)
+            .filter_map(|it| it.expr())
+            .filter(|expr| !cx.sema.type_of_expr(expr).is_some_and(|it| it.original.is_never()))
+            .map(|expr| block_span(&expr))
+            .collect();
+        return if prior.is_empty() { Context::Plain } else { Context::MatchArm { match_expr, prior } };
     }
     if let Some(if_expr) = ast::IfExpr::cast(parent.clone()) {
         let is_else = match if_expr.else_branch() {
@@ -672,20 +674,37 @@ fn value_of(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
 /// rustc's suggestions for an expression of the wrong type: borrow it, dereference it, remove
 /// its borrow, convert it with `.to_string()`, or wrap it in the variant of the expected enum
 /// that holds its type.
-fn suggest(
+fn suggest<'t>(
     cx: &Cx<'_, '_>,
     expr: &InFile<ast::Expr>,
-    expected: &hir::Type<'_>,
-    found: &hir::Type<'_>,
+    expected: &hir::Type<'t>,
+    found: &hir::Type<'t>,
     diag: &mut Diag,
 ) {
     let span = cx.span(expr.as_ref().map(|it| it.syntax().text_range()));
     if expr.file_id.is_macro() {
         return;
     }
-    let found_text = cx.ty(found);
+    if let ast::Expr::Literal(lit) = &expr.value
+        && let Some(suffix) = numeric_suffix(lit)
+        && (expected.is_int_or_uint() && found.is_int_or_uint() || expected.is_float() && found.is_float())
+    {
+        let token = lit.token().text_range();
+        let at = TextRange::new(token.end() - suffix, token.end());
+        diag.suggestion_verbose(
+            cx.span(expr.with_value(at)),
+            format!(
+                "change the type of the numeric literal from `{}` to `{}`",
+                cx.ty(found),
+                cx.ty(expected)
+            ),
+            cx.ty(expected),
+            Applicability::MachineApplicable,
+        );
+        return;
+    }
     if let Some((inner, m)) = expected.as_reference()
-        && cx.ty(&inner) == found_text
+        && inner == *found
     {
         let (prefix, how) = if m == hir::Mutability::Mut { ("&mut ", "mutably ") } else { ("&", "") };
         let code = if needs_parens(&expr.value) {
@@ -702,7 +721,7 @@ fn suggest(
         return;
     }
     if let Some((inner, _)) = found.as_reference()
-        && cx.ty(&inner) == cx.ty(expected)
+        && inner == *expected
     {
         if let ast::Expr::RefExpr(r) = &expr.value
             && let Some(operand) = r.expr()
@@ -744,27 +763,25 @@ fn suggest(
 
 /// rustc's `suggest_compatible_variants` of one variant: "try wrapping the expression in
 /// `Some`".
-fn wrap_in_variant(
+fn wrap_in_variant<'t>(
     cx: &Cx<'_, '_>,
     span: &Span,
-    expected: &hir::Type<'_>,
-    found: &hir::Type<'_>,
+    expected: &hir::Type<'t>,
+    found: &hir::Type<'t>,
     diag: &mut Diag,
 ) {
     let Some(hir::Adt::Enum(e)) = expected.as_adt() else { return };
     let args: Vec<hir::Type<'_>> = expected.type_arguments().collect();
-    let found_text = cx.ty(found);
-    let compatible: Vec<hir::EnumVariant> = e
-        .variants(cx.db)
-        .into_iter()
-        .filter(|v| {
-            let fields = v.fields(cx.db);
-            matches!(v.kind(cx.db), hir::StructKind::Tuple)
-                && fields.len() == 1
-                && cx.ty(&fields[0].ty(cx.db).instantiate_type_params(args.iter())) == found_text
-        })
-        .collect();
-    let [variant] = compatible.as_slice() else { return };
+    let mut compatible = e.variants(cx.db).into_iter().filter(|v| {
+        if matches!(v.kind(cx.db), hir::StructKind::Tuple)
+            && let [field] = v.fields(cx.db).as_slice()
+        {
+            field.ty(cx.db).instantiate_type_params(args.iter()) == *found
+        } else {
+            false
+        }
+    });
+    let (Some(variant), None) = (compatible.next(), compatible.next()) else { return };
     let enum_name = e.name(cx.db);
     let in_prelude = matches!(enum_name.as_str(), "Option" | "Result")
         && matches!(e.module(cx.db).krate(cx.db).origin(cx.db), CrateOrigin::Lang(_));
@@ -779,6 +796,16 @@ fn wrap_in_variant(
         vec![(span.shrink_to_lo(), format!("{path}(")), (span.shrink_to_hi(), ")".to_owned())],
         Applicability::MaybeIncorrect,
     );
+}
+
+/// The length of a numeric literal's type suffix (`f64` of `1f64`).
+fn numeric_suffix(lit: &ast::Literal) -> Option<TextSize> {
+    let suffix = match lit.kind() {
+        ast::LiteralKind::IntNumber(it) => it.suffix().map(str::len),
+        ast::LiteralKind::FloatNumber(it) => it.suffix().map(str::len),
+        _ => None,
+    }?;
+    TextSize::try_from(suffix).ok()
 }
 
 fn is_string(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {

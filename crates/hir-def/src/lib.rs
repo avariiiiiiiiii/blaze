@@ -144,10 +144,38 @@ impl<N: AstIdNode> Eq for ItemLoc<N> {}
 
 impl<N: AstIdNode> Hash for ItemLoc<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.container.hash(state);
-        self.id.hash(state);
+        let ItemLoc { container, id } = *self;
+        container.hash(state);
+        let word = hash_ast_id(id, state);
+        state.write_u64(word);
     }
 }
+
+/// Hashes the id of `id`'s file alone and returns the rest of `id` as the low 40 bits of a word
+/// (the file-local id, then the file's variant), for a loc to fill the high bits with its own
+/// small fields and hash the word once.
+#[inline]
+fn hash_ast_id<N, H: Hasher>(id: AstId<N>, state: &mut H) -> u64 {
+    let file: u64 = match id.file_id {
+        HirFileId::FileId(it) => {
+            it.hash(state);
+            0
+        }
+        HirFileId::MacroFile(it) => {
+            it.hash(state);
+            1
+        }
+    };
+    u64::from(id.value.erase().into_raw()) | file << 32
+}
+
+// An `AstId` is 16 bytes: the file 12 (a tag word and an id), the file-local id 4.
+const _: () = assert!(size_of::<AstId<ast::Struct>>() == 16);
+
+// 24 bytes per item (module 8, `AstId` 16), no padding; hashed in 3 Fx rounds (module, file,
+// file-local id with the file's variant).
+const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 24);
+const _: () = assert!(align_of::<ItemLoc<ast::Struct>>() == 4);
 
 impl<N: AstIdNode> HasModule for ItemLoc<N> {
     #[inline]
@@ -181,10 +209,17 @@ impl<N: AstIdNode> Eq for AssocItemLoc<N> {}
 
 impl<N: AstIdNode> Hash for AssocItemLoc<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.container.hash(state);
-        self.id.hash(state);
+        let AssocItemLoc { container, id } = *self;
+        let container = container.hash_id(state);
+        let word = hash_ast_id(id, state);
+        state.write_u64(word | u64::from(container) << 40);
     }
 }
+
+// 28 bytes per item (container 12: a tag word and an id, `AstId` 16); hashed in 3 Fx rounds
+// (container, file, file-local id with both variants).
+const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 28);
+const _: () = assert!(align_of::<AssocItemLoc<ast::Fn>>() == 4);
 
 impl<N: AstIdNode> HasModule for AssocItemLoc<N> {
     #[inline]
@@ -347,13 +382,27 @@ impl ImplId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinDeriveImplLoc {
     pub adt: AdtId,
     pub trait_: BuiltinDeriveImplTrait,
     pub derive_attr_id: AttrId,
     pub derive_index: u32,
 }
+
+impl Hash for BuiltinDeriveImplLoc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let BuiltinDeriveImplLoc { adt, trait_, derive_attr_id, derive_index } = *self;
+        let adt = adt.hash_id(state);
+        derive_attr_id.hash(state);
+        state.write_u64(
+            u64::from(derive_index) | u64::from(adt) << 32 | u64::from(trait_ as u8) << 40,
+        );
+    }
+}
+
+// 24 bytes per impl (adt 12, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.
+const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 24);
 
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 #[derive(PartialOrd, Ord)]
@@ -377,7 +426,7 @@ impl ExternBlockId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumVariantLoc {
     pub id: AstId<ast::Variant>,
     pub parent: EnumId,
@@ -385,6 +434,20 @@ pub struct EnumVariantLoc {
 }
 impl_intern!(EnumVariantId, EnumVariantLoc);
 impl_loc!(EnumVariantLoc, id: Variant, parent: EnumId);
+
+impl Hash for EnumVariantLoc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let EnumVariantLoc { id, parent, name } = self;
+        let word = hash_ast_id(*id, state);
+        state.write_u64(word);
+        parent.hash(state);
+        name.hash(state);
+    }
+}
+
+// 32 bytes per variant (`AstId` 16, enum 8, name 8), no padding; hashed in 4 Fx rounds (file,
+// file-local id, enum, name).
+const _: () = assert!(size_of::<EnumVariantLoc>() == 32);
 
 impl EnumVariantLoc {
     pub fn index(&self, db: &dyn SourceDatabase) -> usize {
@@ -415,7 +478,7 @@ impl EnumVariantId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Macro2Loc {
     pub container: ModuleId,
     pub id: AstId<ast::MacroDef>,
@@ -426,7 +489,23 @@ pub struct Macro2Loc {
 impl_intern!(Macro2Id, Macro2Loc);
 impl_loc!(Macro2Loc, id: MacroDef, container: ModuleId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+impl Hash for Macro2Loc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Macro2Loc { container, id, expander, allow_internal_unsafe, edition } = *self;
+        container.hash(state);
+        let word = hash_ast_id(id, state);
+        state.write_u64(
+            word | u64::from(expander.hash_word()) << 40
+                | (u64::from(allow_internal_unsafe) | u64::from(edition as u8) << 1) << 56,
+        );
+    }
+}
+
+// 28 bytes per macro (module 8, `AstId` 16, expander 2, flag 1, edition 1), no padding; hashed
+// in 3 Fx rounds.
+const _: () = assert!(size_of::<Macro2Loc>() == 28);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacroRulesLoc {
     pub container: ModuleId,
     pub id: AstId<ast::MacroRules>,
@@ -436,6 +515,22 @@ pub struct MacroRulesLoc {
 }
 impl_intern!(MacroRulesId, MacroRulesLoc);
 impl_loc!(MacroRulesLoc, id: MacroRules, container: ModuleId);
+
+impl Hash for MacroRulesLoc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let MacroRulesLoc { container, id, expander, flags, edition } = *self;
+        container.hash(state);
+        let word = hash_ast_id(id, state);
+        state.write_u64(
+            word | u64::from(expander.hash_word()) << 40
+                | (u64::from(flags.bits()) | u64::from(edition as u8) << 3) << 56,
+        );
+    }
+}
+
+// 28 bytes per macro (module 8, `AstId` 16, expander 2, flags 1, edition 1), no padding; hashed
+// in 3 Fx rounds.
+const _: () = assert!(size_of::<MacroRulesLoc>() == 28);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -456,7 +551,26 @@ pub enum MacroExpander {
     UnimplementedBuiltIn,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+const _: () = assert!(size_of::<MacroExpander>() == 2);
+
+impl MacroExpander {
+    /// The variant in the high byte and its payload in the low one, so a loc hashes the expander
+    /// with its other small fields in one word.
+    #[inline]
+    fn hash_word(self) -> u16 {
+        let (variant, payload): (u8, u8) = match self {
+            MacroExpander::Declarative { styles } => (0, styles.bits()),
+            MacroExpander::BuiltIn(it) => (1, it as u8),
+            MacroExpander::BuiltInAttr(it) => (2, it as u8),
+            MacroExpander::BuiltInDerive(it) => (3, it as u8),
+            MacroExpander::BuiltInEager(it) => (4, it as u8),
+            MacroExpander::UnimplementedBuiltIn => (5, 0),
+        };
+        u16::from(variant) << 8 | u16::from(payload)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcMacroLoc {
     pub container: ModuleId,
     pub id: AstId<ast::Fn>,
@@ -466,6 +580,20 @@ pub struct ProcMacroLoc {
 }
 impl_intern!(ProcMacroId, ProcMacroLoc);
 impl_loc!(ProcMacroLoc, id: Fn, container: ModuleId);
+
+impl Hash for ProcMacroLoc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let ProcMacroLoc { container, id, expander, kind, edition } = *self;
+        container.hash(state);
+        let word = hash_ast_id(id, state);
+        expander.hash(state);
+        state.write_u64(word | u64::from(kind as u8) << 40 | u64::from(edition as u8) << 48);
+    }
+}
+
+// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);
+// hashed in 4 Fx rounds (module, file, expander, the rest in one word).
+const _: () = assert!(size_of::<ProcMacroLoc>() == 32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum LoweringMode {
@@ -734,6 +862,32 @@ pub enum ItemContainerId {
 }
 impl_from!(ModuleId for ItemContainerId);
 
+impl ItemContainerId {
+    /// Hashes the container's id alone and returns its variant, for a loc to hash beside its
+    /// own small fields in one word.
+    #[inline]
+    fn hash_id<H: Hasher>(self, state: &mut H) -> u8 {
+        match self {
+            ItemContainerId::ExternBlockId(it) => {
+                it.hash(state);
+                0
+            }
+            ItemContainerId::ModuleId(it) => {
+                it.hash(state);
+                1
+            }
+            ItemContainerId::ImplId(it) => {
+                it.hash(state);
+                2
+            }
+            ItemContainerId::TraitId(it) => {
+                it.hash(state);
+                3
+            }
+        }
+    }
+}
+
 /// A Data Type
 #[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum AdtId {
@@ -742,6 +896,27 @@ pub enum AdtId {
     EnumId(EnumId),
 }
 impl_from!(StructId, UnionId, EnumId for AdtId);
+
+impl AdtId {
+    /// Hashes the adt's id alone and returns its variant, as [`ItemContainerId::hash_id`].
+    #[inline]
+    fn hash_id<H: Hasher>(self, state: &mut H) -> u8 {
+        match self {
+            AdtId::StructId(it) => {
+                it.hash(state);
+                0
+            }
+            AdtId::UnionId(it) => {
+                it.hash(state);
+                1
+            }
+            AdtId::EnumId(it) => {
+                it.hash(state);
+                2
+            }
+        }
+    }
+}
 
 /// A macro
 #[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
@@ -1567,4 +1742,204 @@ pub fn include_macro_invoc(
         .flat_map(|(_, m)| m.scope(db).iter_macro_invoc())
         .filter_map(|(_, &invoc)| invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x)))
         .collect()
+}
+
+#[cfg(test)]
+mod loc_hash_tests {
+    use std::{
+        fmt::Debug,
+        hash::{BuildHasher, Hash},
+    };
+
+    use hir_expand::{
+        EditionedFileId, HirFileId, InFile, MacroCallId, MacroCallStyles,
+        attrs::AttrId,
+        builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
+        name::Name,
+        proc_macro::{CustomProcMacroExpander, ProcMacroKind},
+    };
+    use intern::Symbol;
+    use rustc_hash::{FxBuildHasher, FxHashSet};
+    use salsa::plumbing::FromId;
+    use span::{Edition, ErasedFileAstId, FileAstId};
+    use syntax::ast;
+
+    use super::*;
+
+    fn hash<T: Hash>(it: &T) -> u64 {
+        FxBuildHasher.hash_one(it)
+    }
+
+    /// An id of a salsa struct whose data no test reads.
+    fn salsa_id<T: FromId>(index: u32) -> T {
+        T::from_id(salsa::Id::from_bits(u64::from(index)))
+    }
+
+    fn ast_ids<N: AstIdNode>() -> [AstId<N>; 4] {
+        let raw = |it| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(it));
+        [
+            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(7)),
+            InFile::new(HirFileId::MacroFile(salsa_id::<MacroCallId>(3)), raw(7)),
+            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(4)), raw(7)),
+            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(8)),
+        ]
+    }
+
+    fn containers() -> [ItemContainerId; 5] {
+        [
+            ItemContainerId::ModuleId(salsa_id(5)),
+            ItemContainerId::ImplId(salsa_id(5)),
+            ItemContainerId::TraitId(salsa_id(5)),
+            ItemContainerId::ExternBlockId(salsa_id(5)),
+            ItemContainerId::ModuleId(salsa_id(6)),
+        ]
+    }
+
+    fn adts() -> [AdtId; 4] {
+        [
+            AdtId::StructId(salsa_id(5)),
+            AdtId::UnionId(salsa_id(5)),
+            AdtId::EnumId(salsa_id(5)),
+            AdtId::StructId(salsa_id(6)),
+        ]
+    }
+
+    fn expanders() -> Vec<MacroExpander> {
+        let mut all: Vec<_> = (0..8)
+            .map(|bits| MacroExpander::Declarative { styles: MacroCallStyles::from_bits_retain(bits) })
+            .collect();
+        all.extend(BuiltinFnLikeExpander::ALL.iter().map(|&it| MacroExpander::BuiltIn(it)));
+        all.extend(BuiltinAttrExpander::ALL.iter().map(|&it| MacroExpander::BuiltInAttr(it)));
+        all.extend(BuiltinDeriveExpander::ALL.iter().map(|&it| MacroExpander::BuiltInDerive(it)));
+        all.extend(EagerExpander::ALL.iter().map(|&it| MacroExpander::BuiltInEager(it)));
+        all.push(MacroExpander::UnimplementedBuiltIn);
+        all
+    }
+
+    /// The values differ from each other in one or a few fields: a packed hash must still tell
+    /// each unequal pair apart, as the derived one did, and agree with `Eq`.
+    #[track_caller]
+    fn check<T: Hash + Eq + Debug>(values: &[T]) {
+        for a in values {
+            for b in values {
+                assert_eq!(a == b, hash(a) == hash(b), "{a:?} and {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn item_locs() {
+        let mut locs = Vec::new();
+        for id in ast_ids::<ast::Struct>() {
+            locs.push(ItemLoc { container: salsa_id(5), id });
+        }
+        locs.push(ItemLoc { container: salsa_id(6), id: ast_ids()[0] });
+        check(&locs);
+    }
+
+    #[test]
+    fn assoc_item_locs() {
+        let mut locs = Vec::new();
+        for container in containers() {
+            for id in ast_ids::<ast::Fn>() {
+                locs.push(AssocItemLoc { container, id });
+            }
+        }
+        check(&locs);
+    }
+
+    #[test]
+    fn enum_variant_locs() {
+        let mut locs = Vec::new();
+        for id in ast_ids() {
+            for parent in [salsa_id::<EnumId>(5), salsa_id(6)] {
+                for name in ["A", "B"] {
+                    let name = Name::new_symbol_root(Symbol::intern(name));
+                    locs.push(EnumVariantLoc { id, parent, name });
+                }
+            }
+        }
+        check(&locs);
+    }
+
+    #[test]
+    fn expander_words_are_distinct() {
+        let all = expanders();
+        let words: FxHashSet<u16> = all.iter().map(|it| it.hash_word()).collect();
+        assert_eq!(words.len(), all.len());
+    }
+
+    #[test]
+    fn macro_locs() {
+        let base = Macro2Loc {
+            container: salsa_id(5),
+            id: ast_ids()[0],
+            expander: MacroExpander::UnimplementedBuiltIn,
+            allow_internal_unsafe: false,
+            edition: Edition::Edition2015,
+        };
+        let mut locs = vec![base];
+        locs.push(Macro2Loc { container: salsa_id(6), ..base });
+        locs.extend(ast_ids().into_iter().skip(1).map(|id| Macro2Loc { id, ..base }));
+        locs.extend(expanders().into_iter().skip(1).map(|expander| Macro2Loc { expander, ..base }));
+        locs.push(Macro2Loc { allow_internal_unsafe: true, ..base });
+        locs.push(Macro2Loc { edition: Edition::Edition2021, ..base });
+        locs.push(Macro2Loc { allow_internal_unsafe: true, edition: Edition::Edition2021, ..base });
+        check(&locs);
+
+        let base = MacroRulesLoc {
+            container: salsa_id(5),
+            id: ast_ids()[0],
+            expander: MacroExpander::Declarative { styles: MacroCallStyles::FN_LIKE },
+            flags: MacroRulesLocFlags::empty(),
+            edition: Edition::Edition2015,
+        };
+        let mut locs = vec![base];
+        locs.push(MacroRulesLoc { container: salsa_id(6), ..base });
+        locs.extend(ast_ids().into_iter().skip(1).map(|id| MacroRulesLoc { id, ..base }));
+        locs.extend(expanders().into_iter().map(|expander| MacroRulesLoc { expander, ..base }));
+        locs.extend(
+            (1..8).map(|bits| MacroRulesLoc {
+                flags: MacroRulesLocFlags::from_bits_retain(bits),
+                ..base
+            }),
+        );
+        locs.push(MacroRulesLoc { edition: Edition::Edition2021, ..base });
+        check(&locs);
+
+        let base = ProcMacroLoc {
+            container: salsa_id(5),
+            id: ast_ids()[0],
+            expander: CustomProcMacroExpander::new(0),
+            kind: ProcMacroKind::Bang,
+            edition: Edition::Edition2015,
+        };
+        let mut locs = vec![base];
+        locs.push(ProcMacroLoc { container: salsa_id(6), ..base });
+        locs.extend(ast_ids().into_iter().skip(1).map(|id| ProcMacroLoc { id, ..base }));
+        locs.push(ProcMacroLoc { expander: CustomProcMacroExpander::new(1), ..base });
+        locs.push(ProcMacroLoc { expander: CustomProcMacroExpander::disabled(), ..base });
+        locs.push(ProcMacroLoc { kind: ProcMacroKind::Attr, ..base });
+        locs.push(ProcMacroLoc { kind: ProcMacroKind::CustomDerive, ..base });
+        locs.push(ProcMacroLoc { edition: Edition::Edition2021, ..base });
+        check(&locs);
+    }
+
+    #[test]
+    fn builtin_derive_impl_locs() {
+        let mut locs = Vec::new();
+        for adt in adts() {
+            for &trait_ in BuiltinDeriveImplTrait::ALL {
+                for (attr, index) in [(0, 0), (1, 0), (0, 1)] {
+                    locs.push(BuiltinDeriveImplLoc {
+                        adt,
+                        trait_,
+                        derive_attr_id: AttrId::from_item_tree_index(attr),
+                        derive_index: index,
+                    });
+                }
+            }
+        }
+        check(&locs);
+    }
 }

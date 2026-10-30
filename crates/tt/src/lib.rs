@@ -27,10 +27,8 @@ use stdx::{impl_from, itertools::Itertools as _};
 pub use span::Span;
 pub use text_size::{TextRange, TextSize};
 
-use crate::storage::TokenTreesSlice;
-
 pub use self::iter::{TtElement, TtIter};
-pub use self::storage::{TopSubtree, TopSubtreeBuilder};
+pub use self::storage::{SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder};
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
 
@@ -115,14 +113,6 @@ impl Leaf {
             Leaf::Ident(it) => &it.span,
         }
     }
-
-    fn symbol(&self) -> Option<&Symbol> {
-        match self {
-            Leaf::Literal(Literal { text_and_suffix: symbol, .. })
-            | Leaf::Ident(Ident { sym: symbol, .. }) => Some(symbol),
-            Leaf::Punct(_) => None,
-        }
-    }
 }
 impl_from!(Literal, Punct, Ident for Leaf);
 
@@ -139,16 +129,20 @@ impl Subtree {
     }
 }
 
+/// The token trees `start..end` of `tree`, whole subtrees: 16 bytes, copied freely.
 #[derive(Clone, Copy)]
 pub struct TokenTreesView<'a> {
-    slice: TokenTreesSlice<'a>,
-    len: usize,
+    tree: &'a TopSubtree,
+    start: u32,
+    end: u32,
 }
+
+const _: () = assert!(size_of::<TokenTreesView<'_>>() == 16);
 
 impl<'a> TokenTreesView<'a> {
     #[inline]
     pub fn empty() -> Self {
-        Self { slice: TokenTreesSlice::empty(), len: 0 }
+        Self { tree: storage::empty_tree(), start: 0, end: 0 }
     }
 
     pub fn iter(&self) -> TtIter<'a> {
@@ -159,18 +153,20 @@ impl<'a> TokenTreesView<'a> {
         Cursor::new(*self)
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        (self.end - self.start) as usize
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.start == self.end
     }
 
     pub fn try_into_subtree(self) -> Option<SubtreeView<'a>> {
-        let is_subtree = self.iter_flat_tokens().next().is_some_and(
-            |it| matches!(it, TokenTree::Subtree(subtree) if subtree.usize_len() == self.len - 1),
-        );
+        let is_subtree = !self.is_empty()
+            && self.tree.is_subtree(self.start)
+            && self.tree.subtree_len(self.start) == self.end - self.start - 1;
         if is_subtree { Some(SubtreeView(self)) } else { None }
     }
 
@@ -205,29 +201,18 @@ impl<'a> TokenTreesView<'a> {
     }
 
     pub fn first_span(&self) -> Option<Span> {
-        self.iter_flat_tokens().next().map(|it| it.first_span())
+        (!self.is_empty()).then(|| self.tree.first_span_at(self.start))
     }
 
-    /// Note: this is quite expensive, this needs to decode the whole view,
-    /// although it "tricks" by skipping subtrees (since we know their byte length).
+    /// The span of the last token: the last token tree in the view's preorder, which is a leaf
+    /// or a subtree without token trees, whose closing span it is.
     pub fn last_span(&self) -> Option<Span> {
-        let mut iter = self.iter();
-        loop {
-            match iter.last()? {
-                TtElement::Leaf(leaf) => return Some(*leaf.span()),
-                TtElement::Subtree(subtree, tt_iter) => {
-                    if subtree.len == 0 {
-                        return Some(subtree.delimiter.close);
-                    } else {
-                        iter = tt_iter;
-                    }
-                }
-            }
-        }
+        (!self.is_empty()).then(|| self.tree.last_span_at(self.end - 1))
     }
 
     pub fn iter_flat_tokens(&self) -> impl Iterator<Item = TokenTree> + use<'a> {
-        self.slice.iter().take(self.len)
+        let tree = self.tree;
+        (self.start..self.end).map(move |at| tree.token_tree_at(at))
     }
 }
 
@@ -303,10 +288,7 @@ impl<'a> SubtreeView<'a> {
     }
 
     pub fn top_subtree(&self) -> Subtree {
-        let Some(TokenTree::Subtree(subtree)) = self.0.iter_flat_tokens().next() else {
-            unreachable!("the first token tree is always the top subtree");
-        };
-        subtree
+        self.0.tree.subtree_at(self.0.start)
     }
 
     pub fn strip_invisible(&self) -> TokenTreesView<'a> {
@@ -318,10 +300,7 @@ impl<'a> SubtreeView<'a> {
     }
 
     pub fn token_trees(&self) -> TokenTreesView<'a> {
-        let mut result = self.0;
-        result.slice.advance();
-        result.len -= 1;
-        result
+        TokenTreesView { start: self.0.start + 1, ..self.0 }
     }
 }
 
@@ -473,16 +452,20 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
 
     let (lit, suffix) = text.split_at(suffix_start as usize);
     let lit = &lit[start_offset..lit.len() - end_offset];
-    let suffix = match suffix {
-        "" | "_" => "",
+    match suffix {
+        "" | "_" => Literal::new_no_suffix(lit, span, kind),
         // ill-suffixed literals
         _ if !matches!(kind, LitKind::Integer | LitKind::Float | LitKind::Err(_)) => {
-            return Literal::new_no_suffix(text, span, LitKind::Err(()));
+            Literal::new_no_suffix(text, span, LitKind::Err(()))
         }
-        suffix => suffix,
-    };
-
-    Literal::new(lit, span, kind, suffix)
+        // A number has no quotes, so its text and suffix are the token's text.
+        suffix => Literal {
+            text_and_suffix: Symbol::intern(text),
+            span,
+            kind,
+            suffix_len: suffix.len().try_into().unwrap(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

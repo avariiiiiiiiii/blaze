@@ -225,3 +225,108 @@ never contended); `hir-def/src/nameres/frozen.rs:113` (`Check`/`Verify` modes on
 crate); and the test databases (`hir-def/src/test_db.rs`, `hir/src/tests/db.rs`).
 
 > forwarded to db: every finding is in lane db's own crates (`blaze-query`, `vendor/salsa`, the front end); lane db is still running.
+
+## speed-hir-store: hir onto the HIR column views (from speed-hir-store-tools)
+
+From speed-hir-store-tools, 2026-10-29. 30 sites in 5 files of `crates/hir/src/`. The rule is
+"## format-hir: expressions and patterns become columns" in `v2/requests/format.md` (contract:
+`~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md`). These land together with the
+format-hir change. No site builds an `Expr`/`Pat`, uses `ExpressionStoreBuilder`, stores, hashes
+or compares a view, and no borrow changes: every store here is a `&ExpressionStore`/`&Body`, so a
+view borrows the store, not `self`.
+
+**Depends on `crates/hir-ide/` (coordinator):** `source_analyzer.rs` calls
+`hir_ide::diagnostics::{record_literal_missing_fields, record_pattern_missing_fields}`
+(`crates/hir-ide/src/diagnostics/expr.rs:647`, `:690`), which take `expr: &Expr` / `pat: &Pat`.
+The edits below pass `body.expr(expr_id)` / `body.pat(pat_id)`, so those two parameters become
+`expr: Expr<'_>` / `pat: Pat<'_>` (rule 3) in the same change; the request is filed in
+`v2/requests/speed.md` under "## speed-hir-store: coordinator-owned consumers".
+
+Files that import the HIR types and need no change: `display.rs` (only `TypeRef` indexing),
+`from_id.rs`, `has_source.rs`, `term_search.rs`, `term_search/` (their `Expr` is
+`crate::term_search::Expr`, not HIR's). Imports stay as they are in every file.
+
+### crates/hir/src/lib.rs  (8 sites)
+- ~L2003  `&body[body.params[self.idx - body.self_param.is_some() as usize].user_written]`  ->  `body.pat(body.params[self.idx - body.self_param.is_some() as usize].user_written)`
+- ~L2008, ~L2026 (both in `Param::as_local`, the only two in the file)  `binding_id: *id,`  ->  `binding_id: id,`
+- ~L2020  `if let Expr::Closure { args, .. } = &store[c.expr]`  ->  `if let Expr::Closure { args, .. } = store.expr(c.expr)`
+- ~L2021  `&& let Pat::Bind { id, .. } = &store[args[self.idx]]`  ->  `&& let Pat::Bind { id, .. } = store.pat(args[self.idx])`
+- ~L4404  `ExprOrPatId::ExprId(expr) => matches!(store[expr], Expr::Ref { .. }),`  ->  `ExprOrPatId::ExprId(expr) => matches!(store.expr(expr), Expr::Ref { .. }),`
+- ~L4406  `ExprOrPatId::PatId(pat) => match store[pat] {`  ->  `ExprOrPatId::PatId(pat) => match store.pat(pat) {`
+- ~L5948  `match &body[self.expr] {`  ->  `match body.expr(self.expr) {` (the arm `hir_def::hir::Expr::InlineAsm(e) => e.operands.get(self.index)?.0.clone()` is unchanged: `e` is `&InlineAsm`)
+
+### crates/hir/src/diagnostics.rs  (3 sites)
+- ~L1409  `Err(_) => match &body[expr] {`  ->  `Err(_) => match body.expr(expr) {`
+- ~L1411  `match source_map.expr_syntax(*inner) {`  ->  `match source_map.expr_syntax(inner) {`
+- ~L1414  `.format_args_implicit_capture(*inner)?`  ->  `.format_args_implicit_capture(inner)?`
+- ~L1425 `body.exprs().find(|&(it, _)| {` stays: the item is `(ExprId, Expr<'_>)` and `&(it, _)` copies the id out of the reference `find` passes.
+
+### crates/hir/src/semantics.rs  (5 sites)
+- ~L1681  `match &body[expr_id] {`  ->  `match body.expr(expr_id) {` (in `collect_returns`)
+- ~L2440  `&& let Expr::Block { unsafe_: Unsafe::Yes, .. } = body[expr_id]`  ->  `&& let Expr::Block { unsafe_: Unsafe::Yes, .. } = body.expr(expr_id)`
+- ~L2527  `if let Expr::Path(path) = &store[expr_id] {`  ->  `if let Expr::Path(path) = store.expr(expr_id) {` (`path` is `&Path` borrowed from `store`, so it still outlives the arm)
+- ~L2554  `if let Expr::Assignment { target, .. } = store[expr_id] {`  ->  `if let Expr::Assignment { target, .. } = store.expr(expr_id) {`
+- ~L2941  `match &self.body[expr] {`  ->  `match self.body.expr(expr) {` (`self.body: &'a ExpressionStore`, so `path` borrows the store, not `self`, and the `&mut self` calls in the arm still compile)
+
+### crates/hir/src/semantics/source_to_def.rs  (2 sites)
+- ~L402  `if let crate::Pat::Bind { id, .. } = store[pat_id] {`  ->  `if let crate::Pat::Bind { id, .. } = store.pat(pat_id) {`
+- ~L440  `let (Expr::Break { label, .. } | Expr::Continue { label }) = store[break_or_continue]`  ->  `let (Expr::Break { label, .. } | Expr::Continue { label }) = store.expr(break_or_continue)`
+
+### crates/hir/src/source_analyzer.rs  (12 sites)
+- ~L437  `if let Pat::Bind { id, .. } = self.store()?[pat_id.as_pat()?] { Some(id) } else { None }`  ->  `if let Pat::Bind { id, .. } = self.store()?.pat(pat_id.as_pat()?) { Some(id) } else { None }`
+- ~L525  `&& let Expr::Block { tail: Some(tail), .. } = store[expr_id]`  ->  `&& let Expr::Block { tail: Some(tail), .. } = store.expr(expr_id)`
+- ~L707  `if let Expr::Field { expr: object_expr, name: _ } = body[field_expr] {`  ->  `if let Expr::Field { expr: object_expr, name: _ } = body.expr(field_expr) {`
+- ~L1051  `ExprOrPatId::ExprId(idx) => match &store[idx] {`  ->  `ExprOrPatId::ExprId(idx) => match store.expr(idx) {`
+- ~L1055  `ExprOrPatId::PatId(idx) => match &store[idx] {`  ->  `ExprOrPatId::PatId(idx) => match store.pat(idx) {` (both arms' `path` is `&'db Path` from `store: &'db ExpressionStore`, as before)
+- ~L1519  `record_literal_missing_fields(db, infer, expr_id, &body[expr_id])?;`  ->  `record_literal_missing_fields(db, infer, expr_id, body.expr(expr_id))?;` (needs the hir-ide signature change above)
+- ~L1535  `record_literal_matched_fields(db, infer, expr_id, &body[expr_id])?;`  ->  `record_literal_matched_fields(db, infer, expr_id, body.expr(expr_id))?;`
+- ~L1553  `record_pattern_missing_fields(db, infer, pat_id, &body[pat_id])?;`  ->  `record_pattern_missing_fields(db, infer, pat_id, body.pat(pat_id))?;` (needs the hir-ide signature change above)
+- ~L1570  `record_pattern_matched_fields(db, infer, pat_id, &body[pat_id])?;`  ->  `record_pattern_matched_fields(db, infer, pat_id, body.pat(pat_id))?;`
+- ~L2180 (in `fn record_literal_matched_fields`)  `    expr: &Expr,`  ->  `    expr: Expr<'_>,` (the body's `Expr::RecordLit { fields, spread, .. } => (fields, spread)` is unchanged: `fields: &[RecordLitField]`, `spread: RecordSpread` by value, unused)
+- ~L2212 (in `fn record_pattern_matched_fields`)  `    pat: &Pat,`  ->  `    pat: Pat<'_>,`
+- ~L2215  `Pat::Record { path: _, args, ellipsis } => (args, *ellipsis),`  ->  `Pat::Record { path: _, args, ellipsis } => (args, ellipsis),`
+
+## From speed-hir-nameres: `UnconfiguredCode` keeps no `CfgOptions` (2026-10-29)
+
+`hir_def::nameres::diagnostics::DefDiagnosticKind::UnconfiguredCode` lost its `opts: CfgOptions`
+field (a clone of the crate's whole cfg set per cfg'd-out item; the options are always the
+crate's). In `crates/hir/src/diagnostics.rs:868-877` replace
+```rust
+DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts } => {
+```
+with
+```rust
+DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
+```
+and `opts: opts.clone(),` with `opts: self.krate.cfg_options(self.db).clone(),` (`self.krate` is
+the `base_db::Crate` whose def map's diagnostics these are). The clone now happens only when an
+`InactiveCode` diagnostic is emitted, not once per disabled item at collection.
+
+## speed-hir-store: hir onto the HIR column views, type refs (from speed-hir-store-tools)
+
+From speed-hir-store-tools, 2026-10-29. The type-ref half of the block "## speed-hir-store: hir
+onto the HIR column views" above: apply both in the same edit of each file. `TypeRef` becomes a
+view too (`store.type_ref(t)`, API in the addendum of
+`~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`; `Index<TypeRefId>` goes,
+`Index<PathId>` and `Index<LifetimeRefId>` stay). 10 sites in 4 files. Every store is a
+`&ExpressionStore` from a signature, so no borrow changes. `TypeBound` stays owned, so
+`&TypeBound::Path(path, _)` patterns and `store[path]` (a `PathId`) stay. `pub use
+hir_def::type_ref::TypeRef` in `lib.rs` now re-exports the view; only `blaze-diagnostics`
+imports it and reads it through `hir_def` already.
+
+### crates/hir/src/lib.rs  (1 site)
+- ~L2053  `.map(|&param| match &func_data.store[param] {`  ->  `.map(|&param| match func_data.store.type_ref(param) {` (`TypeRef::Reference(ref_) => match ref_.mutability` is unchanged)
+
+### crates/hir/src/display.rs  (6 sites)
+- ~L249 and ~L273 (both in the fn display of a function's return type, the only two in the file)  `match &data.store[ret_type] {`  ->  `match data.store.type_ref(ret_type) {` (`TypeRef::ImplTrait(bounds) => match &bounds[0]` and `TypeRef::Tuple(tup) if tup.is_empty()` are unchanged)
+- ~L327  `match &data.store[param] {`  ->  `match data.store.type_ref(param) {`
+- ~L329  `TypeRef::Reference(ref_) if matches!(&data.store[ref_.ty], TypeRef::Path(p) if p.is_self_type()) =>`  ->  `TypeRef::Reference(ref_) if matches!(data.store.type_ref(ref_.ty), TypeRef::Path(p) if p.is_self_type()) =>`
+- ~L794  `if  matches!(store[*target],`  ->  `if  matches!(store.type_ref(*target),`
+- ~L811  `matches!(store[target],`  ->  `matches!(store.type_ref(target),`
+
+### crates/hir/src/diagnostics.rs  (2 sites)
+- ~L1663  `if let TypeRef::ImplTrait(_) = self.store[ty] {`  ->  `if let TypeRef::ImplTrait(_) = self.store.type_ref(ty) {`
+- ~L1680  `let TypeRef::ImplTrait(bounds) = &store[it] else { return None };`  ->  `let TypeRef::ImplTrait(bounds) = store.type_ref(it) else { return None };` (`&bounds[..]` and `store[*path]` below are unchanged)
+
+### crates/hir/src/semantics.rs  (1 site)
+- ~L1729  `let path = match &analyze.store()?.types[ty] {`  ->  `let path = match analyze.store()?.type_ref(ty) {` (this read the store's `types` arena field directly, which the columns remove; `path` is `&'db Path`, as before)

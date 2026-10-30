@@ -46,6 +46,7 @@ tt.workspace = true
 span.workspace = true
 thin-vec.workspace = true
 syntax-bridge.workspace = true
+blaze-format.workspace = true
 
 # This is a transitive dep, but we need to specify this
 # for the workspace-wide pinning

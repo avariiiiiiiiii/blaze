@@ -10,7 +10,7 @@ use std::{
     fmt,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -354,42 +354,262 @@ impl fmt::Display for Backend {
     }
 }
 
-/// What the producers did since the last report.
-#[derive(Default)]
+/// What the producers did since the last report. Every compile on every core counts into it,
+/// so no count is a shared word: each thread adds to [`Counts`] of its own, and [`report`]
+/// sums them, as the Linux kernel's per-CPU counters do. A field names which word of a
+/// thread's counts it is.
+///
+/// [`report`]: Tally::report
 pub(super) struct Tally {
     cranelift: Produced,
     pub(super) llvm: Produced,
     /// The units LLVM compiled ([`super::units`]), the functions of them and the imports
-    /// they kept as the code of the functions those are of, and why a function of one was
-    /// compiled alone instead, and how often.
-    units: AtomicUsize,
-    unit_members: AtomicUsize,
-    pub(super) unit_kept: AtomicUsize,
-    alone: Mutex<BTreeMap<String, usize>>,
-    /// Time LLVM spent on functions it then gave up on.
-    wasted: AtomicU64,
-    /// Why LLVM left a function to Cranelift, and how often.
-    fallbacks: Mutex<BTreeMap<String, usize>>,
+    /// they kept as the code of the functions those are of. Why a function of one was
+    /// compiled alone instead, and how often, is [`Counts::alone`].
+    units: Count,
+    unit_members: Count,
+    pub(super) unit_kept: Count,
+    /// Nanoseconds LLVM spent on functions it then gave up on. Why it gave up, and how
+    /// often, is [`Counts::fallbacks`].
+    wasted: Count,
     /// Functions too large for LLVM to optimize in reasonable time, compiled at `-O0`.
-    pub(super) large: AtomicUsize,
-    /// Where LLVM's time went.
-    pub(super) phases: [AtomicU64; Phase::COUNT],
-    /// Where the time around the producer went.
-    steps: [AtomicU64; Step::COUNT],
-    /// Where Cranelift's time went, summed over the threads, with `BLAZE_STATS`.
-    passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
+    pub(super) large: Count,
     /// The exports built for compiles to import ([`super::imports`]), and how many bodies
     /// and instructions those imported.
     pub(super) exports: Produced,
-    pub(super) imported: AtomicUsize,
-    pub(super) imported_size: AtomicUsize,
+    pub(super) imported: Count,
+    pub(super) imported_size: Count,
 }
 
-#[derive(Default)]
-pub(super) struct Produced {
-    functions: AtomicUsize,
-    nanos: AtomicU64,
-    bytes: AtomicUsize,
+/// The words of [`Counts::words`]: three for each [`Produced`], one for each [`Count`], then
+/// LLVM's phases and the steps around the producer, in nanoseconds.
+mod word {
+    pub(super) const CRANELIFT: usize = 0;
+    pub(super) const LLVM: usize = 3;
+    pub(super) const EXPORTS: usize = 6;
+    pub(super) const UNITS: usize = 9;
+    pub(super) const UNIT_MEMBERS: usize = 10;
+    pub(super) const UNIT_KEPT: usize = 11;
+    pub(super) const WASTED: usize = 12;
+    pub(super) const LARGE: usize = 13;
+    pub(super) const IMPORTED: usize = 14;
+    pub(super) const IMPORTED_SIZE: usize = 15;
+    pub(super) const PHASES: usize = 16;
+    pub(super) const STEPS: usize = PHASES + super::Phase::COUNT;
+    pub(super) const COUNT: usize = STEPS + super::Step::COUNT;
+}
+
+/// A count of [`Tally`]: which of a thread's [`Counts::words`] it is.
+pub(super) struct Count(usize);
+
+#[cfg(feature = "llvm")]
+impl Count {
+    /// Adds `n` to the calling thread's count. Takes the ordering its callers gave the
+    /// shared atomic it replaced; a thread's own word needs none.
+    pub(super) fn fetch_add(&self, n: usize, _: Ordering) {
+        counts().add(self.0, n as u64);
+    }
+}
+
+/// Functions compiled, and the nanoseconds and bytes of code they took: three words from the
+/// one named.
+pub(super) struct Produced(usize);
+
+/// One thread's counts, written by that thread alone with a plain load and store (no locked
+/// instruction, no line another core writes), read by [`Tally::report`]. 2 × 256 bytes of
+/// words, each block on lines of its own, so a report's writes never touch the line a worker
+/// counts into. A thread that ends hands its counts on to the next thread that starts
+/// ([`Registry::claim`]): nothing counted is lost, and there are never more of them than
+/// the most threads alive at once.
+#[repr(C, align(128))]
+struct Counts {
+    words: Lines<[AtomicU64; word::COUNT]>,
+    /// What a report read of each word last, written by reports alone.
+    reported: Lines<[AtomicU64; word::COUNT]>,
+    /// Why a function of a unit was compiled alone, and how often.
+    alone: Mutex<BTreeMap<String, usize>>,
+    /// Why LLVM left a function to Cranelift, and how often.
+    fallbacks: Mutex<BTreeMap<String, usize>>,
+    /// Where Cranelift's time went on this thread, with `BLAZE_STATS`.
+    passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
+    /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
+    /// none and shared by all: their words are added to with `fetch_add`.
+    held: AtomicBool,
+    next: AtomicPtr<Counts>,
+}
+
+#[repr(C, align(128))]
+struct Lines<T>(T);
+
+const _: () = assert!(size_of::<Lines<[AtomicU64; word::COUNT]>>() == 256);
+
+impl Counts {
+    const fn new(held: bool) -> Counts {
+        Counts {
+            words: Lines([const { AtomicU64::new(0) }; word::COUNT]),
+            reported: Lines([const { AtomicU64::new(0) }; word::COUNT]),
+            alone: Mutex::new(BTreeMap::new()),
+            fallbacks: Mutex::new(BTreeMap::new()),
+            passes: Mutex::new(None),
+            held: AtomicBool::new(held),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    fn add(&self, word: usize, n: u64) {
+        let word = &self.words.0[word];
+        if self.held.load(Ordering::Relaxed) {
+            word.store(word.load(Ordering::Relaxed).wrapping_add(n), Ordering::Relaxed);
+        } else {
+            word.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// What each word grew by since a report last read it. Reports at once each get a part,
+    /// and the parts add up to the growth once.
+    fn take(&self, sums: &mut [u64; word::COUNT]) {
+        for ((sum, word), reported) in sums.iter_mut().zip(&self.words.0).zip(&self.reported.0) {
+            let now = word.load(Ordering::Relaxed);
+            let before = reported.fetch_max(now, Ordering::Relaxed);
+            *sum += now.saturating_sub(before);
+        }
+    }
+
+    fn release(&self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
+/// Every thread's [`Counts`]: a list that only grows, of counts that are never freed, so a
+/// report reads them with no lock while threads count.
+struct Registry {
+    head: AtomicPtr<Counts>,
+    /// Where a thread counts once its own counts are gone, as it ends.
+    late: Counts,
+}
+
+static REGISTRY: Registry =
+    Registry { head: AtomicPtr::new(std::ptr::null_mut()), late: Counts::new(false) };
+
+impl Registry {
+    /// Counts no thread holds, now held by the calling one: those a thread that ended left,
+    /// or new ones.
+    fn claim(&'static self) -> &'static Counts {
+        for counts in self.listed() {
+            if !counts.held.load(Ordering::Relaxed)
+                && counts
+                    .held
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return counts;
+            }
+        }
+        let counts: &'static Counts = Box::leak(Box::new(Counts::new(true)));
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            counts.next.store(head, Ordering::Relaxed);
+            let new = std::ptr::from_ref(counts).cast_mut();
+            match self.head.compare_exchange_weak(head, new, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return counts,
+                Err(now) => head = now,
+            }
+        }
+    }
+
+    /// The counts threads held, held now or not.
+    fn listed(&'static self) -> impl Iterator<Item = &'static Counts> {
+        let mut at = self.head.load(Ordering::Acquire);
+        std::iter::from_fn(move || {
+            // SAFETY: every pointer in the list is of counts leaked by `claim`, which are
+            // never freed, and was published with a release store after its `next` was set.
+            let counts = unsafe { at.as_ref() }?;
+            at = counts.next.load(Ordering::Acquire);
+            Some(counts)
+        })
+    }
+
+    /// The counts of every thread that counted, after [`Registry::late`].
+    fn all(&'static self) -> impl Iterator<Item = &'static Counts> {
+        std::iter::once(&self.late).chain(self.listed())
+    }
+
+    /// What every word grew by since the last report, and the reasons counted since.
+    fn take(&'static self) -> Taken {
+        let mut taken = Taken {
+            sums: [0; word::COUNT],
+            alone: BTreeMap::new(),
+            fallbacks: BTreeMap::new(),
+            passes: None,
+        };
+        for counts in self.all() {
+            counts.take(&mut taken.sums);
+            for (into, from) in
+                [(&mut taken.alone, &counts.alone), (&mut taken.fallbacks, &counts.fallbacks)]
+            {
+                let from = std::mem::take(&mut *from.lock().unwrap_or_else(|e| e.into_inner()));
+                for (reason, count) in from {
+                    *into.entry(reason).or_default() += count;
+                }
+            }
+            if let Some(times) = counts.passes.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                taken.passes.get_or_insert_with(Default::default).add(&times);
+            }
+        }
+        taken
+    }
+}
+
+struct Taken {
+    sums: [u64; word::COUNT],
+    alone: BTreeMap<String, usize>,
+    fallbacks: BTreeMap<String, usize>,
+    passes: Option<cranelift_codegen::timing::PassTimes>,
+}
+
+/// The calling thread's counts, given back for the next thread when it ends.
+struct Held(&'static Counts);
+
+impl Held {
+    fn claim() -> Held {
+        // Cranelift times every pass of every function it compiles, with two reads of the
+        // clock and a token for each, for the report `BLAZE_STATS` asks for alone.
+        if !stats() {
+            drop(cranelift_codegen::timing::set_thread_profiler(Box::new(Untimed)));
+        }
+        Held(REGISTRY.claim())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+thread_local! {
+    static HELD: Held = Held::claim();
+}
+
+fn counts() -> &'static Counts {
+    HELD.try_with(|held| held.0).unwrap_or(&REGISTRY.late)
+}
+
+/// A profiler of Cranelift's that reads no clock: its token is of no size, so it is not
+/// allocated either.
+struct Untimed;
+
+impl cranelift_codegen::timing::Profiler for Untimed {
+    fn start_pass(&self, _: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        Box::new(())
+    }
+}
+
+/// Whether `BLAZE_STATS` asks for the steps and Cranelift's passes to be reported.
+fn stats() -> bool {
+    static STATS: OnceLock<bool> = OnceLock::new();
+    *STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some())
 }
 
 /// The steps of compiling one function with LLVM.
@@ -444,15 +664,16 @@ impl Step {
 
 impl Produced {
     pub(super) fn add(&self, took: Duration, bytes: usize) {
-        self.functions.fetch_add(1, Ordering::Relaxed);
-        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        let counts = counts();
+        counts.add(self.0, 1);
+        counts.add(self.0 + 1, took.as_nanos() as u64);
+        counts.add(self.0 + 2, bytes as u64);
     }
 
-    fn take(&self) -> Option<String> {
-        let functions = self.functions.swap(0, Ordering::Relaxed);
-        let took = Duration::from_nanos(self.nanos.swap(0, Ordering::Relaxed));
-        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+    fn take(&self, sums: &[u64; word::COUNT]) -> Option<String> {
+        let functions = sums[self.0];
+        let took = Duration::from_nanos(sums[self.0 + 1]);
+        let bytes = sums[self.0 + 2];
         (functions != 0).then(|| {
             let each = took / functions as u32;
             format!("{functions} functions, {bytes} bytes, {took:.1?} ({each:.1?} each)")
@@ -460,48 +681,70 @@ impl Produced {
     }
 }
 
+static TALLY: Tally = Tally {
+    cranelift: Produced(word::CRANELIFT),
+    llvm: Produced(word::LLVM),
+    units: Count(word::UNITS),
+    unit_members: Count(word::UNIT_MEMBERS),
+    unit_kept: Count(word::UNIT_KEPT),
+    wasted: Count(word::WASTED),
+    large: Count(word::LARGE),
+    exports: Produced(word::EXPORTS),
+    imported: Count(word::IMPORTED),
+    imported_size: Count(word::IMPORTED_SIZE),
+};
+
 impl Tally {
     pub(super) fn global() -> &'static Tally {
-        static TALLY: OnceLock<Tally> = OnceLock::new();
-        TALLY.get_or_init(Tally::default)
+        &TALLY
     }
 
     #[cfg(feature = "llvm")]
     fn fell_back(&self, took: Duration, reason: &str) {
-        self.wasted.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-        let mut fallbacks = self.fallbacks.lock().unwrap_or_else(|e| e.into_inner());
-        *fallbacks.entry(reason.to_owned()).or_default() += 1;
+        let counts = counts();
+        counts.add(self.wasted.0, took.as_nanos() as u64);
+        let mut fallbacks = counts.fallbacks.lock().unwrap_or_else(|e| e.into_inner());
+        match fallbacks.get_mut(reason) {
+            Some(count) => *count += 1,
+            None => _ = fallbacks.insert(reason.to_owned(), 1),
+        }
     }
 
     #[cfg(feature = "llvm")]
     pub(super) fn unit(&self, members: usize) {
-        self.units.fetch_add(1, Ordering::Relaxed);
-        self.unit_members.fetch_add(members, Ordering::Relaxed);
+        let counts = counts();
+        counts.add(self.units.0, 1);
+        counts.add(self.unit_members.0, members as u64);
     }
 
     #[cfg(feature = "llvm")]
     pub(super) fn alone(&self, reason: &str, functions: usize) {
-        let mut alone = self.alone.lock().unwrap_or_else(|e| e.into_inner());
-        *alone.entry(reason.to_owned()).or_default() += functions;
+        let counts = counts();
+        let mut alone = counts.alone.lock().unwrap_or_else(|e| e.into_inner());
+        match alone.get_mut(reason) {
+            Some(count) => *count += functions,
+            None => _ = alone.insert(reason.to_owned(), functions),
+        }
     }
 
     #[cfg(feature = "llvm")]
     pub(super) fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = work();
-        self.phases[phase as usize].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counts().add(word::PHASES + phase as usize, start.elapsed().as_nanos() as u64);
         out
     }
 
     /// Adds the times of Cranelift's passes on this thread since it was last asked, with
-    /// `BLAZE_STATS`.
+    /// `BLAZE_STATS`. Without it, the thread's Cranelift reads no clock from its next
+    /// function on ([`Held::claim`]).
     pub(super) fn passes(&self) {
-        static STATS: OnceLock<bool> = OnceLock::new();
-        if !*STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some()) {
+        let counts = counts();
+        if !stats() {
             return;
         }
         let times = cranelift_codegen::timing::take_current();
-        let mut passes = self.passes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut passes = counts.passes.lock().unwrap_or_else(|e| e.into_inner());
         passes.get_or_insert_with(Default::default).add(&times);
     }
 
@@ -525,32 +768,29 @@ impl Tally {
     }
 
     pub(super) fn add(&self, step: Step, took: Duration) {
-        self.steps[step as usize].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        counts().add(word::STEPS + step as usize, took.as_nanos() as u64);
     }
 
     /// Says what was compiled by which producer since the last call, on stderr. Times are
     /// summed over the threads that compiled.
     pub(super) fn report(&self) {
-        let fallbacks =
-            std::mem::take(&mut *self.fallbacks.lock().unwrap_or_else(|e| e.into_inner()));
-        let wasted = Duration::from_nanos(self.wasted.swap(0, Ordering::Relaxed));
-        let phases = Phase::ALL.map(|phase| {
-            Duration::from_nanos(self.phases[phase as usize].swap(0, Ordering::Relaxed))
-        });
-        let (llvm, cranelift) = (self.llvm.take(), self.cranelift.take());
-        let large = self.large.swap(0, Ordering::Relaxed);
+        let Taken { sums, alone, fallbacks, passes } = REGISTRY.take();
+        let wasted = Duration::from_nanos(sums[self.wasted.0]);
+        let phases =
+            Phase::ALL.map(|phase| Duration::from_nanos(sums[word::PHASES + phase as usize]));
+        let (llvm, cranelift) = (self.llvm.take(&sums), self.cranelift.take(&sums));
+        let large = sums[self.large.0];
         let steps = Step::ALL.map(|(step, name)| {
-            let took = Duration::from_nanos(self.steps[step as usize].swap(0, Ordering::Relaxed));
+            let took = Duration::from_nanos(sums[word::STEPS + step as usize]);
             format!("{name} {took:.1?}")
         });
         let selected = Self::selected_llvm();
-        let stats = std::env::var_os("BLAZE_STATS").is_some();
+        let stats = stats();
         if !selected && !stats {
             return;
         }
         if stats {
             eprintln!("steps: {}", steps.join(", "));
-            let passes = self.passes.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(passes) = passes {
                 eprint!("cranelift passes:\n{passes}");
             }
@@ -565,23 +805,21 @@ impl Tally {
         if large != 0 {
             eprintln!("backend: llvm compiled {large} large functions without optimization");
         }
-        if let Some(exports) = self.exports.take() {
-            let imported = self.imported.swap(0, Ordering::Relaxed);
-            let size = self.imported_size.swap(0, Ordering::Relaxed);
+        if let Some(exports) = self.exports.take(&sums) {
+            let imported = sums[self.imported.0];
+            let size = sums[self.imported_size.0];
             eprintln!(
                 "backend: llvm built exports of {exports}; {imported} imported, {size} instructions"
             );
         }
-        let (units, members) =
-            (self.units.swap(0, Ordering::Relaxed), self.unit_members.swap(0, Ordering::Relaxed));
-        let kept = self.unit_kept.swap(0, Ordering::Relaxed);
+        let (units, members) = (sums[self.units.0], sums[self.unit_members.0]);
+        let kept = sums[self.unit_kept.0];
         if units != 0 {
             eprintln!(
                 "backend: llvm compiled {members} functions in {units} units, which kept {kept} \
                  imports"
             );
         }
-        let alone = std::mem::take(&mut *self.alone.lock().unwrap_or_else(|e| e.into_inner()));
         if !alone.is_empty() {
             let count: usize = alone.values().sum();
             eprintln!("backend: {count} functions of units compiled alone:");
@@ -603,5 +841,125 @@ impl Tally {
 
     fn selected_llvm() -> bool {
         matches!(Backend::from_env(), Ok(Backend::Llvm(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> &'static Registry {
+        Box::leak(Box::new(Registry {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+            late: Counts::new(false),
+        }))
+    }
+
+    #[test]
+    fn every_count_is_a_word_of_its_own() {
+        let tally = Tally::global();
+        let mut words: Vec<usize> = [&tally.cranelift, &tally.llvm, &tally.exports]
+            .into_iter()
+            .flat_map(|it| it.0..it.0 + 3)
+            .collect();
+        words.extend(
+            [
+                &tally.units,
+                &tally.unit_members,
+                &tally.unit_kept,
+                &tally.wasted,
+                &tally.large,
+                &tally.imported,
+                &tally.imported_size,
+            ]
+            .map(|it| it.0),
+        );
+        words.extend(word::PHASES..word::COUNT);
+        words.sort_unstable();
+        assert_eq!(words, (0..word::COUNT).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_counts_of_every_thread_add_up_once() {
+        let registry = registry();
+        std::thread::scope(|scope| {
+            for thread in 0..8u64 {
+                scope.spawn(move || {
+                    let counts = registry.claim();
+                    for _ in 0..1000 {
+                        counts.add(word::LARGE, thread + 1);
+                    }
+                    counts.add(word::STEPS, 1);
+                    counts.release();
+                });
+            }
+        });
+        registry.late.add(word::LARGE, 5);
+        let taken = registry.take();
+        assert_eq!(taken.sums[word::LARGE], 1000 * (1..=8).sum::<u64>() + 5);
+        assert_eq!(taken.sums[word::STEPS], 8);
+        assert_eq!(registry.take().sums, [0; word::COUNT]);
+    }
+
+    #[test]
+    fn a_thread_that_ends_hands_its_counts_to_the_next() {
+        let registry = registry();
+        let run = move |n| {
+            std::thread::spawn(move || {
+                let counts = registry.claim();
+                counts.add(word::UNITS, n);
+                counts.release();
+                std::ptr::from_ref(counts) as usize
+            })
+            .join()
+            .expect("the thread")
+        };
+        assert_eq!(run(3), run(4));
+        assert_eq!(registry.listed().count(), 1);
+        assert_eq!(registry.take().sums[word::UNITS], 7);
+    }
+
+    #[test]
+    fn reports_while_threads_count_see_each_count_once() {
+        let registry = registry();
+        let reported = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let counts = registry.claim();
+                    for _ in 0..10_000 {
+                        counts.add(word::WASTED, 1);
+                    }
+                    counts.release();
+                });
+            }
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        let taken = registry.take().sums[word::WASTED];
+                        reported.fetch_add(taken, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        let rest = registry.take().sums[word::WASTED];
+        assert_eq!(reported.load(Ordering::Relaxed) + rest, 40_000);
+    }
+
+    #[test]
+    fn reasons_of_every_thread_are_merged() {
+        let registry = registry();
+        for (reason, n) in [("a", 1), ("b", 2), ("a", 3)] {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let counts = registry.claim();
+                    *counts.alone.lock().unwrap().entry(reason.to_owned()).or_default() += n;
+                    counts.release();
+                });
+            });
+        }
+        let taken = registry.take();
+        assert_eq!(taken.alone, BTreeMap::from([("a".to_owned(), 4), ("b".to_owned(), 2)]));
+        assert!(registry.take().alone.is_empty());
     }
 }

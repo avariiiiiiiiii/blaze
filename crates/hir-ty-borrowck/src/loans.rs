@@ -22,7 +22,7 @@ use hir_ty::{
 
 use super::{
     Ctx,
-    bitset::{BitMatrix, BitSet},
+    bitset::{BitMatrix, BitSet, Transfer},
     cfg::{Cfg, Location, index},
     dataflow::{GenKill, forward},
     intervals::IntervalSet,
@@ -49,6 +49,10 @@ pub(super) struct Loan {
     pub(super) assigned: LocalId,
     pub(super) activation: Activation,
 }
+
+// One per borrow, read when a conflict is found; the sets in scope are bit indices into
+// `Loans::loans`, so the dataflow never touches it.
+const _: () = assert!(size_of::<Loan>() <= 88);
 
 /// The kinds of the facts of [`Loans::index`]: the loan made at a point, the loans of a
 /// local, the two-phase loans activated at a point.
@@ -325,7 +329,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
     };
     fn promotable(
         defs: &FxHashMap<LocalId, Option<&Rvalue>>,
-        temp: &dyn Fn(LocalId) -> bool,
+        temp: &impl Fn(LocalId) -> bool,
         local: LocalId,
         depth: usize,
     ) -> bool {
@@ -697,29 +701,23 @@ impl Loans {
         if count == 0 {
             return BitMatrix::new(blocks, 0);
         }
-        // A block only adds and removes loans, whatever is in scope: what it does is what it
-        // leaves of nothing in scope and of all of them.
         let mut transfer = GenKill::new(blocks, count);
-        let all = BitSet::filled(count);
         for &block in &cfg.order {
             let data = &body.basic_blocks[block];
-            let (mut made, mut kept) = (BitSet::new(count), all.clone());
+            let mut row = transfer.row(index(block));
             for statement in 0..=data.statements.len() {
                 let location = Location { block, statement };
-                for state in [&mut made, &mut kept] {
-                    self.before(cfg, location, state);
-                    self.after(ctx, body, cfg, location, state);
-                }
+                self.before(cfg, location, &mut row);
+                self.after(ctx, body, cfg, location, &mut row);
             }
-            transfer.set_from(index(block), &made, &kept);
         }
         forward(cfg, &transfer, body.start_block, &BitSet::new(count), |_, _, _| ())
     }
 
     /// The loans that go out of scope as `location` starts.
-    pub(super) fn before(&self, cfg: &Cfg, location: Location, state: &mut BitSet) {
+    pub(super) fn before(&self, cfg: &Cfg, location: Location, state: &mut impl Transfer) {
         for &id in self.scopes.get(ENDS_AT, cfg.point(location)) {
-            state.remove(id as usize);
+            state.kill(id as usize);
         }
     }
 
@@ -730,7 +728,7 @@ impl Loans {
         body: &MirBody<'db>,
         cfg: &Cfg,
         location: Location,
-        state: &mut BitSet,
+        state: &mut impl Transfer,
     ) {
         let data = &body.basic_blocks[location.block];
         if let Some(statement) = data.statements.get(location.statement) {
@@ -738,12 +736,12 @@ impl Loans {
                 StatementKind::Assign(place, _) => {
                     self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), state);
                     if let Some(id) = self.made_at(cfg.point(location)) {
-                        state.insert(id);
+                        state.gen_(id);
                     }
                 }
                 StatementKind::StorageDead(local) => {
                     for &id in self.of_local(*local) {
-                        state.remove(id as usize);
+                        state.kill(id as usize);
                     }
                 }
                 StatementKind::InlineAsm(asm) => {
@@ -781,7 +779,7 @@ impl Loans {
         body: &MirBody<'db>,
         local: LocalId,
         projection: &[PlaceElem],
-        state: &mut BitSet,
+        state: &mut impl Transfer,
     ) {
         for &id in self.of_local(local) {
             let id = id as usize;
@@ -797,7 +795,7 @@ impl Loans {
                     Bias::NoOverlap,
                 )
             {
-                state.remove(id);
+                state.kill(id);
             }
         }
     }
@@ -824,10 +822,10 @@ fn out_of_scope(
     if rest {
         match first_absent(issued_point + 1, last(issued.block)) {
             Some(point) => out.push(point),
-            None => work.extend(cfg.successors[index(issued.block)].iter().copied()),
+            None => work.extend(cfg.successors(issued.block).iter().copied()),
         }
     } else {
-        work.extend(cfg.successors[index(issued.block)].iter().copied());
+        work.extend(cfg.successors(issued.block).iter().copied());
     }
     while let Some(block) = work.pop() {
         if !entered.insert(index(block)) {
@@ -839,7 +837,7 @@ fn out_of_scope(
             if rest && block == issued.block { (issued_point, false) } else { (last(block), true) };
         match first_absent(start, end) {
             Some(point) => out.push(point),
-            None if through => work.extend(cfg.successors[index(block)].iter().copied()),
+            None if through => work.extend(cfg.successors(block).iter().copied()),
             None => (),
         }
     }

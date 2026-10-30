@@ -1,0 +1,509 @@
+//! E0109 "type arguments are not allowed on module `m`": generic arguments on a path segment
+//! that takes none (a module, a type parameter, `Self`, a primitive type, a local variable, a
+//! variant whose enum has them too), one error for the segments rustc checks together, with
+//! the note or suggestion of what the segment is; E0229 for an associated item constraint
+//! there; and E0107 for a static's or a const parameter's, which rustc counts as a value's.
+//!
+//! Follows rustc's `compiler/rustc_hir_analysis/src/hir_ty_lowering/mod.rs`
+//! (`prohibit_generic_args`, `probe_generic_path_segments`, `lower_resolved_ty_path`),
+//! `compiler/rustc_hir_analysis/src/hir_ty_lowering/errors.rs`
+//! (`report_prohibited_generic_args`, `generics_args_err_extend`,
+//! `prohibit_assoc_item_constraint`), `compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs`
+//! (`instantiate_value_path`) and `compiler/rustc_hir/src/def.rs` (`Res::descr`) (MIT or
+//! Apache-2.0).
+
+use either::Either;
+use hir::{
+    Adt, AsAssocItem as _, GenericDef, HasSource as _, InFile, ModuleDef, PathResolution,
+    StructKind,
+};
+use syntax::{
+    AstNode, TextRange,
+    ast::{self, HasGenericArgs as _, HasName as _},
+};
+
+use crate::{
+    cx::{Cx, def_range},
+    lower::{
+        Found,
+        incorrect_generics_len::{Segment, def_name_span, phase_at, s, site_fact, takes_none},
+    },
+    model::{Applicability, Diag, MultiSpan},
+};
+
+/// rustc's `ProhibitGenericsArg`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgKind {
+    Lifetime,
+    Type,
+    Const,
+    Infer,
+}
+
+/// A segment of the path, the path up to it, and what that resolves to.
+struct Seg<'db> {
+    segment: ast::PathSegment,
+    res: Option<PathResolution<'db>>,
+}
+
+/// The note or suggestion rustc adds for what the segments are: its `GenericsArgsErrExtend`.
+enum Extend {
+    None,
+    Param(hir::TypeParam),
+    SelfTyParam,
+    SelfTyAlias(Either<hir::Impl, Adt>),
+    PrimTy(String),
+    DefVariant,
+}
+
+/// The segments of `top`, first to last, each with what the path up to it resolves to.
+fn segments<'db>(cx: &Cx<'_, 'db>, top: &ast::Path) -> Vec<Seg<'db>> {
+    let mut paths = Vec::new();
+    let mut at = Some(top.clone());
+    while let Some(path) = at {
+        at = path.qualifier();
+        paths.push(path);
+    }
+    paths.reverse();
+    paths
+        .into_iter()
+        .filter_map(|prefix| {
+            let segment = prefix.segment()?;
+            Some(Seg { segment, res: cx.sema.resolve_path(&prefix) })
+        })
+        .collect()
+}
+
+fn has_args(segment: &ast::PathSegment) -> bool {
+    segment.generic_arg_list().is_some() || segment.parenthesized_arg_list().is_some()
+}
+
+/// The generic arguments of a segment, constraints left out: rustc's `GenericArgs::args`, the
+/// inputs of `Fn`-style ones a tuple type.
+fn args(segment: &ast::PathSegment) -> Vec<(ArgKind, TextRange)> {
+    if let Some(list) = segment.parenthesized_arg_list() {
+        return vec![(ArgKind::Type, list.syntax().text_range())];
+    }
+    let Some(list) = segment.generic_arg_list() else { return Vec::new() };
+    list.generic_args()
+        .filter_map(|arg| {
+            let kind = match &arg {
+                ast::GenericArg::AssocTypeArg(_) => return None,
+                ast::GenericArg::LifetimeArg(_) => ArgKind::Lifetime,
+                ast::GenericArg::ConstArg(_) => ArgKind::Const,
+                ast::GenericArg::TypeArg(it) => match it.ty() {
+                    Some(ast::Type::InferType(_)) => ArgKind::Infer,
+                    _ => ArgKind::Type,
+                },
+            };
+            Some((kind, arg.syntax().text_range()))
+        })
+        .collect()
+}
+
+fn is_trait_self(cx: &Cx<'_, '_>, param: hir::TypeParam) -> bool {
+    matches!(param.parent(cx.db), GenericDef::Trait(_)) && param.is_implicit(cx.db)
+}
+
+/// Whether `path` is of a value: an expression or a pattern that is not a struct's.
+fn in_value(path: &ast::Path) -> bool {
+    path.syntax().parent().is_some_and(|it| {
+        ast::PathExpr::can_cast(it.kind())
+            || ast::PathPat::can_cast(it.kind())
+            || ast::TupleStructPat::can_cast(it.kind())
+    })
+}
+
+fn is_enum(res: &Option<PathResolution<'_>>) -> bool {
+    matches!(res, Some(PathResolution::Def(ModuleDef::Adt(Adt::Enum(_)))))
+}
+
+/// The segments rustc allows arguments on for a variant: its enum's when the enum has them,
+/// else the variant's.
+fn variant_allowed(segs: &[Seg]) -> Vec<usize> {
+    let last = segs.len() - 1;
+    match last.checked_sub(1) {
+        Some(i) if has_args(&segs[i].segment) && is_enum(&segs[i].res) => vec![i],
+        _ => vec![last],
+    }
+}
+
+/// The segments rustc checks together, the ones that may have arguments among them, and its
+/// extension of the error.
+fn checked(cx: &Cx<'_, '_>, segs: &[Seg], value: bool) -> (Vec<usize>, Extend) {
+    let db = cx.db;
+    let last = segs.len() - 1;
+    let all: Vec<usize> = (0..segs.len()).collect();
+    let but = |allowed: Vec<usize>| -> Vec<usize> {
+        (0..segs.len()).filter(|it| !allowed.contains(it)).collect()
+    };
+    let last_seg = &segs[last];
+    let is_self = last_seg.segment.self_type_token().is_some();
+    if value {
+        return match &last_seg.res {
+            Some(PathResolution::Local(_)) | Some(PathResolution::SelfType(_)) => {
+                (all, Extend::None)
+            }
+            Some(PathResolution::Def(ModuleDef::EnumVariant(_))) => {
+                (but(variant_allowed(segs)), Extend::DefVariant)
+            }
+            Some(PathResolution::Def(ModuleDef::Function(it))) if it.as_assoc_item(db).is_some() => {
+                (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
+            }
+            Some(PathResolution::Def(ModuleDef::Const(it))) if it.as_assoc_item(db).is_some() => {
+                (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
+            }
+            _ => (but(vec![last]), Extend::None),
+        };
+    }
+    match &last_seg.res {
+        Some(PathResolution::TypeParam(it)) if is_trait_self(cx, *it) => {
+            let single = segs.len() == 1 && has_args(&last_seg.segment);
+            (all, if single { Extend::SelfTyParam } else { Extend::None })
+        }
+        Some(PathResolution::TypeParam(it)) => (all, Extend::Param(*it)),
+        Some(PathResolution::SelfType(it)) => (all, Extend::SelfTyAlias(Either::Left(*it))),
+        Some(PathResolution::Def(ModuleDef::Adt(it))) if is_self => {
+            (all, Extend::SelfTyAlias(Either::Right(*it)))
+        }
+        Some(PathResolution::Def(ModuleDef::BuiltinType(it))) => {
+            (all, Extend::PrimTy(it.name().display(db, cx.edition).to_string()))
+        }
+        Some(PathResolution::Def(ModuleDef::EnumVariant(_))) => {
+            (but(variant_allowed(segs)), Extend::DefVariant)
+        }
+        Some(PathResolution::Def(ModuleDef::TypeAlias(it))) if it.as_assoc_item(db).is_some() => {
+            (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
+        }
+        _ => (but(vec![last]), Extend::None),
+    }
+}
+
+/// rustc's `Res::descr`, with the name of a definition: "module `m`", "builtin type `u8`".
+fn what(cx: &Cx<'_, '_>, seg: &Seg, value_last: bool) -> String {
+    let db = cx.db;
+    let named = |descr: &str, name: hir::Name| format!("{descr} `{}`", name.display(db, cx.edition));
+    match &seg.res {
+        None => "this type".to_owned(),
+        Some(PathResolution::Local(_)) => "local variable".to_owned(),
+        Some(PathResolution::SelfType(_)) if value_last => "self constructor".to_owned(),
+        Some(PathResolution::SelfType(_)) => "self type".to_owned(),
+        Some(PathResolution::TypeParam(it)) if is_trait_self(cx, *it) => "self type".to_owned(),
+        Some(PathResolution::TypeParam(it)) => named("type parameter", it.name(db)),
+        Some(PathResolution::ConstParam(it)) => named("const parameter", it.name(db)),
+        Some(PathResolution::Def(def)) => match def {
+            ModuleDef::Adt(_) if seg.segment.self_type_token().is_some() => "self type".to_owned(),
+            ModuleDef::Module(it) => match it.name(db) {
+                Some(name) => named("module", name),
+                None => "module".to_owned(),
+            },
+            ModuleDef::Adt(Adt::Struct(it)) => named("struct", it.name(db)),
+            ModuleDef::Adt(Adt::Enum(it)) => named("enum", it.name(db)),
+            ModuleDef::Adt(Adt::Union(it)) => named("union", it.name(db)),
+            ModuleDef::EnumVariant(it) => {
+                let descr = match (value_last, it.kind(db)) {
+                    (true, StructKind::Tuple) => "tuple variant",
+                    (true, StructKind::Unit) => "unit variant",
+                    _ => "variant",
+                };
+                named(descr, it.name(db))
+            }
+            ModuleDef::Function(it) => match it.as_assoc_item(db) {
+                Some(_) => named("associated function", it.name(db)),
+                None => named("function", it.name(db)),
+            },
+            ModuleDef::Const(it) => {
+                let descr = if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
+                match it.name(db) {
+                    Some(name) => named(descr, name),
+                    None => descr.to_owned(),
+                }
+            }
+            ModuleDef::Static(it) => named("static", it.name(db)),
+            ModuleDef::Trait(it) => named("trait", it.name(db)),
+            ModuleDef::TypeAlias(it) => match it.as_assoc_item(db) {
+                Some(_) => named("associated type", it.name(db)),
+                None => named("type alias", it.name(db)),
+            },
+            ModuleDef::BuiltinType(it) => named("builtin type", it.name()),
+            ModuleDef::Macro(it) => named("macro", it.name(db)),
+        },
+        Some(_) => "this type".to_owned(),
+    }
+}
+
+fn listify(list: &[String]) -> String {
+    match list {
+        [only] => only.clone(),
+        [others @ .., last] => format!("{} and {last}", others.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// From the end of the segment's name to the end of its arguments: `::<T>`, `<T>`, `(A)`.
+fn args_after_name(segment: &ast::PathSegment) -> Option<TextRange> {
+    let start = segment.name_ref()?.syntax().text_range().end();
+    let end = match (segment.generic_arg_list(), segment.parenthesized_arg_list()) {
+        (Some(list), _) => list.syntax().text_range().end(),
+        (None, Some(list)) => match segment.ret_type() {
+            Some(ret) => ret.syntax().text_range().end(),
+            None => list.syntax().text_range().end(),
+        },
+        (None, None) => return None,
+    };
+    Some(TextRange::new(start, end.max(start)))
+}
+
+pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Found> {
+    let db = cx.db;
+    let node = cx.node(d.args);
+    let file = node.file_id;
+    let span = |range: TextRange| cx.span(InFile::new(file, range));
+    let owner = node.value.syntax().parent().and_then(ast::PathSegment::cast);
+    let Some(segment) = owner else {
+        let range = node.value.syntax().text_range();
+        let mut diag = Diag::error(Some("E0109"), "type arguments are not allowed on this type", span(range));
+        diag.span_label(span(range), "type argument not allowed");
+        site_fact(cx, &mut diag, InFile::new(file, node.value.syntax()));
+        return vec![Found::new(diag, phase_at(node.value.syntax()))];
+    };
+    let top = segment.parent_path().top_path();
+    let value = in_value(&top);
+    let segs = segments(cx, &top);
+    let Some(h) = segs.iter().position(|it| it.segment.syntax() == segment.syntax()) else {
+        return Vec::new();
+    };
+    let last = segs.len() - 1;
+
+    // A static's or a const parameter's arguments are counted as a value's, E0107.
+    if value && h == last {
+        let found = match &segs[last].res {
+            Some(PathResolution::Def(ModuleDef::Static(it))) => {
+                Segment::of_node(file, segment.syntax().clone(), None)
+                    .map(|seg| takes_none(cx, &seg, GenericDef::Static(*it), None))
+            }
+            Some(PathResolution::ConstParam(it)) => {
+                Segment::of_node(file, segment.syntax().clone(), None)
+                    .map(|seg| takes_none(cx, &seg, it.parent(db), Some(*it)))
+            }
+            _ => None,
+        };
+        if let Some(found) = found {
+            return found;
+        }
+    }
+
+    let (checked, extend) = checked(cx, &segs, value);
+    let (checked, extend) = match checked.contains(&h) {
+        true => (checked, extend),
+        false => (vec![h], Extend::None),
+    };
+    let with_args: Vec<usize> = checked.iter().copied().filter(|&i| has_args(&segs[i].segment)).collect();
+    // The segments checked together are one error, given with the first.
+    if with_args.first() != Some(&h) {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    let mut kinds: Vec<ArgKind> = Vec::new();
+    let mut arg_spans: Vec<TextRange> = Vec::new();
+    let mut types_and_spans: Vec<(String, TextRange)> = Vec::new();
+    for &i in &with_args {
+        let seg = &segs[i];
+        let seg_args = args(&seg.segment);
+        if seg_args.is_empty() {
+            continue;
+        }
+        for (kind, range) in &seg_args {
+            if !kinds.contains(kind) {
+                kinds.push(*kind);
+            }
+            arg_spans.push(*range);
+        }
+        if let Some(name) = seg.segment.name_ref() {
+            types_and_spans.push((what(cx, seg, value && i == last), name.syntax().text_range()));
+        }
+    }
+
+    if let Some(&last_span) = arg_spans.last() {
+        let kind_names: Vec<String> = kinds
+            .iter()
+            .map(|it| {
+                match it {
+                    ArgKind::Lifetime => "lifetime",
+                    ArgKind::Type => "type",
+                    ArgKind::Const => "const",
+                    ArgKind::Infer => "generic",
+                }
+                .to_owned()
+            })
+            .collect();
+        let kind = listify(&kind_names);
+        let this_type = listify(&types_and_spans.iter().map(|(it, _)| it.clone()).collect::<Vec<_>>());
+        let mut diag = Diag::error(
+            Some("E0109"),
+            format!("{kind} arguments are not allowed on {this_type}"),
+            span(arg_spans[0]),
+        );
+        for range in &arg_spans[1..] {
+            diag.primary(span(*range));
+        }
+        diag.span_label(span(last_span), format!("{kind} argument{} not allowed", s(kinds.len())));
+        for (what, range) in &types_and_spans {
+            diag.span_label(span(*range), format!("not allowed on {what}"));
+        }
+        extend_err(cx, &mut diag, &segs, &checked, extend, file);
+        site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
+        found.push(Found::new(diag, phase_at(segment.syntax())));
+    }
+
+    // Only the first constraint is an error, rustc's not to overload with them.
+    let constraint = checked.iter().find_map(|&i| {
+        segs[i].segment.generic_arg_list()?.generic_args().find_map(|it| match it {
+            ast::GenericArg::AssocTypeArg(it) => Some(it),
+            _ => None,
+        })
+    });
+    if let Some(constraint) = constraint {
+        let range = constraint.syntax().text_range();
+        let mut diag =
+            Diag::error(Some("E0229"), "associated item constraints are not allowed here", span(range));
+        diag.span_label(span(range), "associated item constraint not allowed here");
+        site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
+        found.push(Found::new(diag, phase_at(segment.syntax())));
+    }
+    found
+}
+
+/// rustc's `generics_args_err_extend`.
+fn extend_err(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    segs: &[Seg],
+    checked: &[usize],
+    extend: Extend,
+    file: hir::HirFileId,
+) {
+    let db = cx.db;
+    let span = |range: TextRange| cx.span(InFile::new(file, range));
+    match extend {
+        Extend::None => {}
+        Extend::Param(param) => {
+            let Some(src) = param.merge().source(db) else { return };
+            let Either::Left(ast::TypeOrConstParam::Type(it)) = &src.value else { return };
+            let Some(name) = it.name() else { return };
+            let at = cx.span(src.with_value(name.syntax().text_range()));
+            diag.span_note(
+                at,
+                format!("type parameter `{}` defined here", param.name(db).display(db, cx.edition)),
+            );
+        }
+        Extend::SelfTyParam => {
+            let Some(range) = args_after_name(&segs[0].segment) else { return };
+            diag.suggestion_verbose(
+                span(range),
+                "the `Self` type doesn't accept type parameters",
+                "",
+                Applicability::MaybeIncorrect,
+            );
+        }
+        Extend::PrimTy(name) => {
+            for &i in checked {
+                let Some(range) = args_after_name(&segs[i].segment) else { continue };
+                diag.suggestion_verbose(
+                    span(range),
+                    format!("primitive type `{name}` doesn't have generic parameters"),
+                    "",
+                    Applicability::MaybeIncorrect,
+                );
+            }
+        }
+        Extend::DefVariant => {
+            let args: Vec<TextRange> = segs
+                .iter()
+                .filter(|it| {
+                    matches!(
+                        it.res,
+                        Some(PathResolution::Def(ModuleDef::EnumVariant(_)))
+                            | Some(PathResolution::Def(ModuleDef::Adt(Adt::Enum(_))))
+                    )
+                })
+                .filter_map(|it| args_after_name(&it.segment))
+                .collect();
+            if args.len() > 1
+                && let Some(&range) = args.last()
+            {
+                diag.note(
+                    "generic arguments are not allowed on both an enum and its variant's path \
+                     segments simultaneously; they are only valid in one place or the other",
+                );
+                diag.suggestion_verbose(
+                    span(range),
+                    "remove the generics arguments from one of the path segments",
+                    "",
+                    Applicability::MaybeIncorrect,
+                );
+            }
+        }
+        Extend::SelfTyAlias(of) => {
+            let (ty, impl_span) = match of {
+                Either::Left(impl_) => {
+                    let impl_span = impl_
+                        .source(db)
+                        .map(|src| cx.span(src.as_ref().map(|it| def_range(it.syntax()))));
+                    (impl_.self_ty(db), impl_span)
+                }
+                Either::Right(adt) => (adt.ty(db), None),
+            };
+            let Some(adt) = ty.as_adt() else { return };
+            let type_name = adt.name(db).display(db, cx.edition).to_string();
+            let ty_span = def_name_span(cx, GenericDef::Adt(adt));
+            let generics = GenericDef::Adt(adt).params(db).len();
+            let msg = format!("`Self` is of type `{}`", cx.ty(&ty));
+            match (impl_span, ty_span) {
+                (Some(impl_span), Some(ty_span)) => {
+                    let postfix = match generics {
+                        0 => ", which doesn't have generic parameters",
+                        _ => "",
+                    };
+                    let spans = MultiSpan {
+                        primary: vec![ty_span.clone()],
+                        labels: vec![
+                            (impl_span, format!("`Self` is on type `{type_name}` in this `impl`")),
+                            (ty_span, format!("`Self` corresponds to this type{postfix}")),
+                        ],
+                    };
+                    diag.span_note(spans, msg);
+                }
+                _ => {
+                    diag.note(msg);
+                }
+            }
+            for seg in segs {
+                if seg.segment.self_type_token().is_none() {
+                    continue;
+                }
+                let Some(range) = args_after_name(&seg.segment) else { continue };
+                if generics == 0 {
+                    diag.suggestion_verbose(
+                        span(range),
+                        "the `Self` type doesn't accept type parameters",
+                        "",
+                        Applicability::MachineApplicable,
+                    );
+                    return;
+                }
+                let Some(token) = seg.segment.self_type_token() else { continue };
+                diag.suggestion_verbose(
+                    span(token.text_range()),
+                    format!(
+                        "the `Self` type doesn't accept type parameters, use the concrete type's \
+                         name `{type_name}` instead if you want to specify its type parameters"
+                    ),
+                    type_name.clone(),
+                    Applicability::MaybeIncorrect,
+                );
+            }
+        }
+    }
+}

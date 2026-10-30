@@ -12,11 +12,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::model::{
-    Binding, Class, Fixup, Import, Library, NativeFile, Object, SectionKind, Shared, Special, Sym,
-    SymbolDef, SymbolKind,
+    Binding, Class, Directive, Fixup, Import, Library, NativeFile, Object, SectionKind, Shared, Special,
+    Sym, SymbolDef, SymbolKind,
 };
 use crate::stage::{Stage, error};
 use crate::state::{Def, Input, PieceId, Resolved, What};
@@ -48,6 +49,51 @@ enum Candidate {
     Common,
 }
 
+/// What an archive member is.
+enum Pulled {
+    Object(Arc<Object>),
+    /// An import library's member: one symbol of a DLL.
+    Shared(Arc<Shared>),
+}
+
+/// Whether a candidate is in a section a COMDAT group of its name dropped.
+fn dead(loads: &[Loaded], discarded: &FxHashSet<(usize, u32)>, candidate: &Candidate) -> bool {
+    let Candidate::Section { load, symbol, .. } = candidate else { return false };
+    matches!(
+        loads[*load].object.symbols[*symbol as usize].def,
+        SymbolDef::Section { section, .. } if discarded.contains(&(*load, section))
+    )
+}
+
+/// The section and offset a global is defined at: its candidate's, or through the weak
+/// externals it falls back to (`aliases`), the one it falls back to.
+fn defined_in(
+    loads: &[Loaded],
+    candidates: &FxHashMap<Sym, Candidate>,
+    aliases: &FxHashMap<Sym, (usize, u32)>,
+    mut sym: Sym,
+) -> Option<(usize, u32, u64)> {
+    let at = |load: usize, symbol: u32| match loads[load].object.symbols[symbol as usize].def {
+        SymbolDef::Section { section, value, .. } => Some((load, section, value)),
+        _ => None,
+    };
+    for _ in 0..64 {
+        match candidates.get(&sym) {
+            Some(Candidate::Section { load, symbol, .. }) => return at(*load, *symbol),
+            Some(_) => return None,
+            None => {
+                let (load, symbol) = *aliases.get(&sym)?;
+                let it = &loads[load].object.symbols[symbol as usize];
+                if it.binding == Binding::Local || it.kind == SymbolKind::Section {
+                    return at(load, symbol);
+                }
+                sym = loads[load].syms[symbol as usize];
+            }
+        }
+    }
+    None
+}
+
 impl<'a> Stage<'a> {
     /// The native inputs the change adds and removes.
     pub fn inputs(&mut self, change: &Change<'a>) -> Result<(), LinkError> {
@@ -56,15 +102,24 @@ impl<'a> Stage<'a> {
         }
         let inputs = Arc::make_mut(&mut self.new.inputs);
         inputs.retain(|it| !change.removed_natives.contains(&it.id));
+        let mut fresh = Vec::new();
         for native in &change.natives {
-            if let Some(it) = inputs.iter_mut().find(|it| it.id == native.id) {
-                it.order = native.order;
-                continue;
+            match inputs.iter_mut().find(|it| it.id == native.id) {
+                Some(it) => it.order = native.order,
+                None => fresh.push(native),
             }
-            let file = self
-                .writer
-                .read(native.name, native.bytes, &native.kind)
-                .map_err(|it| error(None, format!("{}: {it}", native.name)))?;
+        }
+        let writer = self.writer;
+        let files: Vec<Result<NativeFile, LinkError>> = fresh
+            .par_iter()
+            .map(|native| {
+                writer
+                    .read(native.name, native.bytes, &native.kind)
+                    .map_err(|it| error(None, format!("{}: {it}", native.name)))
+            })
+            .collect();
+        for (native, file) in fresh.into_iter().zip(files) {
+            let file = file?;
             inputs.push(Input {
                 id: native.id,
                 name: native.name.into(),
@@ -107,11 +162,11 @@ impl<'a> Stage<'a> {
         loads.push(Loaded { obj, object, input, syms });
     }
 
-    fn member(&mut self, input: usize, member: u32) -> Result<Arc<Object>, LinkError> {
+    fn member(&mut self, input: usize, member: u32) -> Result<Pulled, LinkError> {
         let it = &self.new.inputs[input];
         let obj = Obj { native: it.id, member: member + 1 };
         if let Some(object) = self.objects.get(&obj) {
-            return Ok(object.clone());
+            return Ok(Pulled::Object(object.clone()));
         }
         let NativeFile::Archive(archive) = &*it.file else { unreachable!("a member of an archive") };
         let entry = &archive.members[member as usize];
@@ -123,12 +178,31 @@ impl<'a> Stage<'a> {
             .writer
             .read(&name, bytes, &NativeKind::Object)
             .map_err(|what| error(None, format!("{name}: {what}")))?;
-        let NativeFile::Object(object) = file else {
-            return Err(error(None, format!("{name}: an archive member that is not an object")));
-        };
-        let object = Arc::new(object);
-        self.objects.insert(obj, object.clone());
-        Ok(object)
+        match file {
+            NativeFile::Object(object) => {
+                let object = Arc::new(object);
+                self.objects.insert(obj, object.clone());
+                Ok(Pulled::Object(object))
+            }
+            NativeFile::Shared(shared) => Ok(Pulled::Shared(Arc::new(shared))),
+            NativeFile::Archive(_) => Err(error(None, format!("{name}: an archive in an archive"))),
+        }
+    }
+
+    /// Loads a member pulled from an archive: an object, or an import library's member,
+    /// which adds its DLL's symbol to the shared libraries.
+    fn pull(
+        &mut self,
+        loads: &mut Vec<Loaded>,
+        shared: &mut Vec<Arc<Shared>>,
+        input: usize,
+        member: u32,
+    ) -> Result<(), LinkError> {
+        match self.member(input, member)? {
+            Pulled::Object(object) => self.load(loads, input, member + 1, object),
+            Pulled::Shared(it) => shared.push(it),
+        }
+        Ok(())
     }
 
     /// The names Rust pieces refer to, with whether every reference is weak.
@@ -157,19 +231,20 @@ impl<'a> Stage<'a> {
         let mut wanted = self.wanted();
         let mut roots: Vec<Sym> = wanted.keys().copied().collect();
         let mut extra: Vec<String> = Vec::new();
-        match &self.output.kind {
-            OutputKind::Executable { entry } => extra.push(entry.clone()),
-            OutputKind::Shared { exports, .. } => extra.extend(exports.iter().cloned()),
+        let entry = match &self.output.kind {
+            OutputKind::Executable { entry } => Some(entry.clone()),
+            OutputKind::Shared { .. } => self.writer.shared_entry().map(str::to_owned),
+        };
+        extra.extend(entry.clone());
+        if let OutputKind::Shared { exports, .. } = &self.output.kind {
+            extra.extend(exports.iter().cloned());
         }
         extra.extend(["_init".to_owned(), "_fini".to_owned()]);
         for name in &extra {
             let sym = self.sym(SymKey::Name(name.as_str().into()));
             roots.push(sym);
         }
-        let entry_name = match &self.output.kind {
-            OutputKind::Executable { entry } => Some(self.sym(SymKey::Name(entry.as_str().into()))),
-            OutputKind::Shared { .. } => None,
-        };
+        let entry_name = entry.as_ref().map(|it| self.sym(SymKey::Name(it.as_str().into())));
         if let Some(entry) = entry_name {
             wanted.entry(entry).or_insert(false);
         }
@@ -181,6 +256,7 @@ impl<'a> Stage<'a> {
         }
 
         let mut loads: Vec<Loaded> = Vec::new();
+        let mut pulled_shared: Vec<Arc<Shared>> = Vec::new();
         let mut archives: Vec<(usize, FxHashMap<&str, u32>)> = Vec::new();
         let inputs = self.new.inputs.clone();
         for (at, input) in inputs.iter().enumerate() {
@@ -196,8 +272,7 @@ impl<'a> Stage<'a> {
                 NativeFile::Archive(archive) => {
                     if matches!(input.kind, NativeKind::Archive { whole: true }) {
                         for member in 0..archive.members.len() as u32 {
-                            let object = self.member(at, member)?;
-                            self.load(&mut loads, at, member + 1, object);
+                            self.pull(&mut loads, &mut pulled_shared, at, member)?;
                         }
                     } else {
                         let mut index = FxHashMap::default();
@@ -218,23 +293,77 @@ impl<'a> Stage<'a> {
         }
 
         // COMDAT, candidates and archive pulling, to a fixed point.
-        let mut groups: FxHashMap<String, usize> = FxHashMap::default();
+        let mut groups: FxHashMap<String, (usize, usize)> = FxHashMap::default();
         let mut discarded: FxHashSet<(usize, u32)> = FxHashSet::default();
         let mut candidates: FxHashMap<Sym, Candidate> = FxHashMap::default();
         let mut commons: BTreeMap<Box<str>, (u64, u64)> = BTreeMap::new();
         let mut undefined_strong: BTreeSet<Sym> = BTreeSet::new();
         let mut pulled: FxHashSet<(usize, u32)> = FxHashSet::default();
+        let mut fallbacks: BTreeMap<Sym, (usize, u32)> = BTreeMap::new();
+        // Names the link must define whatever refers to them: `/INCLUDE`, `/EXPORT`, what
+        // weak externals fall back to, `__imp_X`'s `X`.
+        let mut required: FxHashSet<Sym> = FxHashSet::default();
+        let mut exports_asked: Vec<(String, String, bool)> = Vec::new();
+        let mut mismatches: FxHashMap<String, (String, usize)> = FxHashMap::default();
+        let mut native_imports: FxHashMap<Sym, blaze_codegen::wasm::Import> = FxHashMap::default();
         let mut done = 0;
         loop {
             while done < loads.len() {
                 let load = &loads[done];
-                for group in &load.object.groups {
-                    if let Some(winner) = groups.get(&group.name) {
-                        if *winner != done {
-                            discarded.extend(group.sections.iter().map(|it| (done, *it)));
+                for (index, group) in load.object.groups.iter().enumerate() {
+                    let size = |load: &Loaded, group: &crate::model::Group| {
+                        group.sections.first().map_or(0, |it| load.object.sections[*it as usize].data.len())
+                    };
+                    match groups.get(&group.name).copied() {
+                        None => {
+                            groups.insert(group.name.clone(), (done, index));
                         }
-                    } else {
-                        groups.insert(group.name.clone(), done);
+                        Some((winner, _)) if winner == done => {}
+                        Some((winner, at)) => {
+                            let old = &loads[winner].object.groups[at];
+                            if group.largest && size(load, group) > size(&loads[winner], old) {
+                                discarded.extend(old.sections.iter().map(|it| (winner, *it)));
+                                groups.insert(group.name.clone(), (done, index));
+                            } else {
+                                discarded.extend(group.sections.iter().map(|it| (done, *it)));
+                            }
+                        }
+                    }
+                }
+                for directive in &load.object.directives {
+                    match directive {
+                        Directive::Include(name) => {
+                            let sym = self.sym(SymKey::Name(name.as_str().into()));
+                            undefined_strong.insert(sym);
+                            required.insert(sym);
+                            roots.push(sym);
+                        }
+                        Directive::Export { name, symbol, data } => {
+                            let sym = self.sym(SymKey::Name(symbol.as_str().into()));
+                            undefined_strong.insert(sym);
+                            required.insert(sym);
+                            roots.push(sym);
+                            if !exports_asked.iter().any(|it| it.0 == *name) {
+                                exports_asked.push((name.clone(), symbol.clone(), *data));
+                            }
+                        }
+                        Directive::Mismatch { key, value } => match mismatches.get(key) {
+                            Some((first, by)) if first != value => {
+                                return Err(error(
+                                    None,
+                                    format!(
+                                        "`{key}` is `{first}` in {} and `{value}` in {} (/FAILIFMISMATCH)",
+                                        self.new.inputs[loads[*by].input].name,
+                                        self.new.inputs[load.input].name
+                                    ),
+                                ));
+                            }
+                            Some(_) => {}
+                            None => {
+                                mismatches.insert(key.clone(), (value.clone(), done));
+                            }
+                        },
+                        Directive::NoDefaultLib(_) => {}
                     }
                 }
                 for (at, symbol) in load.object.symbols.iter().enumerate() {
@@ -243,11 +372,21 @@ impl<'a> Stage<'a> {
                     }
                     let sym = load.syms[at];
                     let weak = symbol.binding == Binding::Weak;
+                    if let Some(import) = &symbol.import {
+                        native_imports.entry(sym).or_insert_with(|| import.clone());
+                    }
                     let candidate = match symbol.def {
                         SymbolDef::Undefined => {
                             if !weak {
                                 undefined_strong.insert(sym);
                             }
+                            continue;
+                        }
+                        SymbolDef::Fallback { symbol, search } => {
+                            if search {
+                                undefined_strong.insert(sym);
+                            }
+                            fallbacks.entry(sym).or_insert((done, symbol));
                             continue;
                         }
                         SymbolDef::Section { section, .. } => {
@@ -282,7 +421,7 @@ impl<'a> Stage<'a> {
                         Candidate::Section { .. } | Candidate::Absolute { .. } => 1,
                         Candidate::Common => 0,
                     };
-                    match candidates.get(&sym) {
+                    match candidates.get(&sym).filter(|it| !dead(&loads, &discarded, it)) {
                         None => {
                             candidates.insert(sym, candidate);
                         }
@@ -326,9 +465,37 @@ impl<'a> Stage<'a> {
                 break;
             }
             for (input, member) in pull {
-                let object = self.member(input, member)?;
-                self.load(&mut loads, input, member + 1, object);
+                self.pull(&mut loads, &mut pulled_shared, input, member)?;
             }
+        }
+        candidates.retain(|_, it| !dead(&loads, &discarded, it));
+
+        // Weak externals the link left undefined: each is the symbol it falls back to.
+        let mut aliases: FxHashMap<Sym, (usize, u32)> = FxHashMap::default();
+        for (sym, (load, symbol)) in &fallbacks {
+            if !candidates.contains_key(sym) && !rust_names.contains_key(sym) {
+                aliases.insert(*sym, (*load, *symbol));
+            }
+        }
+        for (sym, (load, symbol)) in &aliases {
+            let mut seen = FxHashSet::default();
+            let mut at = (*load, *symbol);
+            loop {
+                let it = &loads[at.0].object.symbols[at.1 as usize];
+                let next = loads[at.0].syms[at.1 as usize];
+                if it.binding == Binding::Local || it.kind == SymbolKind::Section || !seen.insert(next) {
+                    if seen.contains(sym) {
+                        let SymKey::Name(name) = self.symbols.key(*sym) else { unreachable!("a global") };
+                        return Err(error(None, format!("the weak external `{name}` falls back to itself")));
+                    }
+                    break;
+                }
+                match aliases.get(&next) {
+                    Some(then) => at = *then,
+                    None => break,
+                }
+            }
+            required.insert(loads[*load].syms[*symbol as usize]);
         }
 
         // What every loaded symbol is defined in: (load, section, value).
@@ -340,14 +507,19 @@ impl<'a> Stage<'a> {
                     _ => None,
                 };
             }
-            match candidates.get(&loads[load].syms[symbol as usize])? {
-                Candidate::Section { load, symbol, .. } => match loads[*load].object.symbols[*symbol as usize].def {
-                    SymbolDef::Section { section, value, .. } => Some((*load, section, value)),
-                    _ => None,
-                },
-                _ => None,
-            }
+            defined_in(loads, candidates, &aliases, loads[load].syms[symbol as usize])
         };
+        // A kept COMDAT group lives or goes whole: each section's group's sections.
+        let mut group_of: FxHashMap<(usize, u32), (usize, usize)> = FxHashMap::default();
+        for (load, it) in loads.iter().enumerate() {
+            for (index, group) in it.object.groups.iter().enumerate() {
+                for section in &group.sections {
+                    if !discarded.contains(&(load, *section)) {
+                        group_of.insert((load, *section), (load, index));
+                    }
+                }
+            }
+        }
 
         // Collection: mark from the roots.
         let specials_by_section: FxHashMap<String, Vec<(usize, u32)>> = {
@@ -365,16 +537,25 @@ impl<'a> Stage<'a> {
         let mut work: Vec<(usize, u32)> = Vec::new();
         let mut named_done: FxHashSet<String> = FxHashSet::default();
         let mark_name = |this: &Self, sym: Sym, work: &mut Vec<(usize, u32)>, named_done: &mut FxHashSet<String>| {
-            if let Some(Candidate::Section { load, symbol, .. }) = candidates.get(&sym) {
-                if let SymbolDef::Section { section, .. } = loads[*load].object.symbols[*symbol as usize].def {
-                    work.push((*load, section));
-                }
+            if let Some((load, section, _)) = defined_in(&loads, &candidates, &aliases, sym) {
+                work.push((load, section));
             }
             if let SymKey::Name(name) = this.symbols.key(sym) {
-                if let Some(Special::Section { name: section, .. }) = this.writer.special(name) {
-                    if named_done.insert(section.clone()) {
-                        work.extend(specials_by_section.get(&section).into_iter().flatten().copied());
+                match this.writer.special(name) {
+                    Some(Special::Section { name: section, .. }) => {
+                        if named_done.insert(section.clone()) {
+                            work.extend(specials_by_section.get(&section).into_iter().flatten().copied());
+                        }
                     }
+                    Some(Special::Got(target)) => {
+                        let target = this.symbols.find(&SymKey::Name(target.as_str().into()));
+                        if let Some((load, section, _)) =
+                            target.and_then(|it| defined_in(&loads, &candidates, &aliases, it))
+                        {
+                            work.push((load, section));
+                        }
+                    }
+                    _ => {}
                 }
             }
         };
@@ -411,6 +592,9 @@ impl<'a> Stage<'a> {
             while let Some((load, section)) = work.pop() {
                 if discarded.contains(&(load, section)) || !marked.insert((load, section)) {
                     continue;
+                }
+                if let Some((owner, index)) = group_of.get(&(load, section)) {
+                    work.extend(loads[*owner].object.groups[*index].sections.iter().map(|it| (*owner, *it)));
                 }
                 let it = &loads[load].object.sections[section as usize];
                 for fixup in &it.fixups {
@@ -592,6 +776,12 @@ impl<'a> Stage<'a> {
             defined.insert(*sym);
             self.define(*sym, Def::Alias(*target));
         }
+        let mut sorted: Vec<(Sym, (usize, u32))> = aliases.iter().map(|(s, at)| (*s, *at)).collect();
+        sorted.sort_unstable_by_key(|it| it.0);
+        for (sym, (load, symbol)) in sorted {
+            defined.insert(sym);
+            self.define(sym, Def::Alias(loads[load].syms[symbol as usize]));
+        }
         let mut defines: FxHashMap<PieceId, Vec<Sym>> = FxHashMap::default();
         for it in &loads {
             for (at, sym) in it.syms.iter().enumerate() {
@@ -653,26 +843,49 @@ impl<'a> Stage<'a> {
             }
             names.insert(*sym);
         }
+        names.extend(required.iter().copied());
+        // `__imp_X` is X's GOT cell: X is resolved as a strong reference is.
+        let got_targets: Vec<Box<str>> = names
+            .iter()
+            .filter(|it| !defined.contains(*it))
+            .filter_map(|it| match self.symbols.key(*it) {
+                SymKey::Name(name) => match self.writer.special(name) {
+                    Some(Special::Got(target)) => Some(target.into_boxed_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for target in got_targets {
+            let sym = self.sym(SymKey::Name(target));
+            required.insert(sym);
+            names.insert(sym);
+        }
         let mut libraries: Vec<(Library, &Shared)> = Vec::new();
-        for input in inputs.iter() {
-            if let NativeFile::Shared(shared) = &*input.file {
-                let as_needed = matches!(input.kind, NativeKind::Shared { as_needed: true });
-                let mut all: Vec<&Shared> = vec![shared];
-                let mut at = 0;
-                while at < all.len() {
-                    let this: &Shared = all[at];
-                    all.extend(this.more.iter());
-                    at += 1;
-                }
-                for it in all {
-                    libraries.push((Library { name: it.name.clone(), as_needed }, it));
-                }
+        let shared_inputs = inputs.iter().filter_map(|input| match &*input.file {
+            NativeFile::Shared(shared) => Some((shared, matches!(input.kind, NativeKind::Shared { as_needed: true }))),
+            _ => None,
+        });
+        for (shared, as_needed) in shared_inputs.chain(pulled_shared.iter().map(|it| (&**it, false))) {
+            let mut all: Vec<&Shared> = vec![shared];
+            let mut at = 0;
+            while at < all.len() {
+                let this: &Shared = all[at];
+                all.extend(this.more.iter());
+                at += 1;
+            }
+            for it in all {
+                libraries.push((Library { name: it.name.clone(), as_needed }, it));
             }
         }
+        // Libraries of one name are one library (an import library's members of one DLL).
+        let mut first_of: FxHashMap<&str, usize> = FxHashMap::default();
+        let canonical: Vec<usize> =
+            (0..libraries.len()).map(|at| *first_of.entry(libraries[at].0.name.as_str()).or_insert(at)).collect();
         let mut exports: FxHashMap<&str, (usize, &crate::model::SharedSymbol)> = FxHashMap::default();
         for (at, (_, shared)) in libraries.iter().enumerate() {
             for it in &shared.symbols {
-                exports.entry(it.name.as_str()).or_insert((at, it));
+                exports.entry(it.name.as_str()).or_insert((canonical[at], it));
             }
         }
         let mut imports: Vec<(Sym, Import, usize)> = Vec::new();
@@ -683,7 +896,9 @@ impl<'a> Stage<'a> {
                 continue;
             }
             let SymKey::Name(name) = self.symbols.key(sym).clone() else { continue };
-            let weak = wanted.get(&sym).copied().unwrap_or(true) && native_weak.get(&sym).copied().unwrap_or(true);
+            let weak = !required.contains(&sym)
+                && wanted.get(&sym).copied().unwrap_or(true)
+                && native_weak.get(&sym).copied().unwrap_or(true);
             if let Some(special) = self.writer.special(&name) {
                 specials.push((sym, special));
                 continue;
@@ -697,9 +912,39 @@ impl<'a> Stage<'a> {
                         version: it.version.clone(),
                         kind: it.kind,
                         weak: weak || it.weak,
+                        wasm: None,
                     },
                     *library,
                 ));
+                continue;
+            }
+            if self.output.format == crate::Format::Wasm {
+                // rustc links wasm with `--allow-undefined`: a function something says the
+                // import of is imported; a weak one is null.
+                let import = native_imports.get(&sym).or_else(|| self.new.wasm_imports.get(&*name));
+                match import {
+                    Some(it) if !weak => {
+                        let import = Import {
+                            name: name.to_string(),
+                            library: None,
+                            version: None,
+                            kind: SymbolKind::Function,
+                            weak: false,
+                            wasm: Some(it.clone()),
+                        };
+                        imports.push((sym, import, usize::MAX));
+                    }
+                    _ if weak => self.define(sym, Def::Absolute(0)),
+                    _ => {
+                        return Err(error(
+                            None,
+                            format!(
+                                "undefined symbol `{name}`{}, which no input says the wasm import of",
+                                self.referrer(sym)
+                            ),
+                        ));
+                    }
+                }
                 continue;
             }
             if weak && executable {
@@ -709,7 +954,14 @@ impl<'a> Stage<'a> {
             if !executable {
                 imports.push((
                     sym,
-                    Import { name: name.to_string(), library: None, version: None, kind: SymbolKind::Other, weak },
+                    Import {
+                        name: name.to_string(),
+                        library: None,
+                        version: None,
+                        kind: SymbolKind::Other,
+                        weak,
+                        wasm: None,
+                    },
                     usize::MAX,
                 ));
                 continue;
@@ -732,7 +984,7 @@ impl<'a> Stage<'a> {
         let mut index = vec![None; libraries.len()];
         let mut needed = Vec::new();
         for (at, (library, _)) in libraries.iter().enumerate() {
-            if !library.as_needed || used.contains(&at) {
+            if canonical[at] == at && (!library.as_needed || used.contains(&at)) {
                 index[at] = Some(needed.len() as u32);
                 needed.push(library.clone());
             }
@@ -772,9 +1024,8 @@ impl<'a> Stage<'a> {
             Def::None => None,
             _ => Some(it),
         });
-        if executable && entry.is_none() {
-            let OutputKind::Executable { entry } = &self.output.kind else { unreachable!() };
-            return Err(error(None, format!("the entry point `{entry}` is not defined")));
+        if let (Some(name), None) = (&entry_name, entry) {
+            return Err(error(None, format!("the entry point {} is not defined", crate::stage::describe(self.symbols.key(*name)))));
         }
         self.new.resolved = Arc::new(Resolved {
             imports: order.iter().map(|it| it.1.clone()).collect(),
@@ -783,6 +1034,7 @@ impl<'a> Stage<'a> {
             kept,
             frames: frame_keys,
             commons,
+            exports: exports_asked,
         });
         Ok(())
     }

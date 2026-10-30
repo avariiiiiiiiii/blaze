@@ -4,7 +4,8 @@
 //! forms lane proof's harness reads: [`work_json`], [`codegen_inputs_json`] and [`trace_cbor`].
 
 use blaze_api::{
-    Diagnostic, Level, LinkKind, Ranked, Response, TestOutcome, TestResult, Traced, Verb, Worked,
+    Diagnostic, FetchVerb, Level, LinkKind, Ranked, Response, TestOutcome, TestResult, Traced,
+    Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -31,7 +32,7 @@ fn write(out: &mut String, response: &Response, color: bool) {
             line(out, format!("{} {root}{rebased}", paint(GREEN, "committed", color)));
         }
         Response::Diagnostic(diagnostic) => diagnostic_lines(out, diagnostic, 0, color),
-        Response::Built { artifacts, profile } => {
+        Response::Built { artifacts, profile, .. } => {
             for artifact in artifacts {
                 let word = paint(GREEN, &format!("{:>12}", "Built"), color);
                 line(
@@ -55,7 +56,15 @@ fn write(out: &mut String, response: &Response, color: bool) {
             let source = unit.source.as_deref().map(|it| format!(" {it}")).unwrap_or_default();
             line(out, format!("{word} {} v{}{source}", unit.name, unit.version));
         }
-        Response::BuildScript(_) => {}
+        Response::Fetched { verb, what } => {
+            let verb = match verb {
+                FetchVerb::Updating => "Updating",
+                FetchVerb::Downloaded => "Downloaded",
+            };
+            let word = paint(GREEN, &format!("{verb:>12}"), color);
+            line(out, format!("{word} {what}"));
+        }
+        Response::BuildScript(_) | Response::UnitEnded(_) => {}
         Response::Work(worked) => {
             let link = match worked.link {
                 LinkKind::Patched => "patched in place",

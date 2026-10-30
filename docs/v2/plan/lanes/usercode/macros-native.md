@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # Native expanders (#1297)
 
-Part of [usercode](plan/lanes/usercode.md). Code: `crates/blaze-expand/src/native/`; requests:
+Part of [usercode](../usercode.md). Code: `crates/blaze-expand/src/native/`; requests:
 `v2/requests/usercode-macros-native.md`.
 
 ## What runs
@@ -99,7 +99,51 @@ anchor, context or suffix, and a shorter tree; and serde's `Serialize` and `Dese
 (structs, enums, generics, `#[serde(rename, skip)]`, a union's error), thiserror 1 and 2
 (`#[error("…")]`, `transparent`, `#[from]`, `#[source]`, a missing attribute's error),
 tokio's `main` (default and `flavor = "current_thread"`, a non-async error), `test`, and its
-`select!` helpers (including the panic they raise) expand to what they should.
+`select!` helpers (including the panic they raise) expand to what they should. The one-pass
+reader reads every written tree, negative literals included, as the wasm host's two-pass
+reader does; `find` follows the files on disk (a kept snapshot is the same one, a changed byte
+of syn 3 misses with its file named, the restored bytes hit again, an extra file misses); and a
+stamp changed in the tick it was read in is not trusted.
+
+## Speed: the fastest known technique per part
+
+**Matching a library (`find`).** The technique is git's index: a stat cache of every file of the
+closure with git's racily-clean rule, which is the fastest known way to know a tree is unchanged
+without a file watcher. Per library, after the first load, a hit is one `stat` of the
+description and one of each file and directory of its closure, compared with a 32-byte stamp
+(length, inode, mtime and ctime in nanoseconds, `const`-asserted) walked down one column of a
+struct-of-arrays snapshot. It reads no file, takes no lock, writes no shared memory (one
+`AtomicU32` "last snapshot", stored only when it changes) and allocates nothing (the
+description path is a per-thread buffer the hook fills). The verdict, the macro table and each
+macro's identity are computed once per snapshot (`OnceLock`) and kept by content id in
+`blaze_ids::Sharded` tables, append-only with lock-free reads: descriptions by (path, stamp),
+snapshots by their stamps and hashes, file hashes by (path, settled stamp). A stamp within
+`SETTLE_NS` (2 s, FAT's coarsest clock) of the moment it was read is not trusted: such a
+snapshot is used once and not kept, and such a file is hashed again next time. A miss hashes
+only the files whose stamps changed, with BLAKE3 streamed from the file (`update_reader`, its
+SIMD paths chosen at run time). Cfg matching is a merge of sorted lists against
+precomputed identifier-word sets (FxHash) of the compiled sources, and each closure's package
+indices and pairing are precomputed.
+
+What would beat it, and why it isn't used yet: Merkle directory hashes kept by the VFS would
+make a hit one 32-byte compare per package with no `stat`, and a watcher (FSEvents, inotify, or
+watchman's clock) would make it cost in proportion to changes. Both belong to the VFS, which
+blaze-expand does not see; using them means the hook giving a directory hash beside the
+description path. Batched stats
+(`getattrlistbulk` on macOS, `statx` through io_uring on Linux) would cut the syscall count of
+the walk; they are the next step if a load profile shows the walk.
+
+**Expanding.** Each thread keeps its span table and its input, attribute and output buffers
+(`Scratch`, taken out of a `Cell` for the call, so a reentrant expansion gets fresh ones) and
+reuses them: a hit allocates nothing for the wire. The input is written once in the wasm wire
+encoding, and the output is read in one pass straight into rust-analyzer's flat token buffer
+(`TopSubtree::from_serialized`), with no tree per group in between. Inside the expander the
+crates' own code runs as compiled native code, with no wasm boundary or copy into linear memory.
+
+What isn't matched: the shim's `TokenStream` is the wasm guest's (`Rc<Vec<TokenTree>>`, `Rc<str>`
+text), and it is the wasm lane's to change. The reference is rustc's proc-macro bridge, whose
+handles are `u32`s into server-side interned symbols and spans; moving the guest to handles into
+an arena would remove the per-token allocations and the encoding.
 
 ## bitflags: no native expander
 

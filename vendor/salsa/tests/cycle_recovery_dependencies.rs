@@ -57,7 +57,6 @@ fn the_test() {
     assert_eq!(entry(&db, input), 5);
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillCheckCancellation",
             "WillExecute { database_key: query(Id(0)) }",

@@ -24,14 +24,16 @@ fn query_b(db: &dyn KnobsDatabase, input: Input) -> u32 {
 #[test_log::test]
 fn concurrent_first_insert() {
     crate::sync::check(|| {
-        let db_a = Knobs::default();
-        let input = Input::new(&db_a, 42);
-        let db_b = db_a.clone();
+        let db = Knobs::default();
+        let input = Input::new(&db, 42);
+        let db = &db;
 
-        let a = thread::spawn(move || query_a(&db_a, input));
-        let b = thread::spawn(move || query_b(&db_b, input));
+        thread::scope(|scope| {
+            let a = scope.spawn(move || query_a(db, input));
+            let b = scope.spawn(move || query_b(db, input));
 
-        assert_eq!(a.join().unwrap(), 42);
-        assert_eq!(b.join().unwrap(), 42);
+            assert_eq!(a.join().unwrap(), 42);
+            assert_eq!(b.join().unwrap(), 42);
+        });
     });
 }

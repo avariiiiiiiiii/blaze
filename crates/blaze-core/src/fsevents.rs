@@ -3,7 +3,6 @@
 //! [`Done::Changed`].
 
 use std::{
-    collections::BTreeSet,
     ffi::{CStr, CString, c_char, c_void},
     io,
     os::unix::ffi::{OsStrExt as _, OsStringExt as _},
@@ -111,14 +110,19 @@ struct Shared {
 
 impl Shared {
     /// The name under the watched directory of a path FSEvents gave: `None` for one outside
-    /// it, `Some(None)` for one under it that no [`FileName`] can name.
-    fn name(&self, path: &Path) -> Option<Option<FileName>> {
+    /// it, `Some(None)` for one under it that no [`FileName`] can name. `buffer` is room to
+    /// write the name in, reused across the paths of a batch.
+    fn name(&self, path: &Path, buffer: &mut String) -> Option<Option<FileName>> {
         if let Ok(rest) = path.strip_prefix(&self.real_dir) {
             return Some(match rest.as_os_str().is_empty() {
                 true => Some(self.dir.clone()),
-                false => {
-                    rest.to_str().and_then(|rest| FileName::new(&format!("{}/{rest}", self.dir)))
-                }
+                false => rest.to_str().and_then(|rest| {
+                    buffer.clear();
+                    buffer.push_str(self.dir.as_str());
+                    buffer.push('/');
+                    buffer.push_str(rest);
+                    FileName::new(buffer.as_str())
+                }),
             });
         }
         let rest = path.strip_prefix(&self.root).ok()?;
@@ -220,12 +224,12 @@ impl Stream {
         unsafe { FSEventStreamSetDispatchQueue(stream, queue) };
         // SAFETY: the stream is scheduled on its queue.
         if unsafe { FSEventStreamStart(stream) } == 0 {
-            // SAFETY: the stream did not start: no callback runs; both are released once.
-            unsafe {
-                FSEventStreamInvalidate(stream);
-                FSEventStreamRelease(stream);
-                dispatch_release(queue);
-            }
+            // SAFETY: the stream did not start, so no callback runs during or after this.
+            unsafe { FSEventStreamInvalidate(stream) };
+            // SAFETY: the stream made above, released once and not used after.
+            unsafe { FSEventStreamRelease(stream) };
+            // SAFETY: the queue made above, released once and not used after.
+            unsafe { dispatch_release(queue) };
             return Err(failed("FSEventStreamStart refused it".into()));
         }
         Ok(Stream { stream, queue, shared })
@@ -244,24 +248,26 @@ impl Drop for Stream {
         unsafe { (*self.shared).stopped.store(true, Ordering::Release) };
         let mut stream = self.stream;
         // SAFETY: the stream is stopped and invalidated on its own queue, so no callback runs
-        // during it; the second sync runs after any callback queued before the invalidation.
-        unsafe {
-            dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue);
-            dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing);
-            FSEventStreamRelease(self.stream);
-            dispatch_release(self.queue);
-            drop(Box::from_raw(self.shared));
-        }
+        // during it; `stream` outlives the call, which returns once the work has run.
+        unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
+        // SAFETY: a serial queue: this runs after any callback queued before the invalidation.
+        unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
+        // SAFETY: invalidated, with no callback left to run; released once, not used after.
+        unsafe { FSEventStreamRelease(self.stream) };
+        // SAFETY: the queue has run its last work; released once, not used after.
+        unsafe { dispatch_release(self.queue) };
+        // SAFETY: made by `Box::into_raw` in `start`; no callback reads it any more.
+        drop(unsafe { Box::from_raw(self.shared) });
     }
 }
 
 extern "C" fn end_on_queue(stream: *mut c_void) {
-    // SAFETY: the stream `Drop` passed, started and not yet released.
-    unsafe {
-        let stream = *stream.cast::<FSEventStreamRef>();
-        FSEventStreamStop(stream);
-        FSEventStreamInvalidate(stream);
-    }
+    // SAFETY: `Drop` passes a pointer to its copy of the stream, alive for this call.
+    let stream = unsafe { *stream.cast::<FSEventStreamRef>() };
+    // SAFETY: a stream started and not yet released, stopped on its own queue.
+    unsafe { FSEventStreamStop(stream) };
+    // SAFETY: as above; no callback is scheduled once this returns.
+    unsafe { FSEventStreamInvalidate(stream) };
 }
 
 extern "C" fn nothing(_: *mut c_void) {}
@@ -279,16 +285,21 @@ extern "C" fn heard(
     if shared.stopped.load(Ordering::Acquire) {
         return;
     }
-    let paths = paths.cast::<*const c_char>();
-    let mut files = BTreeSet::new();
+    // SAFETY: FSEvents passes `count` flags, alive for the callback.
+    let flags = unsafe { std::slice::from_raw_parts(flags, count) };
+    // SAFETY: and `count` C strings, without kFSEventStreamCreateFlagUseCFTypes.
+    let paths = unsafe { std::slice::from_raw_parts(paths.cast::<*const c_char>(), count) };
+    let mut files = Vec::with_capacity(count);
+    let mut buffer = String::new();
     let mut lost = false;
     for n in 0..count {
-        // SAFETY: `count` flags and NUL-terminated paths, without kFSEventStreamCreateFlagUseCFTypes.
-        let (flag, path) = unsafe { (*flags.add(n), CStr::from_ptr(*paths.add(n))) };
+        let (flag, path) = (flags[n], paths[n]);
+        // SAFETY: a NUL-terminated path, alive for the callback.
+        let path = unsafe { CStr::from_ptr(path) };
         lost |= flag & LOSES != 0;
         let path = Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
-        match shared.name(path) {
-            Some(Some(name)) => _ = files.insert(name),
+        match shared.name(path, &mut buffer) {
+            Some(Some(name)) => files.push(name),
             Some(None) => lost = true,
             None => {}
         }
@@ -296,13 +307,16 @@ extern "C" fn heard(
     if files.is_empty() && !lost {
         return;
     }
-    let done = Done::Changed { files: files.into_iter().collect(), lost };
+    files.sort_unstable();
+    files.dedup();
+    let done = Done::Changed { files, lost };
     (shared.send)(Completion { tag: shared.tag, done });
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         sync::mpsc,
         time::{Duration, Instant},
     };

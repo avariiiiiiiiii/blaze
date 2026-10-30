@@ -80,6 +80,8 @@ pub(crate) enum Event {
     Lazy { kind: SyntaxKind, n_input_tokens: u32 },
 }
 
+const _: () = assert!(size_of::<Event>() == 8, "an event is 8 bytes");
+
 impl Event {
     pub(crate) fn tombstone() -> Self {
         Event::Start { kind: TOMBSTONE, forward_parent: None }
@@ -96,6 +98,12 @@ pub(super) fn process(mut events: Vec<Event>, mut errors: Vec<String>) -> Output
 
     for i in 0..events.len() {
         match events[i] {
+            // Most nodes have no forward parent: they enter at once, with no list to reverse.
+            Event::Start { kind, forward_parent: None } => {
+                if kind != TOMBSTONE {
+                    res.enter_node(kind);
+                }
+            }
             Event::Start { kind, forward_parent } => {
                 // For events[A, B, C], B is A's forward_parent, C is B's forward_parent,
                 // in the normal control flow, the parent-child relation: `A -> B -> C`,

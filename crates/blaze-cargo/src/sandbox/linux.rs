@@ -54,15 +54,15 @@
 //! not refused.
 
 use std::{
-    collections::HashMap,
     ffi::{CString, OsString},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
 use blaze_core::Untraceable;
+use rustc_hash::FxHashMap;
 
-use super::{Also, Bind, MARK, Recorder, Spec, View, tidy};
+use super::{Also, Bind, MARK, Recorder, Spec, View, tidy, tidy_into};
 
 /// The library a traced run's processes load (`LD_PRELOAD`), built from `linux_interpose.c` by
 /// `build.rs`: it tells the supervisor what its filter can't see, the variables read by name
@@ -307,9 +307,32 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
-// _IOWR('!', 0, struct seccomp_notif) and _IOWR('!', 1, struct seccomp_notif_resp).
+const SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: libc::c_ulong = 1;
+// _IOWR('!', 0, struct seccomp_notif), _IOWR('!', 1, struct seccomp_notif_resp) and
+// _IOW('!', 4, __u64).
 const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+const SECCOMP_IOCTL_NOTIF_SET_FLAGS: libc::c_ulong = 0x4008_2104;
+
+/// Each call of [`CALLS`] by its number, one past its index (0 for none): the supervisor
+/// finds a notification's call in one load.
+const BY_NR: [u8; 512] = {
+    let mut by = [0u8; 512];
+    let mut at = 0;
+    while at < CALLS.len() {
+        by[CALLS[at].nr as usize] = at as u8 + 1;
+        at += 1;
+    }
+    by
+};
+
+const _: () = assert!(CALLS.len() < u8::MAX as usize);
+
+/// The call of [`CALLS`] numbered `nr`, if it is one.
+fn call_of(nr: i32) -> Option<&'static Call> {
+    let at = *BY_NR.get(usize::try_from(nr).ok()?)?;
+    CALLS.get(usize::from(at).checked_sub(1)?)
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -585,7 +608,7 @@ fn run_in(
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
-    let mut watch = Watch { around, network: also.network, processes: HashMap::new() };
+    let mut watch = Watch { around, network: also.network, processes: FxHashMap::default() };
     if let Some(listener) = listener {
         supervise(listener, first, &mut recorder, &mut watch);
         unsafe { libc::close(listener) };
@@ -1737,6 +1760,13 @@ fn received(socket: libc::c_int) -> Option<libc::c_int> {
 /// until the process `first` has ended, or no process is left that the filter is on, the
 /// program seeing what `around` says.
 fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, watch: &mut Watch) {
+    // The kernel wakes the supervisor on the CPU of the thread it holds and switches to it
+    // there, as gVisor has it, rather than waking it as any other waiter. A kernel before 6.6
+    // has no such flag and refuses it: the calls are answered the same, each a wake-up later.
+    // SAFETY: the flag is the argument itself.
+    let flags = SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP;
+    unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SET_FLAGS as _, flags) };
+    let mut scratch = Scratch::default();
     let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, first, 0) } as libc::c_int;
     let mut fds = vec![libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 }];
     if pidfd >= 0 {
@@ -1752,7 +1782,7 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
             break;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            answer(listener, recorder, watch);
+            answer(listener, recorder, watch, &mut scratch);
             continue;
         }
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
@@ -1772,7 +1802,19 @@ struct Watch {
     /// Whether the program may reach the network ([`Also::network`]).
     network: bool,
     /// The process of each thread seen, by the thread's id.
-    processes: HashMap<u64, u64>,
+    processes: FxHashMap<u64, u64>,
+}
+
+/// The supervisor's buffers, kept from one notification to the next: a path a call names is
+/// read, made whole and noted without allocating.
+#[derive(Default)]
+struct Scratch {
+    /// The path as the program named it, or the link `/proc` has for a descriptor.
+    raw: Vec<u8>,
+    /// The directory a relative path is in, then the path in it.
+    joined: Vec<u8>,
+    /// The path made whole.
+    path: String,
 }
 
 impl Watch {
@@ -1828,20 +1870,20 @@ fn forker(parent: u64, child: u64) -> Option<u64> {
     })
 }
 
-/// The path the descriptor `fd` of `pid` is open on, made whole.
-fn fd_path(pid: u32, fd: i32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok().map(|it| tidy(&it))
-}
-
 /// Takes one notification, notes what its call reached and lets the call go on.
-fn answer(listener: libc::c_int, recorder: &mut Recorder, watch: &mut Watch) {
+fn answer(
+    listener: libc::c_int,
+    recorder: &mut Recorder,
+    watch: &mut Watch,
+    scratch: &mut Scratch,
+) {
     let mut notif = Notif::default();
     // SAFETY: `notif` is a zeroed `struct seccomp_notif`.
     if unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif) } < 0 {
         return;
     }
-    let refused = match CALLS.iter().find(|it| it.nr as i32 == notif.nr) {
-        Some(call) => noted(&notif, call, recorder, watch),
+    let refused = match call_of(notif.nr) {
+        Some(call) => noted(&notif, call, recorder, watch, scratch),
         None => None,
     };
     let resp = match refused {
@@ -1860,7 +1902,13 @@ fn answer(listener: libc::c_int, recorder: &mut Recorder, watch: &mut Watch) {
 /// sandbox's own directories, which no namespace hides; confined, any other address too, and a
 /// signal to a process outside the sandbox; with the network, an abstract Unix socket, which
 /// is the machine's then.
-fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, watch: &mut Watch) -> Option<i32> {
+fn noted(
+    notif: &Notif,
+    call: &Call,
+    recorder: &mut Recorder,
+    watch: &mut Watch,
+    scratch: &mut Scratch,
+) -> Option<i32> {
     let (pid, thread) = (notif.pid, u64::from(notif.pid));
     let process = watch.process(recorder, thread);
     match call.does {
@@ -1869,8 +1917,11 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, watch: &mut Watch)
             return signal_outside(pid, target, notif.args[0], first).then_some(libc::EPERM);
         }
         Does::List(fd) => {
-            match fd_path(pid, notif.args[fd] as i32) {
-                Some(path) if path.starts_with('/') => recorder.listed(thread, &path),
+            match proc_link(pid, Some(notif.args[fd] as i32), &mut scratch.raw) {
+                true if scratch.raw.starts_with(b"/") => {
+                    tidy_into(&scratch.raw, &mut scratch.path);
+                    recorder.listed(thread, &scratch.path);
+                }
                 _ => recorder.incomplete(thread, "a directory listed the sandbox could not follow"),
             }
             return None;
@@ -1924,7 +1975,11 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, watch: &mut Watch)
             return Some(if to_unix { libc::ECONNREFUSED } else { libc::EACCES });
         }
         Some(Address::Unix(path)) if to_unix => {
-            let path = whole(pid, None, path).and_then(|it| resolved(pid, &it));
+            scratch.raw = path;
+            let path = match whole(pid, None, scratch) {
+                true => resolved(pid, &scratch.path),
+                false => None,
+            };
             match path {
                 Some(path) if recorder.may_connect(&path) => {}
                 path => {
@@ -1943,48 +1998,49 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, watch: &mut Watch)
     };
     for &(dir, at, written) in call.paths {
         let dir = dir.map(|it| notif.args[it] as i32);
-        let raw = match string_at(pid, notif.args[at]) {
-            Some(raw) => raw,
+        if !string_at(pid, notif.args[at], &mut scratch.raw) {
             // `execveat` of the descriptor itself (`fexecve`): what runs is what it is open on.
-            None if matches!(call.does, Does::Run) && recorder.reads() => {
-                match dir.and_then(|it| fd_path(pid, it)) {
-                    Some(path) => path.into_bytes(),
-                    None => {
-                        recorder.incomplete(thread, "a program run from a descriptor the sandbox could not follow");
-                        continue;
-                    }
-                }
+            if !matches!(call.does, Does::Run) || !recorder.reads() {
+                continue;
             }
-            None => continue,
-        };
-        if matches!(call.does, Does::Access(_)) {
-            if raw.starts_with(MARK.as_bytes()) {
-                watch.forked(recorder, thread, process);
-            }
-            if recorder.marked(thread, process, &raw) {
+            if !dir.is_some_and(|it| proc_link(pid, Some(it), &mut scratch.raw)) {
+                recorder.incomplete(thread, "a program run from a descriptor the sandbox could not follow");
                 continue;
             }
         }
-        let Some(path) = whole(pid, dir, raw) else { continue };
-        // In a view what is there is seen through the program's root, not the machine's.
-        let seen = match watch.around {
-            Around::View => format!("/proc/{pid}/root{path}"),
-            Around::Namespaces | Around::Confined(_) => path.clone(),
-        };
-        if writes && written && !recorder.may_write(&path) && refused_write(&seen) {
-            recorder.refused_write(thread, &path);
+        if matches!(call.does, Does::Access(_)) {
+            if scratch.raw.starts_with(MARK.as_bytes()) {
+                watch.forked(recorder, thread, process);
+            }
+            if recorder.marked(thread, process, &scratch.raw) {
+                continue;
+            }
+        }
+        if !whole(pid, dir, scratch) {
+            continue;
+        }
+        let path = scratch.path.as_str();
+        if writes && written && !recorder.may_write(path) {
+            // In a view what is there is seen through the program's root, not the machine's.
+            let refused = match watch.around {
+                Around::View => refused_write(&format!("/proc/{pid}/root{path}")),
+                Around::Namespaces | Around::Confined(_) => refused_write(path),
+            };
+            if refused {
+                recorder.refused_write(thread, path);
+            }
         }
         match call.does {
             _ if !recorder.reads() => {}
-            Does::Look | Does::Access(_) => recorder.looked(thread, &path),
+            Does::Look | Does::Access(_) => recorder.looked(thread, path),
             Does::Run => {
-                recorder.read(thread, &path);
-                ran(recorder, pid, thread, process, &path);
+                recorder.read(thread, path);
+                ran(recorder, pid, thread, process, path);
             }
             Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
                 recorder.random()
             }
-            _ => recorder.read(thread, &path),
+            _ => recorder.read(thread, path),
         }
     }
     None
@@ -2173,38 +2229,76 @@ fn bytes_at(pid: u32, at: u64, len: usize) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
-/// The string of `pid`'s memory at `address`, up to its nul. `None` for an empty one, which
-/// is a call on the descriptor itself.
-fn string_at(pid: u32, address: u64) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut at = address;
-    while bytes.len() < 4096 {
-        // To the end of the page, which is mapped if the byte at `at` is.
-        let chunk = 4096 - (at as usize % 4096);
-        let read = bytes_at(pid, at, chunk)?;
-        if let Some(end) = read.iter().position(|&it| it == 0) {
-            bytes.extend_from_slice(&read[..end]);
-            break;
-        }
-        bytes.extend_from_slice(&read);
-        at += read.len() as u64;
+/// Reads the string of `pid`'s memory at `address`, up to its nul and at most a path's 4096
+/// bytes, into `into`, in one call. False for an empty one, which is a call on the descriptor
+/// itself, or one that can't be read.
+fn string_at(pid: u32, address: u64, into: &mut Vec<u8>) -> bool {
+    const MOST: usize = 4096;
+    into.clear();
+    into.reserve(MOST);
+    // To the end of the page, which is mapped if the byte at `address` is, then on: the kernel
+    // reads one part whole or not at all, and stops at the first it can't.
+    let first = MOST - (address as usize % MOST);
+    let local = libc::iovec { iov_base: into.as_mut_ptr().cast(), iov_len: MOST };
+    let next = (address + first as u64) as *mut libc::c_void;
+    let remote = [
+        libc::iovec { iov_base: address as *mut libc::c_void, iov_len: first },
+        libc::iovec { iov_base: next, iov_len: MOST - first },
+    ];
+    let parts = if first == MOST { 1 } else { 2 };
+    let pid = pid as libc::pid_t;
+    // SAFETY: `into` has room for `MOST` bytes, and the kernel wrote the `read` it says.
+    let read = unsafe { libc::process_vm_readv(pid, &local, 1, remote.as_ptr(), parts, 0) };
+    if read <= 0 {
+        return false;
     }
-    (!bytes.is_empty()).then_some(bytes)
+    unsafe { into.set_len(read as usize) };
+    if let Ok(string) = std::ffi::CStr::from_bytes_until_nul(into) {
+        let len = string.to_bytes().len();
+        into.truncate(len);
+    }
+    !into.is_empty()
 }
 
-/// `path`, which `pid` named, made whole from the directory `dir` (`AT_FDCWD` or a
-/// descriptor, or the working directory when `None`).
-fn whole(pid: u32, dir: Option<i32>, path: Vec<u8>) -> Option<String> {
-    let path = PathBuf::from(<OsString as std::os::unix::ffi::OsStringExt>::from_vec(path));
-    if path.is_absolute() {
-        return Some(tidy(&path));
-    }
-    let base = match dir {
-        Some(fd) if fd != libc::AT_FDCWD => format!("/proc/{pid}/fd/{fd}"),
-        _ => format!("/proc/{pid}/cwd"),
+/// Reads the link `/proc/<pid>/fd/<fd>`, or `/proc/<pid>/cwd` for `None`, into `into`.
+fn proc_link(pid: u32, fd: Option<i32>, into: &mut Vec<u8>) -> bool {
+    use std::io::Write as _;
+    let mut name = [0u8; 48];
+    let mut at: &mut [u8] = &mut name;
+    let named = match fd {
+        Some(fd) => write!(at, "/proc/{pid}/fd/{fd}\0"),
+        None => write!(at, "/proc/{pid}/cwd\0"),
     };
-    let base = std::fs::read_link(base).ok()?;
-    Some(tidy(&base.join(path)))
+    if named.is_err() {
+        return false;
+    }
+    into.clear();
+    into.reserve(libc::PATH_MAX as usize);
+    // SAFETY: `name` ends with a nul, and `into` has room for what `readlink` writes.
+    let room = into.capacity();
+    let read = unsafe { libc::readlink(name.as_ptr().cast(), into.as_mut_ptr().cast(), room) };
+    // A link as long as the room may be cut short.
+    if read < 0 || read as usize >= into.capacity() {
+        return false;
+    }
+    unsafe { into.set_len(read as usize) };
+    true
+}
+
+/// [`Scratch::raw`], which `pid` named, made whole into [`Scratch::path`] from the directory
+/// `dir` (`AT_FDCWD` or a descriptor, or the working directory when `None`).
+fn whole(pid: u32, dir: Option<i32>, scratch: &mut Scratch) -> bool {
+    if scratch.raw.starts_with(b"/") {
+        tidy_into(&scratch.raw, &mut scratch.path);
+        return true;
+    }
+    if !proc_link(pid, dir.filter(|&it| it != libc::AT_FDCWD), &mut scratch.joined) {
+        return false;
+    }
+    scratch.joined.push(b'/');
+    scratch.joined.extend_from_slice(&scratch.raw);
+    tidy_into(&scratch.joined, &mut scratch.path);
+    true
 }
 
 #[cfg(test)]
@@ -2233,6 +2327,72 @@ mod tests {
         assert_eq!(at("missing/../real/s").as_deref(), Some(&*format!("{dir_s}/real/s")));
         assert_eq!(at("loop/s"), None);
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_call_is_found_by_its_number_and_no_other_number_is_one() {
+        for call in super::CALLS {
+            assert!(std::ptr::eq(super::call_of(call.nr as i32).unwrap(), call), "{}", call.nr);
+        }
+        let numbers: Vec<i32> = super::CALLS.iter().map(|it| it.nr as i32).collect();
+        for nr in (-1..600).filter(|it| !numbers.contains(it)) {
+            assert!(super::call_of(nr).is_none(), "{nr}");
+        }
+        assert!(super::call_of(numbers[0] | super::X32 as i32).is_none());
+    }
+
+    #[test]
+    fn a_string_is_read_to_its_nul_or_as_far_as_it_is_mapped() {
+        // A multiple of the 4096 bytes `string_at` reads at most, on every architecture.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert_eq!(page % 4096, 0);
+        // SAFETY: two private pages of this process, the second given back before the last
+        // read, which is to stop at it.
+        let pages = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(pages, libc::MAP_FAILED);
+        let base = pages as u64;
+        let put = |at: usize, bytes: &[u8]| unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pages.cast::<u8>().add(at), bytes.len())
+        };
+        let pid = std::process::id();
+        let mut into = Vec::new();
+        let read = |at: usize, into: &mut Vec<u8>| super::string_at(pid, base + at as u64, into);
+        put(page - 2, b"/ab\0");
+        assert!(read(page - 2, &mut into));
+        assert_eq!(into, b"/ab", "across the end of a page");
+        put(0, b"/x/y\0");
+        assert!(read(0, &mut into));
+        assert_eq!(into, b"/x/y");
+        put(10, b"\0");
+        assert!(!read(10, &mut into), "an empty string");
+        assert_eq!(unsafe { libc::munmap(pages.cast::<u8>().add(page).cast(), page) }, 0);
+        put(page - 3, b"/zz");
+        assert!(read(page - 3, &mut into));
+        assert_eq!(into, b"/zz", "to the end of what is mapped");
+        assert!(!read(page, &mut into), "nothing mapped");
+        unsafe { libc::munmap(pages, page) };
+    }
+
+    #[test]
+    fn a_relative_path_is_made_whole_from_the_working_directory() {
+        let pid = std::process::id();
+        let cwd = super::tidy(&std::env::current_dir().unwrap());
+        let mut scratch = super::Scratch::default();
+        scratch.raw = b"./a//b/.".to_vec();
+        assert!(super::whole(pid, None, &mut scratch));
+        assert_eq!(scratch.path, format!("{cwd}/a/b"));
+        scratch.raw = b"/c/./d/".to_vec();
+        assert!(super::whole(pid, Some(libc::AT_FDCWD), &mut scratch));
+        assert_eq!(scratch.path, "/c/d");
     }
 
     #[test]

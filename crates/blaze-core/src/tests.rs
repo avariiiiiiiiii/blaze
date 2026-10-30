@@ -102,6 +102,12 @@ fn every_driver_ends_the_script_the_same() {
         let kqueue = script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
         assert_eq!(simulated, kqueue);
     }
+    #[cfg(windows)]
+    {
+        let root = dir("iocp");
+        let iocp = script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
+        assert_eq!(simulated, iocp);
+    }
     assert_eq!(simulated[&5], format!("{:?}", Done::Read(b"again".to_vec())));
     assert_eq!(simulated[&13], format!("{:?}", Done::Read(b"again+".to_vec())));
     assert_eq!(simulated[&8], format!("{:?}", Done::Stat(None)));

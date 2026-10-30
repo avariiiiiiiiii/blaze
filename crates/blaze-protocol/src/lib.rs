@@ -15,7 +15,7 @@ pub mod follow;
 #[cfg(test)]
 mod tests;
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -41,27 +41,80 @@ impl<T> Message<T> {
     }
 }
 
-/// Writes `item`, one encoded CBOR item, as one frame.
+/// Writes `item`, one encoded CBOR item, as one frame: its length and the item in one
+/// vectored write where `to` takes both, copying neither.
 pub fn write_frame(to: &mut impl Write, item: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(item.len()).ok().filter(|&len| len <= LONGEST_FRAME);
-    let Some(len) = len else {
-        let said = format!("a frame of {} bytes, longer than {LONGEST_FRAME}", item.len());
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, said));
-    };
-    let mut frame = Vec::with_capacity(4 + item.len());
-    frame.extend(len.to_be_bytes());
-    frame.extend(item);
-    to.write_all(&frame)
+    let len = frame_len(item.len())
+        .map_err(|said| io::Error::new(io::ErrorKind::InvalidInput, said))?;
+    write_both(to, &len.to_be_bytes(), item)
+}
+
+/// The length a frame of `len` bytes says, or why it can have none.
+fn frame_len(len: usize) -> Result<u32, String> {
+    u32::try_from(len)
+        .ok()
+        .filter(|&len| len <= LONGEST_FRAME)
+        .ok_or_else(|| format!("a frame of {len} bytes, longer than {LONGEST_FRAME}"))
+}
+
+/// All of `head` and then all of `body`, in one write for a writer that takes them both.
+fn write_both(to: &mut impl Write, mut head: &[u8], mut body: &[u8]) -> io::Result<()> {
+    while !head.is_empty() {
+        match to.write_vectored(&[IoSlice::new(head), IoSlice::new(body)]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) if n < head.len() => head = &head[n..],
+            Ok(n) => {
+                body = &body[n - head.len()..];
+                head = &[];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    to.write_all(body)
+}
+
+/// `value` as one frame on the end of `out`, encoded where it goes; on an error `out` is left
+/// as it was.
+pub fn append_frame<T: Serialize + ?Sized>(
+    writer: &mut cbor::Writer,
+    out: &mut Vec<u8>,
+    value: &T,
+) -> io::Result<()> {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    if let Err(error) = writer.append(out, value) {
+        out.truncate(start);
+        return Err(invalid(error));
+    }
+    match frame_len(out.len() - start - 4) {
+        Ok(len) => {
+            out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+            Ok(())
+        }
+        Err(said) => {
+            out.truncate(start);
+            Err(io::Error::new(io::ErrorKind::InvalidInput, said))
+        }
+    }
 }
 
 /// The item of the next frame, or `None` when the stream ends before one begins. A stream
 /// that ends inside a frame is one whose writer did not live to finish it.
 pub fn read_frame(from: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut item = Vec::new();
+    Ok(read_frame_into(from, &mut item)?.then_some(item))
+}
+
+/// [`read_frame`] into `item`, a buffer kept from frame to frame: false when the stream ends
+/// before a frame begins.
+pub fn read_frame_into(from: &mut impl Read, item: &mut Vec<u8>) -> io::Result<bool> {
+    item.clear();
     let mut len = [0; 4];
     let mut read = 0;
     while read < len.len() {
         match from.read(&mut len[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) if read == 0 => return Ok(false),
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => read += n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -75,18 +128,19 @@ pub fn read_frame(from: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     }
     // Room for at most a megabyte before the bytes are here, the length being the peer's
     // word: a frame of that much is read in one go.
-    let mut item = Vec::with_capacity((len as usize).min(1 << 20));
-    from.take(u64::from(len)).read_to_end(&mut item)?;
+    item.reserve((len as usize).min(1 << 20));
+    from.take(u64::from(len)).read_to_end(item)?;
     if item.len() != len as usize {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(item))
+    Ok(true)
 }
 
-/// Writes `value` as one frame.
+/// Writes `value` as one frame, in one write.
 pub fn send<T: Serialize + ?Sized>(to: &mut impl Write, value: &T) -> io::Result<()> {
-    let item = cbor::to_vec(value).map_err(invalid)?;
-    write_frame(to, &item)
+    let mut frame = Vec::new();
+    append_frame(&mut cbor::Writer::new(), &mut frame, value)?;
+    to.write_all(&frame)
 }
 
 /// The value of the next frame, or `None` when the stream ends before one begins. An item

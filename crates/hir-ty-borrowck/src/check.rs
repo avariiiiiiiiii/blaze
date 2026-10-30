@@ -185,7 +185,7 @@ pub(super) fn check<'db>(
         used_mut_upvars: Vec::new(),
     };
     let walk = crate::timings::start();
-    let guard_borrows = guard_borrows(ctx, body);
+    let (guards, guard_at) = guard_borrows(ctx, body);
     let index_borrows = index_borrows(ctx, body);
     let tested_at = tested_at(ctx);
     let test_span = |span: MirSpan| match span {
@@ -210,14 +210,14 @@ pub(super) fn check<'db>(
             };
             loans.before(&cfg, location, &mut checker.in_scope);
             checker.check_activations(location, span);
-            if let Some(guard) = guard_borrows.get(&it.span)
+            if let Some(&guard) = guard_at.get(&it.span)
                 && let StatementKind::Assign(dest, rvalue) = &it.kind
             {
                 match rvalue {
                     Rvalue::Ref(BorrowKind::Mut { .. }, borrowed) => {
-                        checker.guard_conflict(guard, borrowed, false, span)
+                        checker.guard_conflict(&guards[guard as usize], borrowed, false, span)
                     }
-                    _ => checker.guard_conflict(guard, dest, true, span),
+                    _ => checker.guard_conflict(&guards[guard as usize], dest, true, span),
                 }
             }
             if let Some(protected) = index_borrows.get(&it.span)
@@ -242,10 +242,10 @@ pub(super) fn check<'db>(
             };
             loans.before(&cfg, location, &mut checker.in_scope);
             checker.check_activations(location, span);
-            if let Some(guard) = guard_borrows.get(&terminator.span)
+            if let Some(&guard) = guard_at.get(&terminator.span)
                 && let TerminatorKind::Call { destination, .. } = &terminator.kind
             {
-                checker.guard_conflict(guard, destination, true, span);
+                checker.guard_conflict(&guards[guard as usize], destination, true, span);
             }
             if let Some(protected) = index_borrows.get(&terminator.span)
                 && let TerminatorKind::Call { destination, .. } = &terminator.kind
@@ -490,7 +490,7 @@ fn rustc_move_indices(
     let mut order: Vec<usize> = (0..moves.moves.len())
         .filter(|&it| {
             let out = moves.moves[it];
-            let local = moves.paths[out.path].local;
+            let local = moves.local(out.path);
             let block = &body.basic_blocks[out.location.block];
             match block.statements.get(out.location.statement) {
                 Some(statement) => match &statement.kind {
@@ -2548,7 +2548,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// The path of `place`, or the nearest above it, with how much of `place` it covers.
     fn move_path_closest_to(&self, place: PlaceRef<'_>) -> (usize, Mpi) {
         let path = self.moves.find(self.ctx, self.body, place.local, place.projection).path();
-        (self.moves.paths[path].projection.len(), path)
+        (self.moves.projection(path).len(), path)
     }
 
     fn move_path_for(&self, place: PlaceRef<'_>) -> Option<Mpi> {
@@ -2595,13 +2595,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 };
                 let Some(array) = self.move_path_for(base) else { return };
                 let range = from..(len as u64).saturating_sub(to);
-                let uninit = &self.uninit;
-                let moved = self.moves.paths[array].children.iter().find_map(|&child| {
-                    match self.moves.paths[child].projection.last() {
+                let moved = self.moves.children(array).find_map(|child| {
+                    match self.moves.projection(child).last() {
                         Some(ProjectionElem::ConstantIndex { offset, .. })
                             if range.contains(offset) =>
                         {
-                            self.moves.find_in_descendants(child, &|it| uninit.contains(it))
+                            self.moves.first_in(child, &self.uninit)
                         }
                         _ => None,
                     }
@@ -2613,8 +2612,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             }
         }
         if let Some(path) = self.move_path_for(place) {
-            let uninit = &self.uninit;
-            if let Some(moved) = self.moves.find_in_descendants(path, &|it| uninit.contains(it)) {
+            if let Some(moved) = self.moves.first_in(path, &self.uninit) {
                 self.report_use_of_moved_or_uninitialized(location, action, place, span, moved);
             }
         }
@@ -2711,7 +2709,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             return true;
         }
         let mut seen = vec![false; self.body.basic_blocks.len()];
-        let mut stack: Vec<_> = self.cfg.successors[index(from.block)].to_vec();
+        let mut stack: Vec<_> = self.cfg.successors(from.block).to_vec();
         while let Some(block) = stack.pop() {
             if block == to.block {
                 return true;
@@ -2719,7 +2717,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             if std::mem::replace(&mut seen[index(block)], true) {
                 continue;
             }
-            stack.extend(self.cfg.successors[index(block)].iter().copied());
+            stack.extend(self.cfg.successors(block).iter().copied());
         }
         false
     }
@@ -2821,9 +2819,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 return;
             }
         }
-        let moved = self.moves.paths[path].projection.len() < used.projection.len()
-            || self.moves.paths[path].local != used.local;
-        let partially = !moved && self.moves.paths[path].projection.len() > used.projection.len();
+        let depth = self.moves.projection(path).len();
+        let moved = depth < used.projection.len() || self.moves.local(path) != used.local;
+        let partially = !moved && depth > used.projection.len();
         let name = self.quoted(used, "value");
         let what = if partially { "partially moved value" } else { "moved value" };
         let message = format!("{} of {what}: {name}", action.noun());
@@ -2848,12 +2846,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// The moves out of `path` or a path above it that reach `location` without an init in
     /// between, as rustc's `get_moved_indexes`.
     fn moved_indexes(&self, location: Location, path: Mpi) -> Vec<usize> {
-        let mut paths = vec![path];
-        let mut up = self.moves.paths[path].parent;
-        while let Some(parent) = up {
-            paths.push(parent);
-            up = self.moves.paths[parent].parent;
-        }
+        let above = |it: Mpi| self.moves.is_ancestor_or_self(it, path);
         let mut stack = Vec::new();
         let mut back_edges = Vec::new();
         for predecessor in self.cfg.predecessor_locations(self.body, location) {
@@ -2863,16 +2856,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 stack.push(predecessor);
             }
         }
-        let is_argument = self
-            .body
-            .param_locals
-            .iter()
-            .any(|&local| paths.contains(&self.moves.local_path(local)));
-        let mut visited = FxHashSet::default();
+        let is_argument = self.body.param_locals.contains(&self.moves.local(path));
+        let mut visited = BitSet::new(self.cfg.points);
         let mut result = Vec::new();
         let mut reached_start = false;
         let mut visit = |result: &mut Vec<usize>, location: Location| -> bool {
-            if !visited.insert(location) {
+            if !visited.insert(self.cfg.point(location)) {
                 return true;
             }
             let is_storage_dead = matches!(
@@ -2883,7 +2872,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             if !is_storage_dead {
                 for &move_out in self.moves.moves_at(point) {
                     let move_out = move_out as usize;
-                    if paths.contains(&self.moves.moves[move_out].path) {
+                    if above(self.moves.moves[move_out].path) {
                         result.push(move_out);
                         return true;
                     }
@@ -2892,7 +2881,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             for &init in self.moves.inits_at(point) {
                 let init = self.moves.inits[init as usize];
                 if matches!(init.kind, InitKind::Deep | InitKind::NonPanicPathOnly)
-                    && paths.contains(&init.path)
+                    && above(init.path)
                 {
                     return true;
                 }
@@ -3082,8 +3071,12 @@ struct Guard {
     bindings: Vec<LocalId>,
 }
 
-/// The [`Guard`] of each expression and pattern in a `match` arm's guard.
-fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, std::rc::Rc<Guard>> {
+/// The [`Guard`]s of a body's `match` arms, and the index of the one of each expression and
+/// pattern in an arm's guard.
+fn guard_borrows(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+) -> (Vec<Guard>, FxHashMap<MirSpan, u32>) {
     use hir_def::hir::Expr;
     let mut tested_by = FxHashMap::default();
     let mut bound_by = FxHashMap::default();
@@ -3111,8 +3104,9 @@ fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, st
     }
     let mut out = FxHashMap::default();
     if matches.is_empty() {
-        return out;
+        return (Vec::new(), out);
     }
+    let (mut guards, mut stack, mut pats) = (Vec::new(), Vec::new(), Vec::new());
     let add = |set: &mut Vec<(LocalId, Vec<PlaceElem>)>, local, projection: &[PlaceElem]| {
         if !set.iter().any(|(it, other)| *it == local && other == projection) {
             set.push((local, projection.to_vec()));
@@ -3182,11 +3176,11 @@ fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, st
             if tested.is_empty() && bound.is_empty() && bindings.is_empty() {
                 continue;
             }
-            let it = std::rc::Rc::new(Guard { tested: tested.clone(), bound, bindings });
-            let mut stack = vec![guard];
+            let it = guards.len() as u32;
+            guards.push(Guard { tested: tested.clone(), bound, bindings });
+            stack.push(guard);
             while let Some(expr) = stack.pop() {
-                out.insert(MirSpan::ExprId(expr), it.clone());
-                let mut pats = Vec::new();
+                out.insert(MirSpan::ExprId(expr), it);
                 match &ctx.store[expr] {
                     Expr::Match { arms, .. } => pats.extend(arms.iter().map(|arm| arm.pat)),
                     Expr::Let { pat, .. } => pats.push(*pat),
@@ -3198,16 +3192,16 @@ fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, st
                     }
                     _ => {}
                 }
-                for pat in pats {
+                for pat in pats.drain(..) {
                     ctx.store.walk_pats(pat, &mut |pat| {
-                        out.insert(MirSpan::PatId(pat), it.clone());
+                        out.insert(MirSpan::PatId(pat), it);
                     });
                 }
                 ctx.store.walk_child_exprs(expr, |it| stack.push(it));
             }
         }
     }
-    out
+    (guards, out)
 }
 
 /// The places rustc fake-borrows shallowly while an index is evaluated, by each expression in

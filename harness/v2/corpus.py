@@ -16,6 +16,12 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     commit    the commit of this repository the project `blaze` is (HEAD)
     jobs      how many projects run at once (2), each with a daemon and a home of its own
     keep      keep each project's checkout and both target directories after it ran
+    cache     where cargo's `test` results are kept across runs ("~/.cache/blaze-v2-proof"; ""
+              keeps none), by everything they depend on: the toolchain (`rustc -vV`, `cargo
+              -vV`), the platform, the checkout's tree after `cargo fetch` (engine.tree_digest,
+              Cargo.lock in it), the step's arguments, cargo's configuration files outside the
+              checkout and the environment, the run's own paths in it written as `{ws}` and
+              `{root}`; a rerun runs cargo's tests only of what changed
 
 The projects:
 
@@ -55,6 +61,7 @@ import importlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -66,7 +73,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -110,6 +117,7 @@ class Input:
     commit: str = "HEAD"
     jobs: int = 2
     keep: bool = False
+    cache: str = "~/.cache/blaze-v2-proof"
 
 
 @dataclass(frozen=True)
@@ -318,9 +326,73 @@ def judge(command: Command, ours: int, theirs: int, differs: str | None, who: st
     return "pass", ""
 
 
+# Set by the shell for its session alone; no build or test reads them to decide anything.
+SESSION = frozenset({"PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "WINDOWID", "STY",
+                     "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY", "SSH_AUTH_SOCK", "XDG_SESSION_ID"})
+
+
+@dataclass(frozen=True)
+class Reference:
+    """What cargo's side of a step depends on beyond the step: the result cache, the
+    toolchain's identity and the checkout's tree digest (`engine.tree_digest`)."""
+
+    kept: engine.Kept
+    toolchain: str
+    tree: str
+
+
+def cargo_configs(ws: Path, env: dict[str, str]) -> str:
+    """The cargo configuration files outside the checkout that apply to a build in it (those
+    of every directory above it and of CARGO_HOME), each by its path and sha256."""
+    home = Path(env.get("CARGO_HOME") or Path.home() / ".cargo")
+    found: list[str] = []
+    for directory in (*[d / ".cargo" for d in ws.parents], home):
+        for name in ("config.toml", "config"):
+            path = directory / name
+            if path.is_file():
+                found.append(f"{path}={engine.digest(path)}")
+    return "\n".join(found)
+
+
+def environment_key(env: dict[str, str], ws: Path, root: Path) -> str:
+    """`env` as part of a key: sorted, without SESSION, the checkout's and the work directory's
+    paths written `{ws}` and `{root}` so that a rerun elsewhere has the same key."""
+    return "\n".join(f"{name}={env[name].replace(str(ws), '{ws}').replace(str(root), '{root}')}"
+                     for name in sorted(env) if name not in SESSION)
+
+
+def kept_ran(entry: object, argv: tuple[str, ...], where: str) -> engine.Ran | None:
+    """A kept result of cargo as an `engine.Ran`; None when there is none; a Failed when it is
+    not of the shape `cargo_test` writes."""
+    if entry is None:
+        return None
+    fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+    code, stdout, seconds = fields.get("returncode"), fields.get("stdout"), fields.get("seconds")
+    if not (isinstance(code, int) and isinstance(stdout, str) and isinstance(seconds, (int, float))):
+        raise engine.Failed(f"the kept result of cargo {where} is not one corpus.py wrote: {entry!r:.300}")
+    return engine.Ran(argv, float(seconds), code, stdout, "")
+
+
+def cargo_test(name: str, args: tuple[str, ...], ws: Path, root: Path, env: dict[str, str],
+               reference: Reference) -> tuple[engine.Ran, bool]:
+    """cargo's `test ARGS` in `ws`: kept from an earlier run of the same inputs (see the input's
+    `cache`), else run and kept; and whether it was kept. A run that timed out raises, and is
+    never kept."""
+    argv = ("cargo", "test", *args)
+    kept = reference.kept
+    key = kept.key(reference.toolchain, sys.platform, platform.machine(), reference.tree, *argv,
+                   cargo_configs(ws, env), environment_key(env, ws, root))
+    if (known := kept_ran(kept.get(key), argv, str(kept.path(key)))) is not None:
+        return known, True
+    ran = engine.cargo(name, ["test", *args], ws, env)
+    kept.put(key, dict(returncode=ran.returncode, stdout=ran.stdout, seconds=ran.seconds))
+    return ran, False
+
+
 def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch: Path,
-            ours_env: dict[str, str], theirs_env: dict[str, str]) -> Found:
+            ours_env: dict[str, str], theirs_env: dict[str, str], reference: Reference) -> Found:
     name = f"{program.name}: {step.label}"
+    was_kept = False
     if step.command == "exec":
         program_name, *args = step.args
         cwd = scratch / "cwd"
@@ -338,7 +410,10 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
             tests.unlink(missing_ok=True)
         ours = eng.build(name, ws, ours_env, step.args, command=step.command)
         who = eng.not_blazes(ours)
-        theirs = engine.cargo(name, [step.command, *step.args], ws, theirs_env)
+        if step.command == "test":
+            theirs, was_kept = cargo_test(name, step.args, ws, scratch, theirs_env, reference)
+        else:
+            theirs = engine.cargo(name, [step.command, *step.args], ws, theirs_env)
         compared = True
         if step.command == "test":
             kept: list[str] = blaze_cli.kept_passes(str(tests))
@@ -353,11 +428,12 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
     verdict, detail = judge(step.command, ours.returncode, theirs.returncode, differs, who, compared)
     if verdict == "fail" and ours.returncode != 0 and theirs.returncode == 0:
         detail += "\n" + ours.said(1500)
-    return Found(name, verdict, detail, {"blaze_s": round(ours.seconds, 2), "cargo_s": round(theirs.seconds, 2)})
+    return Found(name, verdict, detail, {"blaze_s": round(ours.seconds, 2), "cargo_s": round(theirs.seconds, 2),
+                                         "cargo_kept": was_kept})
 
 
-def run_program(eng: engine.Engine, program: Program, root: Path, store: Path,
-                keep: bool) -> tuple[list[Found], str]:
+def run_program(eng: engine.Engine, program: Program, root: Path, store: Path, keep: bool, kept: engine.Kept,
+                toolchain: str) -> tuple[list[Found], str]:
     """Every outcome of `program`, built in `root`, and the sha256 of the `Cargo.lock` both
     sides built with ("" when it never got that far). Never raises for what the harness could
     not do: that is an outcome too."""
@@ -376,9 +452,11 @@ def run_program(eng: engine.Engine, program: Program, root: Path, store: Path,
     try:
         engine.run(f"{program.name}: cargo fetch", ["cargo", "fetch"], ws, theirs_env, 1800, check=True)
         lock = hashlib.sha256((ws / "Cargo.lock").read_bytes()).hexdigest()
+        doing = "the checkout's tree digest"
+        reference = Reference(kept, toolchain, engine.tree_digest(ws, ("target", "target-ref")))
         for step in program.steps:
             doing = step.label
-            done = step_of(eng, program, step, ws, root, ours_env, theirs_env)
+            done = step_of(eng, program, step, ws, root, ours_env, theirs_env, reference)
             found.append(done)
             if step.command == "build" and done.verdict != "pass":
                 break
@@ -433,11 +511,18 @@ def main(args: Input) -> None:
     print(f"work: {work}", flush=True)
     store = work / "store"
     locks: dict[str, str] = {}
+    kept = engine.Kept(args.cache, "cargo-test")
+    try:
+        toolchain = engine.toolchain_identity(engine.scrubbed())
+    except engine.Failed as e:
+        fail(SCRIPT, str(e))
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        running = {pool.submit(run_program, eng, p, work / p.dir, store, args.keep): p.name for p in programs}
-        for done in concurrent.futures.as_completed(running):
+        running = {pool.submit(run_program, eng, p, work / p.dir, store, args.keep, kept, toolchain): p.name
+                   for p in programs}
+        # In the order of the projects, not the order they end in: one report for one input.
+        for done, name in running.items():
             founds, lock = done.result()
-            locks[running[done]] = lock
+            locks[name] = lock
             for found in founds:
                 rep.add(found.name, found.verdict, found.detail, **found.numbers)
     rep.extra["locks"] = dict(sorted(locks.items()))
@@ -556,7 +641,40 @@ def test_pinned() -> None:
     assert helix.env.get("HELIX_DISABLE_AUTO_GRAMMAR_BUILD") == "1"
 
 
-SELFTESTS = (test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
+def test_kept_cargo() -> None:
+    ws, root = Path("/w/root/ws"), Path("/w/root")
+    env = {"CARGO_TARGET_DIR": "/w/root/ws/target-ref", "HOME_ISH": "/w/root/h", "PWD": "/anywhere", "A": "1"}
+    key = environment_key(env, ws, root)
+    assert key == "A=1\nCARGO_TARGET_DIR={ws}/target-ref\nHOME_ISH={root}/h", key
+    assert environment_key({**env, "PWD": "/elsewhere"}, ws, root) == key, "a session variable is in the key"
+    assert environment_key({**env, "A": "2"}, ws, root) != key
+    elsewhere = {name: value.replace("/w/root", "/v/other") for name, value in env.items()}
+    assert environment_key(elsewhere, Path("/v/other/ws"), Path("/v/other")) == key, "a rerun elsewhere misses"
+    argv = ("cargo", "test")
+    ran = kept_ran({"returncode": 101, "stdout": "test result: FAILED.", "seconds": 2}, argv, "k")
+    assert ran is not None and (ran.returncode, ran.stdout, ran.seconds, ran.argv) == (101, "test result: FAILED.", 2.0, argv)
+    assert kept_ran(None, argv, "k") is None
+    for bad in ([], {"returncode": "0", "stdout": "", "seconds": 1}, {"returncode": 0, "stdout": ""}):
+        try:
+            kept_ran(bad, argv, "k")
+        except engine.Failed:
+            continue
+        raise AssertionError(f"a kept result of another shape was taken: {bad}")
+    with tempfile.TemporaryDirectory() as tmp:
+        top = Path(tmp)
+        (top / ".cargo").mkdir()
+        (top / "a" / "ws").mkdir(parents=True)
+        home = top / "cargo-home"
+        home.mkdir()
+        before = cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)})
+        (top / ".cargo" / "config.toml").write_text("[build]\nrustflags = []\n")
+        after = cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)})
+        assert before != after and str(top / ".cargo" / "config.toml") in after, after
+        (home / "config.toml").write_text("[net]\noffline = true\n")
+        assert cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)}) != after, "CARGO_HOME's config is missed"
+
+
+SELFTESTS = (test_kept_cargo, test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
              test_pinned)
 
 

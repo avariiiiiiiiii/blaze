@@ -14,6 +14,12 @@
 //! the caller asks `rustc_lexer` for that token. Both give the same `(kind, length)` wherever
 //! `token` gives one, which the tests check at every offset of every test file; so this is
 //! dispatch by token class, not a second lexer with its own rules.
+//!
+//! One of the crate's two unsafe places (docs/v2/plan/design/unsafe.md; the other is
+//! `SyntaxKind::from(u16)`): the vector loads and the
+//! `target_feature` calls are unsafe. The safe version is [`blocks_scalar`], a table lookup and
+//! shift per byte, 64 per block; the vector paths do a block in a few compares. Every path is
+//! checked against it on every test file (`every_path_classifies_as_the_scalar_one`).
 
 use rustc_lexer::{Base, DocStyle, LiteralKind, TokenKind};
 
@@ -132,6 +138,12 @@ pub(super) fn paths() -> Vec<(&'static str, Blocks)> {
     out
 }
 
+/// [`blocks_scalar`] on AVX-512BW, 64 bytes per compare.
+///
+/// # Safety
+///
+/// The CPU has `avx512bw` (callers check `is_x86_feature_detected!`); without it the
+/// instructions fault.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 unsafe fn blocks_avx512(bytes: &[u8], out: &mut Vec<[u64; 3]>) {
@@ -148,7 +160,8 @@ unsafe fn blocks_avx512(bytes: &[u8], out: &mut Vec<[u64; 3]>) {
     let space = _mm512_set1_epi8(b' ' as i8);
     let newline = _mm512_set1_epi8(b'\n' as i8);
     for chunk in bytes.chunks_exact(64) {
-        // SAFETY: `chunk` is 64 readable bytes; the load is unaligned.
+        // SAFETY: `chunks_exact(64)` makes `chunk` 64 readable bytes, exactly the load's width,
+        // and `loadu` has no alignment requirement; a shorter chunk would read past the slice.
         let v = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
         let alpha =
             _mm512_cmple_epu8_mask(_mm512_sub_epi8(_mm512_or_si512(v, case), a), letters);
@@ -195,18 +208,23 @@ fn half_avx2(v: std::arch::x86_64::__m256i) -> [u64; 3] {
     ]
 }
 
+/// [`blocks_scalar`] on AVX2, 32 bytes per compare.
+///
+/// # Safety
+///
+/// The CPU has `avx2` (callers check `is_x86_feature_detected!`); without it the instructions
+/// fault.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn blocks_avx2(bytes: &[u8], out: &mut Vec<[u64; 3]>) {
     use std::arch::x86_64::*;
     for chunk in bytes.chunks_exact(64) {
-        // SAFETY: `chunk` is 64 readable bytes, so both 32-byte unaligned loads are in it.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(chunk.as_ptr().cast()),
-                _mm256_loadu_si256(chunk.as_ptr().add(32).cast()),
-            )
-        };
+        let (low, high) = chunk.split_at(32);
+        // SAFETY: `low` is 32 readable bytes (`chunks_exact(64)` split in half), the load's
+        // width, and `loadu` has no alignment requirement.
+        let lo = unsafe { _mm256_loadu_si256(low.as_ptr().cast()) };
+        // SAFETY: as for `low`: `high` is the other 32 bytes of the chunk.
+        let hi = unsafe { _mm256_loadu_si256(high.as_ptr().cast()) };
         let (lo, hi) = (half_avx2(lo), half_avx2(hi));
         out.push([lo[0] | hi[0] << 32, lo[1] | hi[1] << 32, lo[2] | hi[2] << 32]);
     }
@@ -243,18 +261,31 @@ fn quarter_neon(v: std::arch::aarch64::uint8x16_t) -> [std::arch::aarch64::uint8
     [ident, blank, vceqq_u8(v, vdupq_n_u8(b'\n'))]
 }
 
+/// 16 bytes of `bytes` from `at` as a vector.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_neon(bytes: &[u8], at: usize) -> std::arch::aarch64::uint8x16_t {
+    let lane: &[u8; 16] = bytes[at..at + 16].try_into().expect("16 bytes");
+    // SAFETY: `lane` is 16 readable bytes (the slice above is bounds-checked), the load's
+    // width, and `vld1q_u8` has no alignment requirement.
+    unsafe { std::arch::aarch64::vld1q_u8(lane.as_ptr()) }
+}
+
+/// [`blocks_scalar`] on NEON, 16 bytes per compare.
+///
+/// # Safety
+///
+/// The CPU has `neon` (callers check `is_aarch64_feature_detected!`); without it the
+/// instructions fault.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn blocks_neon(bytes: &[u8], out: &mut Vec<[u64; 3]>) {
-    use std::arch::aarch64::*;
     const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    // SAFETY: `WEIGHTS` is 16 readable bytes.
-    let weights = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
+    let weights = load_neon(&WEIGHTS, 0);
     for chunk in bytes.chunks_exact(64) {
-        let p = chunk.as_ptr();
-        // SAFETY: `chunk` is 64 readable bytes, so the four 16-byte loads are in it.
         let (a, b, c, d) =
-            unsafe { (vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))) };
+            (load_neon(chunk, 0), load_neon(chunk, 16), load_neon(chunk, 32), load_neon(chunk, 48));
         let (a, b, c, d) = (quarter_neon(a), quarter_neon(b), quarter_neon(c), quarter_neon(d));
         out.push([
             movemask_neon([a[0], b[0], c[0], d[0]], weights),
@@ -414,6 +445,7 @@ pub(super) fn token(bytes: &[u8], at: usize, classes: &Classes) -> Option<(Token
 #[cfg(test)]
 mod tests {
     use super::{Classes, paths, token};
+    use crate::LexedStr;
 
     struct Rng(u64);
 

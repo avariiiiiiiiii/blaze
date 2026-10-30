@@ -33,7 +33,6 @@ mod tests;
 use std::{
     any::Any,
     collections::{BTreeMap, HashMap},
-    ffi::OsString,
     path::PathBuf,
     sync::{Arc, Mutex, atomic::Ordering},
     time::Instant,
@@ -73,6 +72,8 @@ pub(crate) struct Shared {
     /// next link of it relinks only what changed.
     pub(crate) images: Mutex<HashMap<String, codegen::Linked>>,
     pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
+    /// What `-C target-cpu=native` is on this machine; none without LLVM.
+    pub(crate) host_cpu: Option<blaze_units::stdlib::target::HostCpu>,
 }
 
 impl Real {
@@ -87,6 +88,11 @@ impl Real {
             disk: Mutex::new(blaze_usercode::inputs::Disk::new(Vec::new())),
             images: Mutex::new(HashMap::new()),
             memo: blaze_codegen::driver::shared_memo(),
+            host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| blaze_units::stdlib::target::HostCpu {
+                arch: std::env::consts::ARCH.to_owned(),
+                name,
+                features,
+            }),
         };
         Ok(Real { fetcher, shared: Arc::new(shared) })
     }
@@ -146,6 +152,7 @@ impl Steps for Real {
                 config: &job.config,
                 files: &job.files,
                 root: job.root,
+                host_cpu: self.shared.host_cpu.as_ref(),
             })
         })?
         .map_err(|error| Failed::Error(ApiError::new(error.what, error.at)))?;
@@ -226,17 +233,6 @@ impl Job {
             manifest_path: package.manifest_path.clone(),
             target: unit_target(unit),
         })
-    }
-
-    /// The job's whole environment, as the request had it: held in memory for the job only.
-    pub(crate) fn inherited(&self) -> Vec<(OsString, OsString)> {
-        self.input
-            .config
-            .invocation
-            .env
-            .iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-            .collect()
     }
 
     /// `BLAZE_SANDBOX=off` in the request's environment: every build script and test of the

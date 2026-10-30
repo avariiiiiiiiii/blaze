@@ -4,9 +4,12 @@
 //! A **group** is the CPUs that share a last-level cache (an EPYC's CCD: the level 3 cache's
 //! `shared_cpu_list`) or, where the machine says so, a cluster (`cluster_cpus_list`, a
 //! Graviton's); where both are said, the smaller wins. A cluster that is one core (x86 says its
-//! SMT siblings are a cluster) says nothing. On macOS a group is an L2 cluster of one
-//! performance level, and the CPUs of level 0 are `fast`. A machine that says nothing is one
-//! group on one socket. Only online CPUs in the process's affinity mask are counted.
+//! SMT siblings are a cluster) says nothing. A group never spans NUMA nodes (`cpuM/nodeN`):
+//! where a cache is shared across nodes (Intel's sub-NUMA clusters), each node's part of it is
+//! a group, so the memory a group's workers allocate is all local. On macOS a group is an L2
+//! cluster of one performance level, the CPUs of level 0 are `fast`, and there is one node. A
+//! machine that says nothing is one group on one socket and node. Only online CPUs in the
+//! process's affinity mask are counted.
 //!
 //! Group ids are dense from 0 and stable for a machine: sorted by their first CPU.
 
@@ -23,6 +26,9 @@ pub struct Cpu {
     pub id: u32,
     pub group: u32,
     pub socket: u32,
+    /// Its NUMA node: the `nodeN` entry of `/sys/devices/system/cpu/cpuM/`; 0 where the
+    /// machine has none, and on macOS.
+    pub node: u32,
     /// Of the fastest cores: Apple's performance level 0, or the largest `cpu_capacity` of an
     /// Arm big.LITTLE machine; every CPU where the machine says nothing.
     pub fast: bool,
@@ -36,15 +42,22 @@ pub struct Topology {
 
 impl Topology {
     /// This machine's, as far as the process may use it.
-    pub fn detect() -> Topology {
+    ///
+    /// # Errors
+    ///
+    /// Where the kernel does not say what the pool is shaped by (sysfs, the affinity mask, the
+    /// performance levels), naming what: a pool shaped by a guess is never made.
+    pub fn detect() -> io::Result<Topology> {
         detect()
     }
 
-    /// `count` CPUs numbered from 0, one group on one socket: what a machine that says nothing
-    /// is, and the shape of a pool whose threads are not bound to CPUs.
+    /// `count` CPUs numbered from 0, one group on one socket and node: what a machine that
+    /// says nothing is, and the shape of a pool whose threads are not bound to CPUs.
     pub fn flat(count: usize) -> Topology {
         let count = u32::try_from(count).unwrap_or(u32::MAX);
-        Topology { cpus: (0..count).map(|id| Cpu { id, group: 0, socket: 0, fast: true }).collect() }
+        Topology {
+            cpus: (0..count).map(|id| Cpu { id, group: 0, socket: 0, node: 0, fast: true }).collect(),
+        }
     }
 
     /// The topology `root` says, where `root` is the kernel's `/sys/devices/system/cpu` (or a
@@ -74,19 +87,23 @@ impl Topology {
             {
                 capacities.insert(id, capacity);
             }
-            found.push((id, share, socket.unwrap_or(0)));
+            found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
+        let node: BTreeMap<u32, u32> = found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
         let mut sets: BTreeMap<BTreeSet<u32>, u32> = BTreeMap::new();
         let mut cpus = Vec::with_capacity(found.len());
-        for (id, share, socket) in found {
+        for (id, share, socket, home) in found {
+            // A cache shared across nodes is split by node: a group's memory is all local.
+            let share: BTreeSet<u32> =
+                share.into_iter().filter(|it| node.get(it) == Some(&home)).collect();
             let next = u32::try_from(sets.len()).unwrap_or(u32::MAX);
             let group = *sets.entry(share).or_insert(next);
             let fast = match (capacities.get(&id), fastest) {
                 (Some(capacity), Some(fastest)) => *capacity == fastest,
                 _ => true,
             };
-            cpus.push(Cpu { id, group, socket, fast });
+            cpus.push(Cpu { id, group, socket, node: home, fast });
         }
         Ok(dense(cpus))
     }
@@ -98,7 +115,8 @@ impl Topology {
         for (level, &(logical, per_l2)) in levels.iter().enumerate() {
             let per_l2 = if per_l2 == 0 { logical.max(1) } else { per_l2 };
             for at in 0..logical {
-                cpus.push(Cpu { id, group: first_group + at / per_l2, socket: 0, fast: level == 0 });
+                let group = first_group + at / per_l2;
+                cpus.push(Cpu { id, group, socket: 0, node: 0, fast: level == 0 });
                 id += 1;
             }
             first_group += logical.div_ceil(per_l2);
@@ -116,17 +134,29 @@ impl Topology {
     }
 
     /// The groups a worker of `group` takes work from, in order: its own, then the others of
-    /// its socket nearest by id, then the rest nearest by id (ties to the lower). Empty for a
-    /// group the topology does not have.
+    /// its NUMA node, then of its socket, then the rest, each nearest by id first (ties to the
+    /// lower). Empty for a group the topology does not have.
     pub fn steal_order(&self, group: u32) -> Vec<u32> {
-        let mut socket_of: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut place_of: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
         for cpu in &self.cpus {
-            socket_of.entry(cpu.group).or_insert(cpu.socket);
+            place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
-        let Some(&home) = socket_of.get(&group) else { return Vec::new() };
-        let mut rest: Vec<u32> = socket_of.keys().copied().filter(|&it| it != group).collect();
-        rest.sort_by_key(|&it| (socket_of[&it] != home, it.abs_diff(group), it));
+        let Some(&(socket, node)) = place_of.get(&group) else { return Vec::new() };
+        let mut rest: Vec<u32> = place_of.keys().copied().filter(|&it| it != group).collect();
+        rest.sort_by_key(|&it| {
+            let (its_socket, its_node) = place_of[&it];
+            (its_socket != socket, its_node != node, it.abs_diff(group), it)
+        });
         std::iter::once(group).chain(rest).collect()
+    }
+
+    /// The NUMA node of each group, by group id.
+    pub fn nodes(&self) -> Vec<u32> {
+        let mut node_of = vec![0; self.groups() as usize];
+        for cpu in &self.cpus {
+            node_of[cpu.group as usize] = cpu.node;
+        }
+        node_of
     }
 }
 
@@ -142,46 +172,63 @@ fn dense(mut cpus: Vec<Cpu>) -> Topology {
 }
 
 #[cfg(target_os = "linux")]
-fn detect() -> Topology {
-    let allowed = linux::affinity();
-    match (Topology::from_sysfs(Path::new("/sys/devices/system/cpu")), allowed) {
-        (Ok(topology), Some(allowed)) => {
-            let only = topology.only(&allowed);
-            if only.cpus.is_empty() { topology } else { only }
-        }
-        (Ok(topology), None) => topology,
-        (Err(_), Some(allowed)) => {
-            dense(allowed.into_iter().map(|id| Cpu { id, group: 0, socket: 0, fast: true }).collect())
-        }
-        (Err(_), None) => Topology::flat(parallelism()),
+fn detect() -> io::Result<Topology> {
+    let topology = Topology::from_sysfs(Path::new("/sys/devices/system/cpu"))?;
+    let allowed = linux::affinity()?;
+    let only = topology.only(&allowed);
+    if only.cpus.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the process's affinity mask {allowed:?} has no online CPU"),
+        ));
     }
+    Ok(only)
 }
 
 #[cfg(target_os = "macos")]
-fn detect() -> Topology {
-    let levels = macos::sysctl("hw.nperflevels").unwrap_or(0);
+fn detect() -> io::Result<Topology> {
+    let say = |name: &str| {
+        macos::sysctl(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, format!("sysctl {name} says nothing"))
+        })
+    };
+    let levels = say("hw.nperflevels")?;
     let mut shape = Vec::new();
     for level in 0..levels {
-        let Some(logical) = macos::sysctl(&format!("hw.perflevel{level}.logicalcpu")) else {
-            break;
-        };
-        let per_l2 = macos::sysctl(&format!("hw.perflevel{level}.cpusperl2")).unwrap_or(0);
+        let logical = say(&format!("hw.perflevel{level}.logicalcpu"))?;
+        let per_l2 = say(&format!("hw.perflevel{level}.cpusperl2"))?;
         shape.push((logical, per_l2));
     }
-    if shape.iter().all(|&(logical, _)| logical == 0) {
-        let logical = macos::sysctl("hw.logicalcpu").map_or_else(parallelism, |it| it as usize);
-        return Topology::flat(logical);
+    let topology = Topology::from_perflevels(&shape);
+    if topology.cpus.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "hw.perflevel* say no CPU"));
     }
-    Topology::from_perflevels(&shape)
+    Ok(topology)
 }
 
+/// Where the OS says no more than a count, the pool's threads are not bound ([`crate::pool`]).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn detect() -> Topology {
-    Topology::flat(parallelism())
+fn detect() -> io::Result<Topology> {
+    std::thread::available_parallelism().map(|it| Topology::flat(it.get()))
 }
 
-fn parallelism() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+/// The CPU's NUMA node: its `nodeN` entry, 0 where it has none (a machine of one node).
+fn node_of(cpu: &Path) -> io::Result<u32> {
+    let entries = match fs::read_dir(cpu) {
+        Ok(entries) => entries,
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(why) => return Err(at(cpu, why)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|why| at(cpu, why))?;
+        let name = entry.file_name();
+        if let Some(number) = name.to_str().and_then(|it| it.strip_prefix("node"))
+            && let Ok(node) = number.parse::<u32>()
+        {
+            return Ok(node);
+        }
+    }
+    Ok(0)
 }
 
 /// The level 3 cache's CPUs, where the CPU says.
@@ -273,8 +320,8 @@ pub(crate) mod linux {
 
     const BITS: usize = 8 * size_of::<libc::c_ulong>();
 
-    /// The CPUs the process may run on, or `None` where the kernel does not say.
-    pub(crate) fn affinity() -> Option<BTreeSet<u32>> {
+    /// The CPUs the process may run on.
+    pub(crate) fn affinity() -> io::Result<BTreeSet<u32>> {
         let mut words = 1024 / BITS;
         loop {
             let mut mask: Vec<libc::c_ulong> = vec![0; words];
@@ -292,18 +339,20 @@ pub(crate) mod linux {
                 for (at, word) in mask.iter().enumerate() {
                     for bit in 0..BITS {
                         if word & (1 << bit) != 0 {
-                            cpus.insert(u32::try_from(at * BITS + bit).ok()?);
+                            // `words` is at most 2^16, so the CPU number fits.
+                            cpus.insert((at * BITS + bit) as u32);
                         }
                     }
                 }
-                return Some(cpus);
+                return Ok(cpus);
             }
+            let why = io::Error::last_os_error();
             // EINVAL: the mask is smaller than the kernel's.
-            if io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) && words < 1 << 16 {
+            if why.raw_os_error() == Some(libc::EINVAL) && words < 1 << 16 {
                 words *= 2;
                 continue;
             }
-            return None;
+            return Err(io::Error::new(why.kind(), format!("sched_getaffinity: {why}")));
         }
     }
 
@@ -511,15 +560,56 @@ mod tests {
         assert_eq!(
             Topology::from_perflevels(&[(2, 0)]).cpus,
             [
-                Cpu { id: 0, group: 0, socket: 0, fast: true },
-                Cpu { id: 1, group: 0, socket: 0, fast: true }
+                Cpu { id: 0, group: 0, socket: 0, node: 0, fast: true },
+                Cpu { id: 1, group: 0, socket: 0, node: 0, fast: true }
             ]
         );
     }
 
+    /// One socket of two NUMA nodes of four CPUs, one L3 for all eight (sub-NUMA clusters):
+    /// each node's part of the cache is a group, and a group steals from its node first.
+    #[test]
+    fn a_group_never_spans_numa_nodes() {
+        let tree = Tree::new("numa");
+        tree.file("online", "0-7");
+        for cpu in 0..8u32 {
+            let at = format!("cpu{cpu}");
+            tree.file(&format!("{at}/cache/index3/level"), "3");
+            tree.file(&format!("{at}/cache/index3/shared_cpu_list"), "0-7");
+            tree.file(&format!("{at}/topology/physical_package_id"), "0");
+            // The kernel's is a symlink to the node's directory; only the name is read.
+            fs::create_dir_all(tree.0.join(format!("{at}/node{}", cpu / 4))).unwrap();
+        }
+        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let nodes: Vec<u32> = topology.cpus.iter().map(|it| it.node).collect();
+        assert_eq!(nodes, [0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(groups(&topology), [0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(topology.nodes(), [0, 1]);
+
+        // Two sockets of two nodes, a CCD (L3) of two CPUs each: node, then socket, then any.
+        let tree = Tree::new("numa-sockets");
+        tree.file("online", "0-15");
+        for cpu in 0..16u32 {
+            let at = format!("cpu{cpu}");
+            let ccd = cpu / 2;
+            tree.file(&format!("{at}/cache/index3/level"), "3");
+            tree.file(
+                &format!("{at}/cache/index3/shared_cpu_list"),
+                &format!("{}-{}", ccd * 2, ccd * 2 + 1),
+            );
+            tree.file(&format!("{at}/topology/physical_package_id"), &(cpu / 8).to_string());
+            fs::create_dir_all(tree.0.join(format!("{at}/node{}", cpu / 4))).unwrap();
+        }
+        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        assert_eq!(topology.groups(), 8);
+        assert_eq!(topology.nodes(), [0, 0, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(topology.steal_order(2), [2, 3, 1, 0, 4, 5, 6, 7]);
+        assert_eq!(topology.steal_order(5), [5, 4, 6, 7, 3, 2, 1, 0]);
+    }
+
     #[test]
     fn detect_finds_at_least_one_cpu() {
-        let topology = Topology::detect();
+        let topology = Topology::detect().unwrap();
         assert!(!topology.cpus.is_empty());
         let groups = topology.groups();
         assert!(topology.cpus.iter().all(|it| it.group < groups));

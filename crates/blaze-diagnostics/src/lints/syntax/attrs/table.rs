@@ -197,10 +197,6 @@ pub(crate) fn builtin(path: &[&str]) -> Option<&'static Builtin> {
     BUILTINS.binary_search_by(|it| it.path.cmp(path)).ok().map(|it| &BUILTINS[it])
 }
 
-/// The lint attributes, which rustc still checks against a template of their own
-/// (`validate_attr.rs`, `check_attr`).
-pub(crate) const LINT_ATTRIBUTES: &[&str] = &["allow", "deny", "expect", "forbid", "warn"];
-
 /// rustc's `ALL_TARGETS`.
 const ALL_TARGETS: &[Policy] = &[
     Allow(Target::ExternCrate),
@@ -1160,6 +1156,20 @@ const BUILTINS: &[Builtin] = &[
     },
     // `RegisterToolParser`, crate_level.rs
     Builtin {
+        path: &["register_attribute_tool"],
+        kind: Kind::Combine,
+        safety: Safety::Normal,
+        targets: Targets::AllowList(&[Allow(Target::Crate)]),
+        template: template!(List: &["tool1, tool2, ..."]),
+    },
+    Builtin {
+        path: &["register_lint_tool"],
+        kind: Kind::Combine,
+        safety: Safety::Normal,
+        targets: Targets::AllowList(&[Allow(Target::Crate)]),
+        template: template!(List: &["tool1, tool2, ..."]),
+    },
+    Builtin {
         path: &["register_tool"],
         kind: Kind::Combine,
         safety: Safety::Normal,
@@ -1532,6 +1542,14 @@ const BUILTINS: &[Builtin] = &[
             Allow(Target::Crate),
         ]),
         template: template!(NameValueStr: "name"),
+    },
+    // `OpaqueParser`, diagnostic/opaque.rs
+    Builtin {
+        path: &["rustc_diagnostic_opaque"],
+        kind: Kind::Bespoke,
+        safety: Safety::Normal,
+        targets: Targets::AllowListWarnRest(&[Allow(Target::MacroDef)]),
+        template: template!(Word),
     },
     // `RustcDoNotConstCheckParser`, rustc_internal.rs
     Builtin {
@@ -2171,6 +2189,14 @@ const BUILTINS: &[Builtin] = &[
         targets: Targets::AllowList(&[Allow(Target::Fn)]),
         template: template!(Word),
     },
+    // `OnUnimplementedParser`, diagnostic/on_unimplemented.rs
+    Builtin {
+        path: &["rustc_on_unimplemented"],
+        kind: Kind::Bespoke,
+        safety: Safety::Normal,
+        targets: Targets::AllowListWarnRest(&[Allow(Target::Trait)]),
+        template: template!(List: &[r#"/*opt*/ message = "...", /*opt*/ label = "...", /*opt*/ note = "...""#]),
+    },
     // `RustcPanicsWhenZeroParser`, rustc_internal.rs
     Builtin {
         path: &["rustc_panics_when_zero"],
@@ -2614,3 +2640,64 @@ const BUILTINS: &[Builtin] = &[
         template: template!(NameValueStr: ["windows", "console"], "https://doc.rust-lang.org/reference/runtime.html#the-windows_subsystem-attribute"),
     },
 ];
+
+/// rustc's `BUILTIN_ATTRIBUTES`, sorted: the names of every builtin attribute
+/// (`compiler/rustc_feature/src/builtin_attrs.rs`).
+const BUILTIN_ATTRIBUTE_NAMES: &[&str] = &[
+    "allow", "allow_internal_unsafe", "allow_internal_unstable", "automatically_derived", "cfg",
+    "cfg_attr", "cfi_encoding", "cold", "collapse_debuginfo", "compiler_builtins", "const_continue",
+    "coroutine", "coverage", "crate_name", "crate_type", "custom_mir", "debugger_visualizer",
+    "default_lib_allocator", "deny", "deprecated", "doc", "expect", "export_name", "export_stable",
+    "feature", "ffi_const", "ffi_pure", "forbid", "force_target_feature", "fundamental", "ignore",
+    "inline", "instruction_set", "instrument_fn", "lang", "link", "link_name", "link_ordinal",
+    "link_section", "linkage", "loop_match", "macro_escape", "macro_export", "macro_use", "marker",
+    "may_dangle", "move_size_limit", "must_not_suspend", "must_use", "naked", "needs_allocator",
+    "needs_panic_runtime", "no_builtins", "no_core", "no_implicit_prelude", "no_link", "no_main",
+    "no_mangle", "no_std", "non_exhaustive", "optimize", "panic_handler", "panic_runtime",
+    "patchable_function_entry", "path", "pattern_complexity_limit", "pin_v2", "prelude_import",
+    "proc_macro", "proc_macro_attribute", "proc_macro_derive", "profiler_runtime",
+    "recursion_limit", "reexport_test_harness_main", "register_attribute_tool",
+    "register_lint_tool", "register_tool", "repr", "rustc_abi", "rustc_align", "rustc_align_static",
+    "rustc_allocator", "rustc_allocator_zeroed", "rustc_allocator_zeroed_variant",
+    "rustc_allow_const_fn_unstable", "rustc_allow_incoherent_impl",
+    "rustc_allowed_through_unstable_modules", "rustc_as_ptr", "rustc_autodiff",
+    "rustc_builtin_macro", "rustc_canonical_symbol", "rustc_capture_analysis", "rustc_clean",
+    "rustc_coherence_is_core", "rustc_coinductive", "rustc_comptime", "rustc_confusables",
+    "rustc_const_stable", "rustc_const_stable_indirect", "rustc_const_unstable",
+    "rustc_conversion_suggestion", "rustc_deallocator", "rustc_default_body_unstable",
+    "rustc_delayed_bug_from_inside_query", "rustc_deny_explicit_impl", "rustc_deprecated_safe_2024",
+    "rustc_diagnostic_item", "rustc_diagnostic_opaque", "rustc_do_not_const_check",
+    "rustc_doc_primitive", "rustc_dummy", "rustc_dump_def_parents", "rustc_dump_def_path",
+    "rustc_dump_generics", "rustc_dump_hidden_type_of_opaques", "rustc_dump_inferred_outlives",
+    "rustc_dump_item_bounds", "rustc_dump_layout", "rustc_dump_object_lifetime_defaults",
+    "rustc_dump_predicates", "rustc_dump_symbol_name", "rustc_dump_user_args",
+    "rustc_dump_variances", "rustc_dump_variances_of_opaques", "rustc_dump_vtable",
+    "rustc_dyn_incompatible_trait", "rustc_effective_visibility", "rustc_eii_foreign_item",
+    "rustc_evaluate_where_clauses", "rustc_expected_cgu_reuse", "rustc_force_inline",
+    "rustc_has_incoherent_inherent_impls", "rustc_if_this_changed", "rustc_inherit_overflow_checks",
+    "rustc_insignificant_dtor", "rustc_intrinsic", "rustc_intrinsic_const_stable_indirect",
+    "rustc_legacy_const_generics", "rustc_lint_opt_deny_field_access", "rustc_lint_opt_ty",
+    "rustc_lint_query_instability", "rustc_lint_untracked_query_information",
+    "rustc_macro_transparency", "rustc_main", "rustc_mir", "rustc_must_implement_one_of",
+    "rustc_must_match_exhaustively", "rustc_never_returns_null_ptr", "rustc_never_type_options",
+    "rustc_no_implicit_autorefs", "rustc_no_implicit_bounds", "rustc_no_mir_inline",
+    "rustc_no_writable", "rustc_non_const_trait_method", "rustc_nonnull_optimization_guaranteed",
+    "rustc_nounwind", "rustc_objc_class", "rustc_objc_selector", "rustc_offload_kernel",
+    "rustc_on_unimplemented", "rustc_panics_when_zero", "rustc_paren_sugar",
+    "rustc_partition_codegened", "rustc_partition_reused", "rustc_pass_by_value",
+    "rustc_pass_indirectly_in_non_rustic_abis", "rustc_preserve_ub_checks",
+    "rustc_proc_macro_decls", "rustc_promotable", "rustc_pub_transparent", "rustc_reallocator",
+    "rustc_regions", "rustc_reservation_impl", "rustc_scalable_vector",
+    "rustc_should_not_be_called_on_const_items", "rustc_simd_monomorphize_lane_limit",
+    "rustc_skip_during_method_dispatch", "rustc_specialization_trait", "rustc_splat",
+    "rustc_std_internal_symbol", "rustc_strict_coherence", "rustc_test_entrypoint_marker",
+    "rustc_test_marker", "rustc_then_this_would_need", "rustc_trivial_field_reads",
+    "rustc_unsafe_specialization_marker", "sanitize", "should_panic", "stable", "target_feature",
+    "test_runner", "thread_local", "track_caller", "type_length_limit", "unroll", "unstable",
+    "unstable_feature_bound", "unstable_removed", "used", "warn", "windows_subsystem",
+];
+
+/// rustc's `is_builtin_attr_name`.
+pub(crate) fn is_builtin_attr_name(name: &str) -> bool {
+    BUILTIN_ATTRIBUTE_NAMES.binary_search(&name).is_ok()
+}

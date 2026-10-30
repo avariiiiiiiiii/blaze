@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 jobserver = "0.1.35"
+memchr.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_derive.workspace = true

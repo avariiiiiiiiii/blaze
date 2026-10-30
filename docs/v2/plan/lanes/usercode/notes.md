@@ -62,16 +62,32 @@ variables (`script::RUN_ONLY`) are of one run alone, as in cargo's fingerprint.
 
 Where inputs are hashed now: `inputs::ViewInputs` reads a view's files through the query
 database's `Cx`, so the query that checks a run depends on exactly what the run read, and the
-machine's files (toolchain, the C compiler and headers: #1480) through `inputs::Disk`, cached
-by what `stat` says. A file that is there and can't be read is an error naming it.
+machine's files (toolchain, the C compiler and headers: #1480) through `inputs::Files`, one
+append-only table per process (`blaze_ids::Sharded`) of hashes by path and what `stat` said:
+a lookup takes no lock, a file is hashed outside any lock, and an edit is a new entry under its
+new stamp. `inputs::Now` is one check's view of it with an environment (`inputs::Env`, sorted);
+`inputs::Disk` owns its environment and shares the table. A file that is there and can't be
+read is an error naming it.
+
+## The environment
+
+The launcher records `E *` (the whole environment) for every traced run, because a process can
+walk `environ` with no call the sandbox sees (Rust's `env::vars` on Linux, C's `environ`). So
+today every passed-through variable is in every traced key: sound, but a shell that differs in
+`SHLVL` or `OLDPWD` reruns build scripts and misses kept expansions. The way out is a std that
+says when it walks (v2/requests/usercode.md, request 6): then `E *` is recorded only for a
+process whose executable is not blaze-built, and a blaze-built script is keyed by the variables
+it read by name.
 
 ## What can't be traced
 
 A run that read the clock, randomness, the network or a descriptor it was given keeps cargo's
 rule (`rule::widen`), added to what it was seen to read: its `rerun-if-changed` paths (a
-directory meaning everything below it: a `trace::TREE` entry), or its whole package without
-hidden directories and `target` (a `trace::PACKAGE` entry), and its `rerun-if-env-changed`
-variables. It is never kept for longer than either rule would keep it.
+directory meaning everything below it: a `trace::TREE` entry), or, when it printed neither
+`rerun-if-changed` nor `rerun-if-env-changed`, its whole package without hidden directories and
+`target` (a `trace::PACKAGE` entry), and its `rerun-if-env-changed` variables
+(`blaze_build_script::watched`, made a `rule::CargoRule` by `CargoRule::of`). It is never kept
+for longer than either rule would keep it.
 
 ## Runs
 
@@ -80,9 +96,31 @@ or a spawn in a sandbox that traces, its `OUT_DIR` given empty and read back wit
 checked to stay inside (a link out of it is an error), kept when it succeeded. `run::Mode::Verify`
 runs anyway and fails naming the run when the result differs from the one kept.
 
-`script::prepare` makes a build script's run from `blaze_build_script::Unit`: a variable the
-script sees with the value it had where the build started is passed through and traced, any
-other is given (#805); either way the value it saw is in its key.
+`script::prepare` makes a build script's run from `blaze_build_script::Unit`: a variable cargo
+sets from the unit (`Env::set_from_unit`) is given, one passed through from where the build
+started is traced (#805); either way the value it saw is in its key. `script::inert` reads a
+script that only prints constant directives (`blaze_build_script::elide`, with the compile
+flags `elide::flags_allow` accepts) as its result without compiling or running it (#1296);
+verify mode runs it as well and `script::verify_elided` compares.
+
+## Speed
+
+What each part matches or beats:
+
+- **Keys** are Shake's constructive traces (*Build systems à la carte*), stored content-addressed
+  as Bazel's action cache is, but keyed by what was read rather than what was declared. A shape
+  chain makes finding cost one get per distinct set of reads, not per result kept.
+- **Checking inputs** costs one `stat` per path outside every view and nothing inside one: view
+  files come from the query database, which the VFS watcher keeps current (watchman's model). A
+  changed file is hashed once per process, with BLAKE3's SIMD over 64 KiB reads, and never under
+  a lock.
+- **Tests** fork from a server per binary, as AFL's fork server does: 0.1 to 0.5 ms a test on
+  Linux, against the few milliseconds of spawning one process per test as nextest does. One
+  global queue runs the longest first across every binary.
+- **Workers**: warm processes are keyed like Bazel's persistent workers, but never by a
+  passed-through variable (#805), so a `PATH` change keeps them.
+- **Build scripts** that only print constants are read without compiling them (#1296), as
+  Relax's no-op detection does, over a tokenizer of this crate's own.
 
 ## The warm pool
 

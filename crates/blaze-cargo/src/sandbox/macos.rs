@@ -553,13 +553,13 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             Ok(bytes) => merge(&String::from_utf8_lossy(&bytes), &mut recorder),
             Err(error) => {
                 let why = format!("the sandbox's record {}: {error}", raw.display());
-                recorder.reached(Seen::Incomplete, String::new(), &why);
+                recorder.reached(Seen::Incomplete, "", &why);
                 None
             }
         };
         if left {
             let why = "processes of the run still ran after it ended, so what they read is not known";
-            recorder.reached(Seen::Incomplete, String::new(), why);
+            recorder.reached(Seen::Incomplete, "", why);
         }
         if let Some(file) = &spec.record {
             recorder.write(file);
@@ -612,7 +612,7 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
         let Some(line) = piece.strip_suffix('\n') else {
             // Every process has ended: a line with no line break was written short.
             let why = "the sandbox's record ends in a line cut short";
-            recorder.reached(Seen::Incomplete, String::new(), why);
+            recorder.reached(Seen::Incomplete, "", why);
             break;
         };
         let mut fields = line.splitn(4, '\t');
@@ -631,7 +631,7 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
                         "process {pid} of the run left its process group and still ran after the \
                          run ended, so what it read is not known"
                     );
-                    recorder.reached(Seen::Incomplete, String::new(), &why);
+                    recorder.reached(Seen::Incomplete, "", &why);
                 }
                 continue;
             }
@@ -647,11 +647,11 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
             _ => None,
         };
         match seen {
-            Some((seen, test, what)) => recorder.reached(seen, test.to_owned(), what),
+            Some((seen, test, what)) => recorder.reached(seen, test, what),
             None => {
                 let shown: String = line.chars().take(200).collect();
                 let why = format!("the sandbox's record has a line that is not one: {shown:?}");
-                recorder.reached(Seen::Incomplete, String::new(), &why);
+                recorder.reached(Seen::Incomplete, "", &why);
             }
         }
     }
@@ -661,7 +661,7 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
                 "{path} ran without the recorder (macOS keeps DYLD_INSERT_LIBRARIES from a \
                  program it protects), so what it read is not known"
             );
-            recorder.reached(Seen::Incomplete, test.to_owned(), &why);
+            recorder.reached(Seen::Incomplete, test, &why);
         }
     }
     lost
@@ -741,7 +741,7 @@ mod tests {
         let mut recorder = Recorder::new(&Spec::default(), &[]);
         let raw = format!("S\t{gone_pid}\nS\t{}\n", std::process::id());
         assert_eq!(super::merge(&raw, &mut recorder), None);
-        let lines: Vec<_> = recorder.lines().cloned().collect();
+        let lines: Vec<_> = recorder.lines().collect();
         let here = format!("process {} of the run left its process group", std::process::id());
         assert!(lines.iter().any(|it| it.seen == Seen::Incomplete && it.what.starts_with(&here)), "{lines:?}");
         let gone = format!("process {gone_pid} ");

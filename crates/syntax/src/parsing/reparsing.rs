@@ -22,6 +22,7 @@ use crate::{
     SyntaxKind::{self, *},
     SyntaxTreeBuilder, T, TextRange, TextSize, ast,
     parsing::{build_node, lexer_errors},
+    raw::joined,
     syntax_node::RustLanguage,
 };
 
@@ -49,15 +50,16 @@ pub(crate) fn incremental_reparse(
         return None;
     }
     let source = tree.source();
-    let mut text = String::with_capacity(source.len() + insert.len());
-    text.push_str(&source[..usize::from(delete.start())]);
-    text.push_str(insert);
-    text.push_str(&source[usize::from(delete.end())..]);
+    let new_source = joined(&[
+        &source[..usize::from(delete.start())],
+        insert,
+        &source[usize::from(delete.end())..],
+    ]);
     let edit = Edit {
         tree,
         delete,
         insert,
-        new_source: Arc::from(text),
+        new_source,
         edition,
         outline: outline.is_some(),
     };
@@ -149,33 +151,9 @@ impl Edit<'_> {
             }
         }
 
-        let parent = tree.parent(at)?;
-        let mut builder = SyntaxTreeBuilder::sourced(Arc::from(self.new_text(tree.range(parent))));
-        let mut open = Vec::new();
-        for it in parent..tree.end(parent) {
-            while open.last().is_some_and(|&end| end <= it) {
-                open.pop();
-                builder.finish_node();
-            }
-            let kind = self.kind(it);
-            if it == at {
-                builder.token(kind, new_text);
-            } else if tree.is_token(it) {
-                builder.token(kind, tree.token_text(it));
-            } else if tree.is_lazy(it) {
-                builder.lazy(kind, tree.range(it).len());
-            } else {
-                builder.start_node(kind);
-                open.push(tree.end(it));
-            }
-        }
-        for _ in open {
-            builder.finish_node();
-        }
-        let (with, _no_errors) = builder.finish_raw(self.edition);
         let token_range = TextRange::up_to(TextSize::of(new_text));
         let errors = new_err.into_iter().map(|msg| SyntaxError::new(msg, token_range)).collect();
-        Some((tree.replace_subtree(parent, &with, self.new_source.clone()), errors, range))
+        Some((tree.replace_token(at, new_text, self.new_source.clone()), errors, range))
     }
 
     /// The smallest node holding the edit that parses again alone, spliced.
@@ -363,8 +341,8 @@ fn comment_style(text: &str) -> (bool, bool) {
     (outer, text.starts_with("//!") || text.starts_with("/*!"))
 }
 
-fn token_lengths(lexed: &LexedStr<'_>) -> Vec<(SyntaxKind, usize)> {
-    (0..lexed.len()).map(|it| (lexed.kind(it), lexed.text_len(it))).collect()
+fn token_lengths<'a>(lexed: &'a LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind, usize)> + 'a {
+    (0..lexed.len()).map(|it| (lexed.kind(it), lexed.text_len(it)))
 }
 
 /// The first [`LOOKAHEAD`] tokens of `lexed` that are not trivia.

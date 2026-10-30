@@ -4,14 +4,15 @@
 //! it and asks [`Finish::exited`].
 //!
 //! The process's memory is held by the system where a limit is asked for: a cgroup of its own
-//! on Linux, which it joins before it runs its program, and on macOS a resource limit and a
-//! watch of its footprint. Where none can be made, it is not started.
+//! on Linux, which it joins before it runs its program, and on macOS a watch of its footprint.
+//! Where none can be made, it is not started.
+
+mod spawn;
 
 use std::{
     io,
-    os::{fd::OwnedFd, unix::process::CommandExt as _},
+    os::fd::OwnedFd,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -25,6 +26,9 @@ static RUNS: AtomicU64 = AtomicU64::new(0);
 /// A process started, its pipes the driver's.
 pub(crate) struct Started {
     pub(crate) pid: libc::pid_t,
+    /// Readable once it exits; made with it, so it names this process and no later one.
+    #[cfg(target_os = "linux")]
+    pub(crate) pidfd: OwnedFd,
     /// Where its input goes, of a command with input; closing it is the end of the input.
     pub(crate) stdin: Option<OwnedFd>,
     pub(crate) stdout: OwnedFd,
@@ -100,40 +104,23 @@ pub(crate) fn start(
         }
         error
     };
-    let mut process = std::process::Command::new(&confined.program);
-    process
-        .args(&confined.args)
-        .env_clear()
-        .envs(confined.env.iter().map(|(name, value)| (name, value)))
-        .current_dir(&confined.dir)
-        .stdin(if command.stdin.is_empty() { Stdio::null() } else { Stdio::piped() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
     #[cfg(target_os = "linux")]
     let cgroup = match command.memory {
-        Some(bytes) => {
-            let cgroup = crate::cgroup::Cgroup::new(bytes).map_err(|error| {
-                removing(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{}: no cgroup can hold its memory to {bytes} bytes: {error}",
-                        command.program.display()
-                    ),
-                ))
-            })?;
-            let procs = cgroup.procs().to_owned();
-            // SAFETY: the closure makes three system calls and allocates nothing, as a child
-            // between fork and exec must.
-            unsafe { process.pre_exec(move || join(&procs)) };
-            Some(cgroup)
-        }
+        Some(bytes) => Some(crate::cgroup::Cgroup::new(bytes).map_err(|error| {
+            removing(io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: no cgroup can hold its memory to {bytes} bytes: {error}",
+                    command.program.display()
+                ),
+            ))
+        })?),
         None => None,
     };
-    #[cfg(target_os = "macos")]
-    if let Some(bytes) = command.memory {
-        // SAFETY: `limit_self` makes system calls alone, as a child between fork and exec must.
-        unsafe { process.pre_exec(move || crate::footprint::limit_self(bytes)) };
-    }
+    #[cfg(target_os = "linux")]
+    let procs = cgroup.as_ref().map(crate::cgroup::Cgroup::procs);
+    #[cfg(not(target_os = "linux"))]
+    let procs = None;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if let Some(bytes) = command.memory {
         return Err(removing(io::Error::new(
@@ -144,18 +131,13 @@ pub(crate) fn start(
             ),
         )));
     }
-    let mut child = process.spawn().map_err(|error| {
+    let spawned = spawn::spawn(&confined, !command.stdin.is_empty(), procs).map_err(|error| {
         removing(io::Error::new(
             error.kind(),
             format!("starting {}: {error}", confined.program.display()),
         ))
     })?;
-    let pid = child.id() as libc::pid_t;
-    let stdin = child.stdin.take().map(OwnedFd::from);
-    let stdout = OwnedFd::from(child.stdout.take().expect("a piped stdout"));
-    let stderr = OwnedFd::from(child.stderr.take().expect("a piped stderr"));
-    // Dropping a `Child` neither waits for nor kills it: the driver reaps it.
-    drop(child);
+    let pid = spawned.pid;
     #[cfg(target_os = "linux")]
     let limit = cgroup.map_or(Limit::None, Limit::Cgroup);
     #[cfg(target_os = "macos")]
@@ -165,26 +147,15 @@ pub(crate) fn start(
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let limit = Limit::None;
-    Ok(Started { pid, stdin, stdout, stderr, finish: Finish { command, confine, scratch, limit } })
-}
-
-/// In the child before its program runs: into the cgroup whose `cgroup.procs` is `procs`.
-#[cfg(target_os = "linux")]
-fn join(procs: &std::ffi::CStr) -> io::Result<()> {
-    // SAFETY: a NUL-terminated path; the descriptor is closed below.
-    let fd = unsafe { libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: one byte from a static, to an open descriptor.
-    let wrote = unsafe { libc::write(fd, b"0".as_ptr().cast(), 1) };
-    let error = io::Error::last_os_error();
-    // SAFETY: the descriptor opened above.
-    unsafe { libc::close(fd) };
-    match wrote {
-        1 => Ok(()),
-        _ => Err(error),
-    }
+    Ok(Started {
+        pid,
+        #[cfg(target_os = "linux")]
+        pidfd: spawned.pidfd,
+        stdin: spawned.stdin,
+        stdout: spawned.stdout,
+        stderr: spawned.stderr,
+        finish: Finish { command, confine, scratch, limit },
+    })
 }
 
 impl Finish {

@@ -13,17 +13,24 @@
 //! variant is its name, any other variant a map of its name to its contents, `None` and `()`
 //! null. Integers wider than 64 bits that do not fit CBOR's are refused.
 //!
-//! [`from_slice`] first [`check`]s that the bytes are one item in this encoding and refuses
-//! them, naming the first offence and where, rather than read an encoding the writer should
-//! not have sent.
+//! [`from_slice`] refuses bytes that are not one item in this encoding, naming the first
+//! offence and where (as [`check`] does), rather than read an encoding the writer should not
+//! have sent. It reads them once, checking as it goes, and borrows text and byte strings from
+//! them for a type that borrows. [`append`] and a kept [`Writer`] write onto the end of a
+//! buffer the caller reuses, each item in place.
 
 mod check;
 mod de;
+#[cfg(any(test, feature = "reference"))]
+#[doc(hidden)]
+pub mod reference;
 mod ser;
+#[cfg(test)]
+mod tests;
 
 pub use check::check;
 pub use de::from_slice;
-pub use ser::to_vec;
+pub use ser::{Writer, append, to_vec};
 
 use std::fmt;
 
@@ -84,23 +91,45 @@ const NAN: u16 = 0x7e00;
 
 /// Writes the head of an item of `major` type with argument `n`, in its shortest form.
 fn head(out: &mut Vec<u8>, major: u8, n: u64) {
+    if n < 24 {
+        out.push((major << 5) | n as u8);
+        return;
+    }
+    let (bytes, len) = head_bytes(major, n);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+/// The head of an item of `major` type with argument `n`, in its shortest form, and how many
+/// of the bytes it is.
+fn head_bytes(major: u8, n: u64) -> ([u8; 9], usize) {
     let major = major << 5;
-    match n {
-        0..=23 => out.push(major | n as u8),
-        24..=0xff => out.extend([major | 24, n as u8]),
+    let mut bytes = [0; 9];
+    let len = match n {
+        0..=23 => {
+            bytes[0] = major | n as u8;
+            1
+        }
+        24..=0xff => {
+            bytes[..2].copy_from_slice(&[major | 24, n as u8]);
+            2
+        }
         0x100..=0xffff => {
-            out.push(major | 25);
-            out.extend((n as u16).to_be_bytes());
+            bytes[0] = major | 25;
+            bytes[1..3].copy_from_slice(&(n as u16).to_be_bytes());
+            3
         }
         0x1_0000..=0xffff_ffff => {
-            out.push(major | 26);
-            out.extend((n as u32).to_be_bytes());
+            bytes[0] = major | 26;
+            bytes[1..5].copy_from_slice(&(n as u32).to_be_bytes());
+            5
         }
         _ => {
-            out.push(major | 27);
-            out.extend(n.to_be_bytes());
+            bytes[0] = major | 27;
+            bytes[1..].copy_from_slice(&n.to_be_bytes());
+            9
         }
-    }
+    };
+    (bytes, len)
 }
 
 /// `value` in half precision, when it is exactly one. NaN has its own encoding and is not

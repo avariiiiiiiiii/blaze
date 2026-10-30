@@ -502,6 +502,26 @@ mod tests {
         );
     }
 
+    /// Code without syntax errors is still changed by `fixup_syntax` (a statement `if` gets a
+    /// `;`), so a macro's input skips it unless an error touches the item
+    /// (`HirFileId::has_syntax_error_in`): the macro sees the tokens rustc gives it.
+    #[test]
+    fn valid_code_is_changed_by_fixups() {
+        let parsed = syntax::SourceFile::parse("fn foo() { if a {} b(); }", Edition::CURRENT);
+        assert!(parsed.errors().is_empty());
+        let span_map = SpanMap::RealSpanMap(&RealSpanMap::absolute(EditionedFileId::new(
+            FileId::from_raw(0),
+            Edition::CURRENT,
+        )));
+        let fixups = super::fixup_syntax(
+            span_map,
+            &parsed.syntax_node(),
+            span_map.span_for_range(TextRange::empty(0.into())),
+            DocCommentDesugarMode::ProcMacro,
+        );
+        assert!(!fixups.append.is_empty());
+    }
+
     #[test]
     fn just_for_token() {
         check(

@@ -21,7 +21,7 @@
 //! what runs, and the job still finishes once, not ok.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -38,9 +38,10 @@ use blaze_cas::{Placed, Store};
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_graph::{
     Key, Outcome, Pool, RequestId, RequestStats, Spec,
+    admission::TaskKind,
     machine::NodeId,
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, QueryKey};
 use blaze_units::{
@@ -48,7 +49,7 @@ use blaze_units::{
     schema::Mode as UnitMode,
 };
 use blaze_vfs::{Ticket, ViewId, Vfs};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     heads::Heads,
@@ -63,7 +64,8 @@ const RUN_TAGS: u64 = 1 << 32;
 /// What a thread task of a job hands the loop.
 pub enum Value {
     Library(Result<(String, Source), ApiError>),
-    Fetched(Box<Fetch>, Result<Source, ApiError>),
+    /// The fetch at its place in its batch ([`Fetching::fetches`]).
+    Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
     Lowered(Result<Arc<dyn Front>, ApiError>),
     Compiled(usize, Result<Compiled, ApiError>),
@@ -114,33 +116,49 @@ fn library_key() -> Key {
 
 /// The single-flight key of a fetch: every job asking the same source shares one download.
 fn fetch_key(fetch: &Fetch) -> Key {
-    let kind = match &fetch.kind {
-        FetchKind::Crate { sha256 } => format!("crate {sha256}"),
-        FetchKind::IndexFile => "index".to_owned(),
-        FetchKind::Git { commit } => format!("git {commit}"),
+    let mut hasher = Hasher::new("blaze v2 serve fetch");
+    hasher.part(fetch.at.as_bytes()).part(fetch.url.as_bytes());
+    match &fetch.kind {
+        FetchKind::Crate { sha256 } => hasher.part(b"crate").part(sha256.as_bytes()),
+        FetchKind::IndexFile => hasher.part(b"index"),
+        FetchKind::Git { commit } => hasher.part(b"git").part(commit.as_bytes()),
     };
-    let text = format!("{}\0{}\0{kind}", fetch.at, fetch.url);
-    Key(ContentId::of("blaze v2 serve fetch", text.as_bytes()).0)
+    Key(hasher.finish().0)
 }
 
 /// A step's work as a task: a give-way posts it again, unless the job is cancelled.
+/// The work of a batch of thread tasks: `step` of a task's `arg`, and the value it is told to
+/// the loop as.
 fn task<R: 'static>(
     cancelled: &Arc<AtomicBool>,
-    step: impl Fn() -> Result<R, Failed> + Send + Sync + 'static,
-    value: impl Fn(Result<R, ApiError>) -> Value + Send + Sync + 'static,
+    step: impl Fn(u32) -> Result<R, Failed> + Send + Sync + 'static,
+    value: impl Fn(u32, Result<R, ApiError>) -> Value + Send + Sync + 'static,
 ) -> plane::Work<Value> {
     let cancelled = cancelled.clone();
-    Arc::new(move || match step() {
-        Ok(it) => Some(Did { outcome: Outcome::Built, value: value(Ok(it)) }),
+    Arc::new(move |arg| match step(arg) {
+        Ok(it) => Some(Did { outcome: Outcome::Built, value: value(arg, Ok(it)) }),
         Err(Failed::Error(error)) => {
-            Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: value(Err(error)) })
+            Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: value(arg, Err(error)) })
         }
         Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
             outcome: Outcome::Failed { why: "cancelled".to_owned() },
-            value: value(Err(ApiError::new("cancelled", None))),
+            value: value(arg, Err(ApiError::new("cancelled", None))),
         }),
         Err(Failed::Again) => None,
     })
+}
+
+/// One thread task of kind `kind`, the batch's only one.
+fn one(kind: TaskKind) -> Task {
+    Task::Thread { kind, arg: 0 }
+}
+
+/// A node's name, `a` then `b`, in one allocation of its length.
+fn named(a: &str, b: &str) -> String {
+    let mut name = String::with_capacity(a.len() + b.len());
+    name.push_str(a);
+    name.push_str(b);
+    name
 }
 
 fn spec(id: NodeId, kind: NodeKind, name: String, deps: Vec<NodeId>, pool: Pool, key: Option<Key>) -> Spec {
@@ -256,23 +274,45 @@ struct Ready {
 enum Stage {
     Library(NodeId),
     Plan(NodeId, Prep),
-    Fetch(BTreeSet<NodeId>, BTreeMap<NodeId, String>, Prep),
+    Fetch(Fetching),
     Lower(NodeId, JobInput),
     Units(Box<Build>),
     Answer(NodeId),
-    /// The tests or the run, once every unit is built.
-    Runs(Box<dyn Runs>),
-    Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: Vec<blaze_cas::Ticket> },
+    /// The tests or the run, once every unit is built: its first tag, and it.
+    Runs(u64, Box<dyn Runs>),
+    /// Waits for the VFS's commit of the heads and the store's last put before this.
+    Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: Option<blaze_cas::Ticket> },
     Over,
+}
+
+/// What the plan needs fetched: fetch `at` is node `first + at`.
+struct Fetching {
+    first: NodeId,
+    fetches: Arc<[Fetch]>,
+    /// How many have not settled.
+    left: u32,
+    prep: Prep,
 }
 
 struct Build {
     input: JobInput,
     front: Arc<dyn Front>,
-    units: FxHashMap<NodeId, usize>,
-    scripts: FxHashMap<NodeId, Box<dyn Runs>>,
-    reported: BTreeSet<String>,
+    /// Unit `at` is node `first + at`.
+    first: NodeId,
+    /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
+    package_of: Vec<u32>,
+    /// The packages reported started, a bit each.
+    reported: Vec<u64>,
+    /// The build scripts that run: their first tag, and the run.
+    scripts: FxHashMap<NodeId, (u64, Box<dyn Runs>)>,
     artifacts: Vec<Artifact>,
+}
+
+impl Build {
+    fn unit(&self, node: NodeId) -> Option<usize> {
+        let at = node.0.wrapping_sub(self.first.0) as usize;
+        (at < self.package_of.len()).then_some(at)
+    }
 }
 
 struct Job {
@@ -290,6 +330,10 @@ struct Job {
     /// Opened by the job and closed as it finishes.
     queries: Vec<ViewId>,
     placing: usize,
+    /// The first ids of its batches of nodes ([`Jobs::nodes`]).
+    batches: Vec<NodeId>,
+    /// Its runs of user code that have not ended.
+    runs: u32,
     over: Option<(bool, Option<ApiError>)>,
     stats: RequestStats,
     /// Units started that were fresh, and that were made again.
@@ -303,7 +347,9 @@ pub struct Jobs {
     started: Vec<(JobId, Option<Opened>, Work)>,
     cancels: Vec<JobId>,
     jobs: BTreeMap<JobId, Job>,
-    by_node: FxHashMap<NodeId, JobId>,
+    /// Whose each batch of nodes is, by its first id: (how many, the job). A node's batch is
+    /// the last one starting at or below it, O(log batches) with nothing kept per node.
+    nodes: BTreeMap<u32, (u32, JobId)>,
     by_request: FxHashMap<RequestId, JobId>,
     library: Option<String>,
     library_failed: Option<ApiError>,
@@ -313,11 +359,14 @@ pub struct Jobs {
     /// The job of each lock write and mode of the loop's own.
     own: FxHashMap<Tag, (JobId, String)>,
     next_own: u64,
-    next_runs: u64,
-    /// By the first tag of its range: whose run it is.
-    runs: BTreeMap<u64, (JobId, Option<NodeId>)>,
-    /// What the store was given and is not durable yet.
-    unsaved: Vec<blaze_cas::Ticket>,
+    /// Whose each run of user code is (the job, and the script's node), by its number less
+    /// `runs_from`: run `n` has the tags `setup.runs + n * 2^32` on. Ended runs at the front
+    /// are let go, so a completion finds its run in O(1).
+    runs: VecDeque<Option<(JobId, Option<NodeId>)>>,
+    runs_from: u64,
+    /// The store's last put: its tickets are made in order, so all before it are durable once
+    /// it is.
+    put: Option<blaze_cas::Ticket>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
@@ -337,12 +386,11 @@ impl Builder for Jobs {
 impl Jobs {
     pub fn new(setup: Setup) -> Jobs {
         Jobs {
-            next_runs: setup.runs,
             setup,
             started: Vec::new(),
             cancels: Vec::new(),
             jobs: BTreeMap::new(),
-            by_node: FxHashMap::default(),
+            nodes: BTreeMap::new(),
             by_request: FxHashMap::default(),
             library: None,
             library_failed: None,
@@ -350,8 +398,9 @@ impl Jobs {
             placing: FxHashMap::default(),
             own: FxHashMap::default(),
             next_own: 0,
-            runs: BTreeMap::new(),
-            unsaved: Vec::new(),
+            runs: VecDeque::new(),
+            runs_from: 0,
+            put: None,
             cold: false,
             ended: false,
         }
@@ -408,6 +457,8 @@ impl Jobs {
             updating: BTreeSet::new(),
             queries: Vec::new(),
             placing: 0,
+            batches: Vec::new(),
+            runs: 0,
             over: None,
             stats: RequestStats::default(),
             fresh: 0,
@@ -429,12 +480,12 @@ impl Jobs {
     fn prepare(&mut self, w: &mut World<'_>, id: JobId) {
         if self.library.is_none() {
             let job = self.jobs.get_mut(&id).expect("a job being prepared");
-            let node = w.plane.node_id();
+            let node = w.plane.reserve(1);
             let steps = w.steps.clone();
-            let work = task(&job.cancelled, move || Ok(steps.library()?), Value::Library);
+            let work = task(&job.cancelled, move |_| Ok(steps.library()?), |_, it| Value::Library(it));
             let spec = spec(node, NodeKind::Std, "the standard library's source".into(), Vec::new(), Pool::Io, Some(library_key()));
             job.stage = Stage::Library(node);
-            self.add(w, id, vec![Node { spec, task: plane::Task::Thread { kind: kinds::LIBRARY, work } }]);
+            self.add(w, id, node, vec![Node { spec, task: one(kinds::LIBRARY) }], Some(work));
             return;
         }
         let job = self.jobs.get(&id).expect("a job being prepared");
@@ -471,27 +522,37 @@ impl Jobs {
 
     fn plan(&mut self, w: &mut World<'_>, id: JobId, prep: Prep) {
         let job = self.jobs.get_mut(&id).expect("a job planning");
-        let node = w.plane.node_id();
+        let node = w.plane.reserve(1);
         let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries);
-        let work = task(&job.cancelled, move || steps.plan(&db, queries), Value::Planned);
-        let spec = spec(node, NodeKind::Manifest, format!("the plan of {}", prep.root_dir), Vec::new(), Pool::Work, None);
+        let work = task(&job.cancelled, move |_| steps.plan(&db, queries), |_, it| Value::Planned(it));
+        let spec = spec(node, NodeKind::Manifest, named("the plan of ", &prep.root_dir), Vec::new(), Pool::Work, None);
         job.stage = Stage::Plan(node, prep);
-        self.add(w, id, vec![Node { spec, task: plane::Task::Thread { kind: kinds::PLAN, work } }]);
+        self.add(w, id, node, vec![Node { spec, task: one(kinds::PLAN) }], Some(work));
     }
 
-    fn add(&mut self, w: &mut World<'_>, id: JobId, nodes: Vec<Node<Value>>) {
-        let request = self.jobs[&id].request.expect("a job that builds has a request");
-        for node in &nodes {
-            self.by_node.insert(node.spec.id, id);
+    /// A batch of the job's nodes, with the ids reserved from `first`.
+    fn add(&mut self, w: &mut World<'_>, id: JobId, first: NodeId, nodes: Vec<Node>, work: Option<plane::Work<Value>>) {
+        let job = self.jobs.get_mut(&id).expect("a job adding nodes");
+        let request = job.request.expect("a job that builds has a request");
+        let count = u32::try_from(nodes.len()).expect("a batch of under 2^32 nodes");
+        if count > 0 {
+            job.batches.push(first);
+            self.nodes.insert(first.0, (count, id));
         }
-        if let Err(error) = w.plane.add(w.now, request, nodes) {
+        if let Err(error) = w.plane.add(w.now, request, first, nodes, work) {
             self.end(w, id, false, Some(ApiError::new(format!("the plane refused the job's tasks: {error}"), None)));
         }
     }
 
+    /// The job whose node `node` is.
+    fn job_of(&self, node: NodeId) -> Option<JobId> {
+        let (first, (count, id)) = self.nodes.range(..=node.0).next_back()?;
+        (node.0 - first < *count).then_some(*id)
+    }
+
     /// What the plane did.
-    pub fn happened(&mut self, w: &mut World<'_>, happened: Vec<Happened<Value>>) {
-        for it in happened {
+    pub fn happened(&mut self, w: &mut World<'_>, happened: &mut Vec<Happened<Value>>) {
+        for it in happened.drain(..) {
             match it {
                 Happened::Did { id, value } => self.did(w, id, value),
                 Happened::Started { id } => self.started_unit(w, id),
@@ -512,17 +573,18 @@ impl Jobs {
                 }
             },
             Value::Library(Err(error)) => self.library_failed = Some(error),
-            Value::Fetched(fetch, Ok(source)) => {
+            Value::Fetched(fetches, at, Ok(source)) => {
+                let fetch = &fetches[at as usize];
                 if let Err(why) = w.mounts.mount(w.vfs, &fetch.at, &source) {
                     self.fetch_failed.insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
                 }
             }
-            Value::Fetched(fetch, Err(error)) => {
-                self.fetch_failed.insert(fetch.at.clone(), error);
+            Value::Fetched(fetches, at, Err(error)) => {
+                self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
             Value::Compiled(unit, result) => self.compiled(w, node, unit, result),
             value => {
-                if let Some(job) = self.by_node.get(&node).and_then(|id| self.jobs.get_mut(id)) {
+                if let Some(job) = self.job_of(node).and_then(|id| self.jobs.get_mut(&id)) {
                     job.values.insert(node, value);
                 }
             }
@@ -530,27 +592,25 @@ impl Jobs {
     }
 
     fn settled(&mut self, w: &mut World<'_>, node: NodeId, ok: bool, why: Option<String>) {
-        let Some(id) = self.by_node.remove(&node) else { return };
+        let Some(id) = self.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(&id) else { return };
         if job.over.is_some() {
             job.values.remove(&node);
-            if let Stage::Units(build) = &mut job.stage {
-                build.units.remove(&node);
-            }
             return;
         }
         let why = why.unwrap_or_default();
         match std::mem::replace(&mut job.stage, Stage::Over) {
-            Stage::Library(at) if at == node => match &self.library {
-                Some(_) => self.prepare(w, id),
-                None => {
+            Stage::Library(at) if at == node => {
+                if self.library.is_some() {
+                    self.prepare(w, id);
+                } else {
                     let error = self
                         .library_failed
                         .clone()
                         .unwrap_or_else(|| ApiError::new(format!("the standard library's source: {why}"), None));
                     self.end(w, id, false, Some(error));
                 }
-            },
+            }
             Stage::Plan(at, prep) if at == node => {
                 let value = job.values.remove(&node);
                 match value {
@@ -559,21 +619,26 @@ impl Jobs {
                     _ => self.end(w, id, false, Some(ApiError::new(format!("the plan of {}: {why}", prep.root_dir), None))),
                 }
             }
-            Stage::Fetch(mut nodes, ats, prep) => {
-                nodes.remove(&node);
+            Stage::Fetch(mut fetching) => {
+                let Some(fetch) = fetching.fetches.get(node.0.wrapping_sub(fetching.first.0) as usize) else {
+                    job.stage = Stage::Fetch(fetching);
+                    return;
+                };
                 if !ok {
-                    let at = ats.get(&node).cloned().unwrap_or_default();
+                    let at = &fetch.at;
                     let error = self
                         .fetch_failed
-                        .get(&at)
+                        .get(at)
                         .cloned()
                         .unwrap_or_else(|| ApiError::new(format!("fetching {at}: {why}"), Some(at.clone())));
                     job.over.get_or_insert((false, Some(error)));
                 }
-                if !nodes.is_empty() {
-                    job.stage = Stage::Fetch(nodes, ats, prep);
+                fetching.left -= 1;
+                if fetching.left > 0 {
+                    job.stage = Stage::Fetch(fetching);
                     return;
                 }
+                let prep = fetching.prep;
                 if let Some((_, error)) = job.over.take() {
                     self.end(w, id, false, error);
                     return;
@@ -599,10 +664,6 @@ impl Jobs {
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
-            Stage::Units(mut build) => {
-                build.units.remove(&node);
-                job.stage = Stage::Units(build);
-            }
             stage => job.stage = stage,
         }
     }
@@ -612,8 +673,7 @@ impl Jobs {
             Planned::Failed(error) => self.end(w, id, false, Some(ApiError::new(error.what, error.at))),
             Planned::Needs(fetches) => {
                 let job = self.jobs.get_mut(&id).expect("a job planning");
-                let mut nodes = Vec::new();
-                let (mut ids, mut ats) = (BTreeSet::new(), BTreeMap::new());
+                let mut wanted = Vec::with_capacity(fetches.len());
                 for fetch in fetches {
                     if !prep.asked.insert(fetch.at.clone()) {
                         let error = ApiError::new(
@@ -635,47 +695,51 @@ impl Jobs {
                     if let Some((verb, what)) = verb {
                         w.said.push(Said::Report(id, Response::Fetched { verb, what }));
                     }
-                    let node = w.plane.node_id();
-                    let steps = w.steps.clone();
-                    let key = fetch_key(&fetch);
-                    let name = format!("fetch {}", fetch.what);
-                    ats.insert(node, fetch.at.clone());
-                    ids.insert(node);
-                    let fetch = Box::new(fetch);
-                    let asked = fetch.clone();
-                    let work = task(
-                        &job.cancelled,
-                        move || Ok(steps.fetch(&asked)?),
-                        move |result| Value::Fetched(fetch.clone(), result),
-                    );
-                    nodes.push(Node {
-                        spec: spec(node, NodeKind::Fetch, name, Vec::new(), Pool::Io, Some(key)),
-                        task: plane::Task::Thread { kind: kinds::FETCH, work },
-                    });
+                    wanted.push(fetch);
                 }
-                if nodes.is_empty() {
+                if wanted.is_empty() {
                     w.db.close(prep.queries);
                     job.queries.retain(|it| *it != prep.queries);
                     let again = self.open(w, id, prep.opened, prep.asked);
                     self.plan(w, id, again);
                     return;
                 }
-                job.stage = Stage::Fetch(ids, ats, prep);
-                self.add(w, id, nodes);
+                let count = u32::try_from(wanted.len()).expect("under 2^32 fetches");
+                let first = w.plane.reserve(count);
+                let fetches: Arc<[Fetch]> = wanted.into();
+                let nodes = (0..count)
+                    .map(|at| {
+                        let fetch = &fetches[at as usize];
+                        let id = NodeId(first.0 + at);
+                        let name = named("fetch ", &fetch.what);
+                        let spec = spec(id, NodeKind::Fetch, name, Vec::new(), Pool::Io, Some(fetch_key(fetch)));
+                        Node { spec, task: Task::Thread { kind: kinds::FETCH, arg: at } }
+                    })
+                    .collect();
+                let work = {
+                    let (steps, asked, told) = (w.steps.clone(), fetches.clone(), fetches.clone());
+                    task(
+                        &job.cancelled,
+                        move |at| Ok(steps.fetch(&asked[at as usize])?),
+                        move |at, result| Value::Fetched(told.clone(), at, result),
+                    )
+                };
+                job.stage = Stage::Fetch(Fetching { first, fetches, left: count, prep });
+                self.add(w, id, first, nodes, Some(work));
             }
-            Planned::Ready(units) => {
+            Planned::Ready(mut units) => {
                 let job = self.jobs.get_mut(&id).expect("a job planning");
-                if let Some(lock) = &units.lock {
+                if let Some(lock) = units.lock.take() {
                     match FileName::new(lock.path.trim_start_matches('/')) {
                         Some(file) => {
                             let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
                             self.next_own += 1;
-                            self.own.insert(tag, (id, lock.path.clone()));
+                            self.own.insert(tag, (id, lock.path));
                             job.placing += 1;
-                            w.effects.push(Effect::Write { file, bytes: lock.text.clone().into_bytes(), tag });
+                            w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
                         }
                         None => {
-                            let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path.clone()));
+                            let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
                             self.end(w, id, false, Some(error));
                             return;
                         }
@@ -701,12 +765,12 @@ impl Jobs {
                     self.next(w, id);
                     return;
                 }
-                let node = w.plane.node_id();
+                let node = w.plane.reserve(1);
                 let (steps, lowering) = (w.steps.clone(), input.clone());
-                let work = task(&job.cancelled, move || steps.lower(&lowering), Value::Lowered);
-                let spec = spec(node, NodeKind::Names, format!("lowering {}", prep.root_dir), Vec::new(), Pool::Work, None);
+                let work = task(&job.cancelled, move |_| steps.lower(&lowering), |_, it| Value::Lowered(it));
+                let spec = spec(node, NodeKind::Names, named("lowering ", &prep.root_dir), Vec::new(), Pool::Work, None);
                 job.stage = Stage::Lower(node, input);
-                self.add(w, id, vec![Node { spec, task: plane::Task::Thread { kind: kinds::LOWER, work } }]);
+                self.add(w, id, node, vec![Node { spec, task: one(kinds::LOWER) }], Some(work));
             }
         }
     }

@@ -9,12 +9,13 @@ use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
-    parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{Binder, ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'t> Bindings<'t> {
-    fn get(&self, name: &MetaVar, span: Span) -> Result<&Binding<'t>, ExpandError> {
-        match self.inner.get(name) {
+    /// The binding of `name`, numbered `binder` when its rule was defined.
+    fn get(&self, binder: Binder, name: &MetaVar, span: Span) -> Result<Binding, ExpandError> {
+        match self.root(binder) {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
@@ -25,6 +26,7 @@ impl<'t> Bindings<'t> {
 
     fn get_fragment(
         &self,
+        binder: Binder,
         name: &MetaVar,
         mut span: Span,
         nesting: &mut [NestingState],
@@ -34,7 +36,7 @@ impl<'t> Bindings<'t> {
             ($($arg:tt)*) => { ExpandError::binding_error(span, format!($($arg)*)) };
         }
 
-        let mut b = self.get(name, span)?;
+        let mut b = self.get(binder, name, span)?;
         for nesting_state in nesting.iter_mut() {
             nesting_state.hit = true;
             b = match b {
@@ -43,10 +45,12 @@ impl<'t> Bindings<'t> {
                     nesting_state.at_end = true;
                     break;
                 }
-                Binding::Nested(bs) => bs.get(nesting_state.idx).ok_or_else(|| {
-                    nesting_state.at_end = true;
-                    binding_err!("could not find nested binding `{name}`")
-                })?,
+                Binding::Nested { start, len } => {
+                    self.iteration(start, len, nesting_state.idx).ok_or_else(|| {
+                        nesting_state.at_end = true;
+                        binding_err!("could not find nested binding `{name}`")
+                    })?
+                }
                 Binding::Empty => {
                     nesting_state.at_end = true;
                     return Err(binding_err!("could not find empty binding `{name}`"));
@@ -54,7 +58,7 @@ impl<'t> Bindings<'t> {
             };
         }
         match b {
-            Binding::Fragment(f) => Ok(f.clone()),
+            Binding::Fragment(f) => Ok(self.fragment(f).clone()),
             // emit some reasonable default expansion for missing bindings,
             // this gives better recovery than emitting the `$fragment-name` verbatim
             Binding::Missing(it) => Ok({
@@ -110,7 +114,7 @@ impl<'t> Bindings<'t> {
                 }
                 Fragment::TokensOwned(builder.build())
             }),
-            Binding::Nested(_) => {
+            Binding::Nested { .. } => {
                 Err(binding_err!("expected simple binding, found nested binding `{name}`"))
             }
             Binding::Empty => {
@@ -200,9 +204,10 @@ fn expand_subtree(
                     expand_subtree_with_delimiter(ctx, tokens, builder, Some(delimiter), marker);
                 err = err.or(e);
             }
-            Op::Var { name, id, .. } => {
+            Op::Var { name, id, binder, .. } => {
+                let follower = Follower::of(ops.peek().copied());
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, Follower::of(ops.peek().copied()), builder, marker);
+                    expand_var(ctx, name, *binder, *id, follower, builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -210,9 +215,10 @@ fn expand_subtree(
                     expand_repeat(ctx, subtree, *kind, separator.as_deref(), builder, marker);
                 err = err.or(e);
             }
-            Op::Ignore { name, id } => {
+            Op::Ignore { name, id, binder } => {
                 // Expand the variable, but ignore the result. This registers the repetition count.
-                let e = ctx.bindings.get_fragment(name, *id, &mut ctx.nesting, marker).err();
+                let e =
+                    ctx.bindings.get_fragment(*binder, name, *id, &mut ctx.nesting, marker).err();
                 // FIXME: The error gets dropped if there were any previous errors.
                 // This should be reworked in a way where the errors can be combined
                 // and reported rather than storing the first error encountered.
@@ -240,8 +246,9 @@ fn expand_subtree(
                     suffix_len: 0,
                 }));
             }
-            Op::Count { name, depth } => {
-                let mut binding = match ctx.bindings.get(name, ctx.call_site) {
+            Op::Count { name, depth, binder } => {
+                let bindings = ctx.bindings;
+                let mut binding = match bindings.get(*binder, name, ctx.call_site) {
                     Ok(b) => b,
                     Err(e) => {
                         err = err.or(Some(e));
@@ -255,8 +262,8 @@ fn expand_subtree(
                             // `count()` will report an error.
                             break;
                         }
-                        Binding::Nested(bs) => {
-                            if let Some(b) = bs.get(state.idx) {
+                        Binding::Nested { start, len } => {
+                            if let Some(b) = bindings.iteration(start, len, state.idx) {
                                 binding = b;
                             } else {
                                 state.at_end = true;
@@ -275,7 +282,7 @@ fn expand_subtree(
                     }
                 }
 
-                let res = count(binding, 0, *depth);
+                let res = count(bindings, binding, 0, *depth);
 
                 builder.push(tt::Leaf::Literal(tt::Literal {
                     text_and_suffix: sym::Integer::get(res),
@@ -296,12 +303,13 @@ fn expand_subtree(
                             // escaping is used most of the times for characters that are invalid in identifiers.
                             concatenated.push_str(lit.text())
                         }
-                        ConcatMetaVarExprElem::Var(var) => {
+                        ConcatMetaVarExprElem::Var { ident: var, binder } => {
                             // Handling of repetitions in `${concat}` isn't fleshed out in rustc, so we currently
                             // err at it.
                             // FIXME: Do what rustc does for repetitions.
                             let var_value = match ctx.bindings.get_fragment(
-                                &MetaVar::new(var.sym.clone(), var.span),
+                                *binder,
+                                &MetaVar::new(var.sym, var.span),
                                 var.span,
                                 &mut ctx.nesting,
                                 marker,
@@ -402,6 +410,7 @@ impl Follower {
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
     v: &MetaVar,
+    binder: Binder,
     id: Span,
     follower: Follower,
     builder: &mut tt::TopSubtreeBuilder,
@@ -410,7 +419,7 @@ fn expand_var(
     // We already handle $crate case in mbe parser
     debug_assert!(*v.sym() != sym::crate_);
 
-    match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
+    match ctx.bindings.get_fragment(binder, v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
             match fragment {
                 // rustc spacing is not like ours. Ours is like proc macros', it dictates how puncts will actually be joined.
@@ -504,7 +513,7 @@ fn expand_var(
             // We just treat it a normal tokens
             let mut span = id;
             marker(&mut span);
-            let sym = v.sym().clone();
+            let sym = *v.sym();
             builder.extend([
                 tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span }),
                 tt::Leaf::from(tt::Ident { sym, span, is_raw: tt::IdentIsRaw::No }),
@@ -533,16 +542,16 @@ fn expand_repeat(
     let initial_restore_point = builder.restore_point();
     let mut restore_point = builder.restore_point();
     loop {
-        let ExpandResult { value: (), err: e } =
-            expand_subtree_with_delimiter(ctx, template, builder, None, marker);
+        // An iteration's tokens go straight into the output: an invisible group around them
+        // would be taken out again (an `O(n)` shift of the builder each time), which leaves the
+        // same tokens.
+        let ExpandResult { value: (), err: e } = expand_subtree(ctx, template, builder, marker);
         let nesting_state = ctx.nesting.last_mut().unwrap();
         if nesting_state.at_end || !nesting_state.hit {
             break;
         }
         nesting_state.idx += 1;
         nesting_state.hit = false;
-
-        builder.remove_last_subtree_if_invisible();
 
         restore_point = builder.restore_point();
 

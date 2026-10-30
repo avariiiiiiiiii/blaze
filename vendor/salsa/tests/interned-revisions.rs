@@ -117,7 +117,6 @@ fn test_intern_new() {
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(80)), revision: R1 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(81)), revision: R2 }",
@@ -151,7 +150,6 @@ fn test_reintern() {
     let result_in_rev_2 = function(&db, input);
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidValidateInternedValue { key: Interned(Id(80)), revision: R2 }",
@@ -185,7 +183,6 @@ fn test_durability() {
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(80)), revision: R1 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "DidValidateMemoizedValue { database_key: function(Id(0)) }",
         ]"#]]);
@@ -211,7 +208,6 @@ fn test_non_reusable_new_value_does_not_record_dependency() {
         let _ = function(&db, input);
         db.assert_logs(expect![[r#"
             [
-                "DidSetCancellationFlag",
                 "WillCheckCancellation",
                 "DidValidateMemoizedValue { database_key: function(Id(0)) }",
             ]"#]]);
@@ -240,7 +236,6 @@ fn test_non_reusable_existing_value_does_not_record_dependency() {
         let _ = function(&db, input1);
         db.assert_logs(expect![[r#"
             [
-                "DidSetCancellationFlag",
                 "WillCheckCancellation",
                 "DidValidateMemoizedValue { database_key: function(Id(1)) }",
             ]"#]]);
@@ -382,39 +377,30 @@ fn test_reuse() {
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(80)), revision: R1 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(81)), revision: R2 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidInternValue { key: Interned(Id(82)), revision: R3 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(80g1)), revision: R4 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(81g1)), revision: R5 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(82g1)), revision: R6 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(80g2)), revision: R7 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(81g2)), revision: R8 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(82g2)), revision: R9 }",
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillExecute { database_key: function(Id(0)) }",
             "DidReuseInternedValue { key: Interned(Id(80g3)), revision: R10 }",

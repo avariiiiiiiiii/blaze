@@ -4,6 +4,7 @@
 //! A check that needs inference or trait solving is not made here: it is the front end's, and
 //! asked of it (`v2/requests/diagnostics.md`).
 
+mod ast_validation;
 mod attrs;
 mod defs;
 mod features;
@@ -13,10 +14,14 @@ mod names;
 
 use std::ops::ControlFlow;
 
-use syntax::{AstNode, ast};
+use syntax::ast::{self, HasAttrs};
 
 use crate::{
     cx::Cx,
+    lints::syntax::{
+        Walk,
+        attrs::{Owner, owners},
+    },
     lower::{Found, Phase},
 };
 
@@ -24,15 +29,21 @@ use crate::{
 /// early lints, before the checks of items. Every check of that pass is given at this phase.
 pub(crate) const PASSES: Phase = Phase::Items;
 
-/// What rustc says of `cx.krate` that `hir` does not, in rustc's order: the resolver's, the
-/// feature gates (with the early lints), `misc_checking_1`, the checks of items.
+/// What rustc says of `cx.krate` that `hir` does not, in rustc's order: AST validation, the
+/// resolver's, the feature gates (with the early lints), what attribute parsing says as the
+/// AST is lowered, `misc_checking_1` (the entry point, then `check_mod_attrs`), the checks of
+/// items.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
+    let walk = Walk::of(cx);
+    let owners: Vec<Owner> = owners(cx, &walk);
     let mut found = Vec::new();
+    found.extend(ast_validation::check(cx, &walk));
     found.extend(defs::check(cx));
     found.extend(names::check(cx));
-    found.extend(features::check(cx));
+    found.extend(features::check(cx, &walk, &owners));
+    found.extend(attrs::parsed(cx, &walk, &owners));
     found.extend(krate::check(cx));
-    found.extend(attrs::check(cx));
+    found.extend(attrs::checked(cx, &walk, &owners));
     found.extend(impls::check(cx));
     found
 }
@@ -71,10 +82,4 @@ pub(crate) fn has_crate_attr(cx: &Cx<'_, '_>, name: &str) -> bool {
         meta.path().and_then(|path| path.as_single_name_ref()).is_some_and(|it| it.text() == name)
             && !matches!(meta, ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_))
     })
-}
-
-/// The text of `node` (for tests that read it).
-#[cfg(test)]
-pub(crate) fn text(node: &impl AstNode) -> String {
-    node.syntax().text().to_string()
 }

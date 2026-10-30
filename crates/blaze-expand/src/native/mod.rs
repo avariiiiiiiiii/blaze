@@ -16,13 +16,20 @@
 //! what else a package is compiled with, a cfg that no source of it or of what it depends on
 //! names (as `debug_assertions` in a dev profile) is not compared: it can't change the code.
 //!
+//! What it costs: [`find`] of an unchanged library is a `stat` of its description and of each
+//! file and directory of its packages, against columns kept from the last call ([`closure`]),
+//! and a verdict kept with them: no read, no lock, no allocation. An expansion allocates only
+//! what its output keeps: its spans' table and its encodings are each thread's, reused, and the
+//! module's output is read straight into rust-analyzer's flat tree ([`wire::Reader`]).
+//!
 //! The packages are serde_derive's (`Serialize`, `Deserialize`), thiserror-impl's 1.x and
 //! 2.x (`Error`) and tokio-macros' (`main`, `test` and the rest), over syn 2 and 3, quote,
-//! proc-macro2 and unicode-ident (`docs/v2/usercode-macros-native-notes.md`). bitflags'
+//! proc-macro2 and unicode-ident (`docs/v2/plan/lanes/usercode/macros-native.md`). bitflags'
 //! `bitflags!` has none: it is a `macro_rules!` macro, which the front end already expands
 //! natively, and taking over more of it than its first step would drop the expansions whose
 //! marks its output's syntax contexts carry.
 
+mod closure;
 mod files;
 mod host;
 #[allow(dead_code)]
@@ -35,34 +42,56 @@ mod wire;
 mod tests;
 
 use std::{
+    cell::Cell,
     cmp::Ordering,
-    collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard, OnceLock},
-    time::SystemTime,
+    path::PathBuf,
+    sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{self, AtomicU64},
+    },
 };
 
 use base_db::{Env, SourceDatabase};
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::proc_macro::{ProcMacroExpansionError, ProcMacroKind};
 use paths::AbsPath;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use span::Span;
 use tt::{Leaf, TokenTree, TopSubtree};
 
 use self::{
     host::Host,
     verified::{Build, Expander, PACKAGES, ROOTS},
-    wire::{Reader, Spans, Writer},
+    wire::{Spans, Writer},
 };
 
 /// A proc-macro crate and every package it depends on but the standard library's, as
 /// [`find`] holds it to the copy blaze verified.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Closure {
     /// The macro's crate first, then every package it depends on, directly or not, once.
     pub packages: Vec<Package>,
+    /// Whether it is a verified copy, worked out once.
+    verdict: OnceLock<Verdict>,
 }
+
+impl Closure {
+    pub fn new(packages: Vec<Package>) -> Closure {
+        Closure { packages, verdict: OnceLock::new() }
+    }
+
+    fn verdict(&self) -> &Verdict {
+        self.verdict.get_or_init(|| verdict_of(self))
+    }
+}
+
+impl PartialEq for Closure {
+    fn eq(&self, other: &Closure) -> bool {
+        self.packages == other.packages
+    }
+}
+
+impl Eq for Closure {}
 
 /// A package of a [`Closure`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,22 +104,57 @@ pub struct Package {
     /// components, and the BLAKE3 of its bytes: sorted by path.
     pub files: Vec<(String, [u8; 32])>,
     /// What it is compiled with, as a `rust-project.json` has it: `feature="name"` for each
-    /// feature and what its build script set.
+    /// feature and what its build script set. Sorted, each once.
     pub cfg: Vec<String>,
     /// Each dependency: the name its code knows it by, and its index in
-    /// [`Closure::packages`].
+    /// [`Closure::packages`]. Sorted by name, each once.
     pub deps: Vec<(String, usize)>,
 }
 
-/// What [`find`] is told of the library of proc macros at a path: its closure, `None` when no
-/// native expander can be of it (it was not built from a description, or its crate is none
-/// blaze verified, [`closure_of_description`]), and `Err` when it can't be told.
-pub type Describe = dyn Fn(&AbsPath) -> Result<Option<Closure>, String> + Send + Sync;
+/// What a [`Closure`] is.
+#[derive(Clone, Debug)]
+enum Verdict {
+    /// The verified copy whose crate is this of [`ROOTS`].
+    Root(usize),
+    /// None blaze verified.
+    Other,
+    /// Not a closure, for the reason given.
+    Shape(String),
+}
+
+fn verdict_of(closure: &Closure) -> Verdict {
+    if let Err(why) = shaped(closure) {
+        return Verdict::Shape(why);
+    }
+    let crate_ = &closure.packages[0];
+    let Some(root) = ROOTS.iter().position(|it| {
+        let package = &PACKAGES[it.package];
+        package.name == crate_.name && package.version == crate_.version
+    }) else {
+        return Verdict::Other;
+    };
+    match matches(closure, ROOTS[root].package) {
+        Ok(()) => {
+            VERIFIED.fetch_add(1, atomic::Ordering::Relaxed);
+            Verdict::Root(root)
+        }
+        Err(why) => {
+            missed(format!("{} {}: {why}", crate_.name, crate_.version));
+            Verdict::Other
+        }
+    }
+}
+
+/// Where the description of the library of proc macros at a path is: it sets its second
+/// argument to the path of the `rust-project.json` the library was built from and says `true`,
+/// or says `false` when the library was built from none (then no native expander can be of
+/// it), and `Err` when it can't tell.
+pub type Describe = dyn Fn(&AbsPath, &mut PathBuf) -> Result<bool, String> + Send + Sync;
 
 static DESCRIBE: OnceLock<Box<Describe>> = OnceLock::new();
 
-/// Has [`find`] learn each library's closure from `describe`, for every load from here on.
-/// Says so when one was registered before.
+/// Has [`find`] learn where each library's description is from `describe`, for every load
+/// from here on. Says so when one was registered before.
 pub fn describe_with(describe: Box<Describe>) -> Result<(), String> {
     DESCRIBE
         .set(describe)
@@ -105,22 +169,25 @@ pub fn find(dylib: &AbsPath, name: &str, kind: ProcMacroKind) -> Result<Option<M
         "nothing describes a library of proc macros to blaze's native expanders \
          (blaze_expand::native::describe_with)",
     )?;
-    let Some(closure) = describe(dylib)? else { return Ok(None) };
-    shaped(&closure).map_err(|why| format!("the description of {dylib}: {why}"))?;
-    let crate_ = &closure.packages[0];
-    let Some(root) = ROOTS.iter().position(|it| {
-        let package = &PACKAGES[it.package];
-        package.name == crate_.name && package.version == crate_.version
-    }) else {
-        return Ok(None);
+    let Some(closure) = closure::of_library(dylib, &**describe)? else { return Ok(None) };
+    find_in(&closure, dylib, name, kind)
+}
+
+fn find_in(
+    closure: &Closure,
+    dylib: &AbsPath,
+    name: &str,
+    kind: ProcMacroKind,
+) -> Result<Option<Macro>, String> {
+    let root = match closure.verdict() {
+        Verdict::Root(root) => *root,
+        Verdict::Other => return Ok(None),
+        Verdict::Shape(why) => return Err(format!("the description of {dylib}: {why}")),
     };
-    if let Err(why) = matches(&closure, ROOTS[root].package) {
-        missed(format!("{} {}: {why}", crate_.name, crate_.version));
-        return Ok(None);
-    }
     let entry =
         ROOTS[root].macros.iter().position(|it| it.name == name && it.kind == kind).ok_or_else(
             || {
+                let crate_ = &PACKAGES[ROOTS[root].package];
                 format!(
                     "{dylib} is the verified copy of {} {}, which declares no {kind:?} macro \
                      `{name}`",
@@ -128,7 +195,6 @@ pub fn find(dylib: &AbsPath, name: &str, kind: ProcMacroKind) -> Result<Option<M
                 )
             },
         )?;
-    lock(&REPORT).found += 1;
     Ok(Some(Macro { root, entry, identity: identity(root, entry) }))
 }
 
@@ -139,6 +205,21 @@ pub struct Macro {
     root: usize,
     entry: usize,
     identity: ContentId,
+}
+
+/// What an expansion on a thread writes and reads, kept for the next one there.
+#[derive(Default)]
+struct Scratch {
+    spans: Spans,
+    input: Vec<u8>,
+    attr: Vec<u8>,
+    output: Vec<u8>,
+}
+
+thread_local! {
+    /// Taken for the length of an expansion: one that a database answer starts on this
+    /// thread (`host.rs`) finds it empty and makes its own.
+    static SCRATCH: Cell<Scratch> = Cell::new(Scratch::default());
 }
 
 impl Macro {
@@ -175,34 +256,46 @@ impl Macro {
         mixed_site: Span,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let entry = &ROOTS[self.root].macros[self.entry];
+        let mut scratch = SCRATCH.take();
+        scratch.spans.clear();
+        scratch.output.clear();
         // As the wasm host numbers them: the sites 1, 2 and 3, the same spans or not, then
         // the input's as they first appear.
-        let mut spans = Spans::default();
         for span in [def_site, call_site, mixed_site] {
-            spans.push(span);
+            scratch.spans.push(span);
         }
-        let mut writer = Writer { out: Vec::new(), spans: &mut spans };
-        writer.top(subtree);
-        let input = std::mem::take(&mut writer.out);
-        let attr = attrs.map(|it| {
-            writer.top(it);
-            std::mem::take(&mut writer.out)
-        });
-        let mut host = Host { db, spans, sites: [1, 2, 3] };
-        let output = native_proc_macro::__native::with_host(&mut host, || match entry.expander {
-            Expander::One(f) => native_proc_macro::__native::expand1(f, &input),
-            // rust-analyzer gives an attribute written without arguments (`#[tokio::main]`)
-            // none, which the macro is given as an empty stream.
-            Expander::Two(f) => {
-                let attr = attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec());
-                native_proc_macro::__native::expand2(f, &attr, &input)
+        {
+            let Scratch { spans, input, attr, .. } = &mut scratch;
+            input.clear();
+            attr.clear();
+            let mut writer = Writer { out: std::mem::take(input), spans };
+            writer.top(subtree);
+            *input = std::mem::take(&mut writer.out);
+            match attrs {
+                Some(attrs) => {
+                    writer.out = std::mem::take(attr);
+                    writer.top(attrs);
+                    *attr = std::mem::take(&mut writer.out);
+                }
+                // rust-analyzer gives an attribute written without arguments
+                // (`#[tokio::main]`) none, which the macro is given as an empty stream.
+                None => attr.extend_from_slice(&0u32.to_le_bytes()),
             }
+        }
+        let mut host = Host { db, spans: std::mem::take(&mut scratch.spans), sites: [1, 2, 3] };
+        let (input, attr, output) = (&scratch.input, &scratch.attr, &mut scratch.output);
+        let ran = native_proc_macro::__native::with_host(&mut host, || match entry.expander {
+            Expander::One(f) => native_proc_macro::__native::expand1(f, input, output),
+            Expander::Two(f) => native_proc_macro::__native::expand2(f, attr, input, output),
         });
-        let output = output.map_err(ProcMacroExpansionError::Panic)?;
-        let trees = Reader::new(&output, &host.spans)
-            .stream()
-            .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", entry.name)))?;
-        Ok(wire::top_subtree(trees, call_site))
+        let read = ran.map(|()| wire::Reader::new(&scratch.output, &host.spans).top(call_site));
+        scratch.spans = host.spans;
+        SCRATCH.set(scratch);
+        match read {
+            Ok(Ok(tree)) => Ok(tree),
+            Ok(Err(e)) => Err(ProcMacroExpansionError::System(format!("`{}`: {e}", entry.name))),
+            Err(panic) => Err(ProcMacroExpansionError::Panic(panic)),
+        }
     }
 }
 
@@ -210,25 +303,32 @@ impl Macro {
 /// are the same: every token tree, each delimiter, character, spacing, text, literal kind and
 /// suffix, and of every span its range, anchor and syntax context.
 pub fn difference(native: &TopSubtree, normal: &TopSubtree) -> Option<String> {
-    let natively: Vec<TokenTree> = native.as_token_trees().iter_flat_tokens().collect();
-    let normally: Vec<TokenTree> = normal.as_token_trees().iter_flat_tokens().collect();
-    for (at, (ours, theirs)) in natively.iter().zip(&normally).enumerate() {
-        if let Some(what) = tree_difference(ours, theirs) {
-            return Some(format!("token tree {at}, {}: {what}", shown(theirs)));
+    let mut natively = native.as_token_trees().iter_flat_tokens();
+    let mut normally = normal.as_token_trees().iter_flat_tokens();
+    let mut at = 0usize;
+    loop {
+        match (natively.next(), normally.next()) {
+            (None, None) => return None,
+            (Some(ours), Some(theirs)) => {
+                if let Some(what) = tree_difference(&ours, &theirs) {
+                    return Some(format!("token tree {at}, {}: {what}", shown(&theirs)));
+                }
+            }
+            (None, Some(theirs)) => {
+                return Some(format!(
+                    "the native output ends after {at} token trees, where the macro's goes on \
+                     with {}",
+                    shown(&theirs),
+                ));
+            }
+            (Some(ours), None) => {
+                return Some(format!(
+                    "the native output goes on after the macro's {at} token trees with {}",
+                    shown(&ours),
+                ));
+            }
         }
-    }
-    match natively.len().cmp(&normally.len()) {
-        Ordering::Equal => None,
-        Ordering::Less => Some(format!(
-            "the native output ends after {} token trees, where the macro's goes on with {}",
-            natively.len(),
-            shown(&normally[natively.len()]),
-        )),
-        Ordering::Greater => Some(format!(
-            "the native output goes on after the macro's {} token trees with {}",
-            normally.len(),
-            shown(&natively[normally.len()]),
-        )),
+        at += 1;
     }
 }
 
@@ -357,163 +457,28 @@ fn shown(tree: &TokenTree) -> String {
     }
 }
 
-/// The closure of the proc-macro crate a `rust-project.json` describes first, as blaze writes
-/// one for the crate's module (`load-cargo/src/described.rs`): each crate's package is the
-/// directory its `CARGO_MANIFEST_DIR` names. `None`, reading no file, when the crate is none
-/// blaze verified a copy of.
-pub fn closure_of_description(description: &str) -> Result<Option<Closure>, String> {
-    let value: serde_json::Value = serde_json::from_str(description)
-        .map_err(|e| format!("the description is not JSON: {e}"))?;
-    let crates = value["crates"].as_array().ok_or("the description has no crates")?;
-    let described: Vec<Described> = crates
-        .iter()
-        .enumerate()
-        .map(|(at, it)| Described::of(it).map_err(|why| format!("its crate {at}: {why}")))
-        .collect::<Result<_, String>>()?;
-    let crate_ = described.first().ok_or("the description is of no crate")?;
-    let verified = ROOTS.iter().any(|it| {
-        let package = &PACKAGES[it.package];
-        package.name == crate_.name && package.version == crate_.version
-    });
-    if !verified {
-        return Ok(None);
-    }
-    let packages = described
-        .into_iter()
-        .map(|it| {
-            let files = package_files(&it.dir)?;
-            Ok(Package { name: it.name, version: it.version, files, cfg: it.cfg, deps: it.deps })
-        })
-        .collect::<Result<_, String>>()?;
-    Ok(Some(Closure { packages }))
-}
-
-/// A crate of a description, before its package's files are read.
-struct Described {
-    name: String,
-    version: String,
-    dir: PathBuf,
-    cfg: Vec<String>,
-    deps: Vec<(String, usize)>,
-}
-
-impl Described {
-    fn of(value: &serde_json::Value) -> Result<Described, String> {
-        let env = |key: &str| {
-            value["env"][key].as_str().map(str::to_owned).ok_or_else(|| format!("no {key}"))
-        };
-        let dir = PathBuf::from(env("CARGO_MANIFEST_DIR")?);
-        if !dir.is_absolute() {
-            return Err(format!("its CARGO_MANIFEST_DIR {} is not absolute", dir.display()));
-        }
-        let mut cfg = Vec::new();
-        for atom in value["cfg"].as_array().ok_or("no cfg")? {
-            cfg.push(atom.as_str().ok_or("a cfg that is not a string")?.to_owned());
-        }
-        cfg.sort();
-        let mut deps = Vec::new();
-        for dep in value["deps"].as_array().ok_or("no deps")? {
-            let at = dep["crate"].as_u64().ok_or("a dependency that names no crate")?;
-            let name = dep["name"].as_str().ok_or("a dependency without a name")?;
-            deps.push((name.to_owned(), at as usize));
-        }
-        deps.sort();
-        Ok(Described {
-            name: env("CARGO_PKG_NAME")?,
-            version: env("CARGO_PKG_VERSION")?,
-            dir,
-            cfg,
-            deps,
-        })
-    }
-}
-
-/// Every file of the package at `dir`, as [`Package::files`] has them.
-fn package_files(dir: &Path) -> Result<Vec<(String, [u8; 32])>, String> {
-    let mut files = Vec::new();
-    walk(dir, "", &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, [u8; 32])>) -> Result<(), String> {
-    let read = |e: std::io::Error| format!("reading {}: {e}", dir.display());
-    for entry in std::fs::read_dir(dir).map_err(read)? {
-        let entry = entry.map_err(read)?;
-        let name = entry.file_name();
-        // A name that is not UTF-8 is in no published package, so it is kept as one that
-        // matches none.
-        let name = match name.to_str() {
-            Some(name) => name.to_owned(),
-            None => format!("\0{}", name.to_string_lossy()),
-        };
-        if prefix.is_empty() && matches!(name.as_str(), ".cargo-ok" | ".cargo-checksum.json") {
-            continue;
-        }
-        let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        if meta.is_dir() {
-            walk(&path, &rel, files)?;
-        } else if meta.is_file() {
-            files.push((rel, file_hash(&path, &meta)?));
-        } else {
-            // A link or another kind of file, which no published package has.
-            let target = std::fs::read_link(&path).unwrap_or_default();
-            let said = format!("\0not a file: {}", target.display());
-            files.push((rel, *blake3::hash(said.as_bytes()).as_bytes()));
-        }
-    }
-    Ok(())
-}
-
-/// What a file's hash is kept under: what `stat` says of it, which changes when it does.
-type Stamp = (u64, Option<SystemTime>, u64, i64, i64);
-
-fn stamp(meta: &std::fs::Metadata) -> Stamp {
-    #[cfg(unix)]
-    let (inode, changed, changed_nanos) = {
-        use std::os::unix::fs::MetadataExt as _;
-        (meta.ino(), meta.ctime(), meta.ctime_nsec())
-    };
-    #[cfg(not(unix))]
-    let (inode, changed, changed_nanos) = (0, 0, 0);
-    (meta.len(), meta.modified().ok(), inode, changed, changed_nanos)
-}
-
-/// The BLAKE3 of the file at `path`, read once for each change of its [`Stamp`].
-fn file_hash(path: &Path, meta: &std::fs::Metadata) -> Result<[u8; 32], String> {
-    static HASHES: Mutex<Option<FxHashMap<PathBuf, (Stamp, [u8; 32])>>> = Mutex::new(None);
-    let stamp = stamp(meta);
-    if let Some((seen, hash)) = lock(&HASHES).get_or_insert_default().get(path)
-        && *seen == stamp
-    {
-        return Ok(*hash);
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let hash = *blake3::hash(&bytes).as_bytes();
-    lock(&HASHES).get_or_insert_default().insert(path.to_owned(), (stamp, hash));
-    Ok(hash)
-}
-
-/// Why `closure` is not one: a package it has not, or files out of order.
+/// Why `closure` is not one: a package it has not, or files, cfgs or dependencies out of
+/// order.
 fn shaped(closure: &Closure) -> Result<(), String> {
     if closure.packages.is_empty() {
         return Err("it is of no package".to_owned());
     }
     for package in &closure.packages {
+        let named = || format!("{} {}", package.name, package.version);
         if let Some((name, at)) = package.deps.iter().find(|it| it.1 >= closure.packages.len()) {
             return Err(format!(
-                "{} {} depends on `{name}`, its package {at}, which it has not",
-                package.name, package.version
+                "{} depends on `{name}`, its package {at}, which it has not",
+                named()
             ));
         }
         if !package.files.windows(2).all(|it| it[0].0 < it[1].0) {
-            return Err(format!(
-                "the files of {} {} are not sorted by path, each once",
-                package.name, package.version
-            ));
+            return Err(format!("the files of {} are not sorted by path, each once", named()));
+        }
+        if !package.cfg.windows(2).all(|it| it[0] < it[1]) {
+            return Err(format!("the cfg of {} is not sorted, each once", named()));
+        }
+        if !package.deps.windows(2).all(|it| it[0].0 < it[1].0) {
+            return Err(format!("the dependencies of {} are not sorted by name, each once", named()));
         }
     }
     Ok(())
@@ -678,44 +643,52 @@ impl native_proc_macro::__native::Host for Probe {
 }
 
 /// Why `closure` is not the verified copy whose crate is `root` of [`PACKAGES`]: its first
-/// package that differs, from the crate down its dependencies, and how.
+/// package that differs, from the crate down its dependencies, and how. `closure` is
+/// [`shaped`].
 fn matches(closure: &Closure, root: usize) -> Result<(), String> {
     let actual = actual();
-    let mut paired: FxHashMap<usize, usize> = FxHashMap::default();
-    paired.insert(0, root);
-    let mut next = VecDeque::from([(0, root)]);
-    while let Some((at, ours)) = next.pop_front() {
+    // Of each package of `closure`, the package of `PACKAGES` it stands for, once reached; and
+    // the pairs reached, in the order they are checked.
+    let mut paired: Vec<Option<usize>> = vec![None; closure.packages.len()];
+    paired[0] = Some(root);
+    let mut pairs = Vec::with_capacity(closure.packages.len());
+    pairs.push((0, root));
+    let mut checked = 0;
+    while let Some(&(at, ours)) = pairs.get(checked) {
+        checked += 1;
         let theirs = &closure.packages[at];
         let package = &PACKAGES[ours];
-        let named = format!("{} {}", package.name, package.version);
+        let named = || format!("{} {}", package.name, package.version);
         if theirs.name != package.name || theirs.version != package.version {
             return Err(format!(
-                "{} {} is where the verified copy has {named}",
-                theirs.name, theirs.version
+                "{} {} is where the verified copy has {}",
+                theirs.name,
+                theirs.version,
+                named()
             ));
         }
         if let Some(why) = files_difference(&theirs.files, &actual[ours].files) {
-            return Err(format!("{named}: {why}"));
+            return Err(format!("{}: {why}", named()));
         }
-        let cfg = actual[ours].cfg.as_ref().map_err(|why| format!("{named}: {why}"))?;
+        let cfg = actual[ours].cfg.as_ref().map_err(|why| format!("{}: {why}", named()))?;
         if let Some(why) = cfg_difference(&theirs.cfg, cfg, ours) {
-            return Err(format!("{named}: {why}"));
+            return Err(format!("{}: {why}", named()));
         }
-        let mut deps: Vec<&(String, usize)> = theirs.deps.iter().collect();
-        deps.sort();
-        let names: Vec<&str> = deps.iter().map(|it| it.0.as_str()).collect();
-        let verified: Vec<&str> = package.deps.iter().map(|it| it.0).collect();
-        if names != verified {
+        let same_names = theirs.deps.len() == package.deps.len()
+            && theirs.deps.iter().zip(package.deps).all(|(a, b)| a.0 == b.0);
+        if !same_names {
+            let names: Vec<&str> = theirs.deps.iter().map(|it| it.0.as_str()).collect();
+            let verified: Vec<&str> = package.deps.iter().map(|it| it.0).collect();
             return Err(format!(
-                "{named} depends on [{}] where the verified copy depends on [{}]",
+                "{} depends on [{}] where the verified copy depends on [{}]",
+                named(),
                 names.join(", "),
                 verified.join(", "),
             ));
         }
-        for (dep, verified_dep) in deps.iter().map(|it| it.1).zip(package.deps.iter().map(|it| it.1))
-        {
-            match paired.get(&dep) {
-                Some(&it) if it != verified_dep => {
+        for (&(_, dep), &(_, verified_dep)) in theirs.deps.iter().zip(package.deps) {
+            match paired[dep] {
+                Some(it) if it != verified_dep => {
                     return Err(format!(
                         "one package stands for both {} {} and {} {} of the verified copy",
                         PACKAGES[it].name,
@@ -726,8 +699,8 @@ fn matches(closure: &Closure, root: usize) -> Result<(), String> {
                 }
                 Some(_) => {}
                 None => {
-                    paired.insert(dep, verified_dep);
-                    next.push_back((dep, verified_dep));
+                    paired[dep] = Some(verified_dep);
+                    pairs.push((dep, verified_dep));
                 }
             }
         }
@@ -765,21 +738,30 @@ fn files_difference(theirs: &[(String, [u8; 32])], ours: &[(&str, [u8; 32])]) ->
     }
 }
 
-/// The first cfg one of two packages is built with and the other not, of those that can change
-/// the code of `at` of [`PACKAGES`] ([`compared`]).
+/// The first cfg, in order, that one of two packages is built with and the other not, of those
+/// that can change the code of `at` of [`PACKAGES`] ([`compared`]). Both are sorted.
 fn cfg_difference(theirs: &[String], ours: &[String], at: usize) -> Option<String> {
-    let set = |all: &[String]| -> FxHashSet<String> {
-        all.iter().filter(|atom| compared(atom, at)).cloned().collect()
-    };
-    let (theirs, ours) = (set(theirs), set(ours));
-    let mut more: Vec<&String> = theirs.difference(&ours).collect();
-    more.sort();
-    if let Some(atom) = more.first() {
-        return Some(format!("it is built with `{atom}`, which the verified copy is not"));
+    fn kept(all: &[String], at: usize) -> impl Iterator<Item = &str> + '_ {
+        all.iter().map(String::as_str).filter(move |atom| compared(atom, at))
     }
-    let mut fewer: Vec<&String> = ours.difference(&theirs).collect();
-    fewer.sort();
-    fewer.first().map(|atom| format!("it is built without `{atom}`, which the verified copy is"))
+    let (mut theirs, mut ours) = (kept(theirs, at).peekable(), kept(ours, at).peekable());
+    let more = |atom: &str| format!("it is built with `{atom}`, which the verified copy is not");
+    let fewer = |atom: &str| format!("it is built without `{atom}`, which the verified copy is");
+    loop {
+        match (theirs.peek().copied(), ours.peek().copied()) {
+            (None, None) => return None,
+            (Some(atom), None) => return Some(more(atom)),
+            (None, Some(atom)) => return Some(fewer(atom)),
+            (Some(a), Some(b)) => match a.cmp(b) {
+                Ordering::Less => return Some(more(a)),
+                Ordering::Greater => return Some(fewer(b)),
+                Ordering::Equal => {
+                    theirs.next();
+                    ours.next();
+                }
+            },
+        }
+    }
 }
 
 /// Whether the cfg `atom` can change the code of `at` of [`PACKAGES`]: a feature, or one whose
@@ -791,20 +773,13 @@ fn compared(atom: &str, at: usize) -> bool {
 
 /// Whether a file a library compiles from (its `build.rs` and the `.rs` files under `src/`,
 /// which include no other, `tests.rs`), of `at` of [`PACKAGES`] or a package it depends on,
-/// has `name` as a word.
+/// has `name` as an identifier. One that is not all identifier characters is taken as named.
 fn mentioned(at: usize, name: &str) -> bool {
-    static SEEN: Mutex<Option<FxHashMap<(usize, String), bool>>> = Mutex::new(None);
-    let mut seen = lock(&SEEN);
-    let seen = seen.get_or_insert_default();
-    *seen.entry((at, name.to_owned())).or_insert_with(|| {
-        closure_of(at).into_iter().any(|it| {
-            PACKAGES[it]
-                .files
-                .iter()
-                .filter(|(path, _)| compiled(path))
-                .any(|(_, bytes)| has_word(bytes, name.as_bytes()))
-        })
-    })
+    if name.is_empty() || !name.bytes().all(identifier) {
+        return true;
+    }
+    let words = words();
+    closure_of(at).iter().any(|&it| words[it].contains(name.as_bytes()))
 }
 
 /// Whether the library of a package compiles from its file at `path`.
@@ -812,38 +787,74 @@ fn compiled(path: &str) -> bool {
     path == "build.rs" || (path.starts_with("src/") && path.ends_with(".rs"))
 }
 
-fn has_word(bytes: &[u8], word: &[u8]) -> bool {
-    let ident = |it: u8| it.is_ascii_alphanumeric() || it == b'_';
-    !word.is_empty()
-        && bytes.windows(word.len()).enumerate().any(|(at, it)| {
-            it == word
-                && (at == 0 || !ident(bytes[at - 1]))
-                && bytes.get(at + word.len()).is_none_or(|it| !ident(*it))
-        })
+fn identifier(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Of each package of [`PACKAGES`], every longest run of identifier characters in the files it
+/// compiles from, each a slice of the file: made once, then a cfg name is one probe of a set.
+fn words() -> &'static [FxHashSet<&'static [u8]>] {
+    static WORDS: OnceLock<Vec<FxHashSet<&'static [u8]>>> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        PACKAGES
+            .iter()
+            .map(|package| {
+                let mut words = FxHashSet::default();
+                for &(path, bytes) in package.files {
+                    if !compiled(path) {
+                        continue;
+                    }
+                    let mut start = None;
+                    for (at, &byte) in bytes.iter().enumerate() {
+                        match (identifier(byte), start) {
+                            (true, None) => start = Some(at),
+                            (false, Some(from)) => {
+                                words.insert(&bytes[from..at]);
+                                start = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(from) = start {
+                        words.insert(&bytes[from..]);
+                    }
+                }
+                words
+            })
+            .collect()
+    })
 }
 
 /// `at` of [`PACKAGES`] and every package it depends on, directly or not, once, in the order
 /// they are first reached.
-fn closure_of(at: usize) -> Vec<usize> {
-    let mut all = vec![at];
-    let mut next = 0;
-    while let Some(&it) = all.get(next) {
-        next += 1;
-        for &(_, dep) in PACKAGES[it].deps {
-            if !all.contains(&dep) {
-                all.push(dep);
-            }
-        }
-    }
-    all
+fn closure_of(at: usize) -> &'static [usize] {
+    static CLOSURES: OnceLock<Vec<Vec<usize>>> = OnceLock::new();
+    &CLOSURES.get_or_init(|| {
+        (0..PACKAGES.len())
+            .map(|at| {
+                let mut all = vec![at];
+                let mut next = 0;
+                while let Some(&it) = all.get(next) {
+                    next += 1;
+                    for &(_, dep) in PACKAGES[it].deps {
+                        if !all.contains(&dep) {
+                            all.push(dep);
+                        }
+                    }
+                }
+                all
+            })
+            .collect()
+    })[at]
 }
 
 /// What an identity is made with.
 const IDENTITY: &str = "blaze v2 native proc macro 1";
 
 /// The code that runs a native expander, besides the packages it expands with.
-const CODE: [&str; 8] = [
+const CODE: [&str; 9] = [
     include_str!("mod.rs"),
+    include_str!("closure.rs"),
     include_str!("host.rs"),
     include_str!("wire.rs"),
     include_str!("lex.rs"),
@@ -853,18 +864,32 @@ const CODE: [&str; 8] = [
     include_str!("proc_macro/Cargo.toml"),
 ];
 
+/// The identity of macro `entry` of `root` of [`ROOTS`], each worked out once.
 fn identity(root: usize, entry: usize) -> ContentId {
-    static CLOSURES: OnceLock<Vec<ContentId>> = OnceLock::new();
-    let closures = CLOSURES.get_or_init(|| {
-        ROOTS.iter().map(|root| closure_identity(root.package)).collect()
-    });
-    let entry = &ROOTS[root].macros[entry];
-    let kind: u8 = match entry.kind {
-        ProcMacroKind::CustomDerive => 0,
-        ProcMacroKind::Attr => 1,
-        ProcMacroKind::Bang => 2,
-    };
-    Hasher::new(IDENTITY).id(&closures[root]).part(entry.name.as_bytes()).part(&[kind]).finish()
+    static IDENTITIES: OnceLock<Vec<Vec<ContentId>>> = OnceLock::new();
+    IDENTITIES.get_or_init(|| {
+        ROOTS
+            .iter()
+            .map(|root| {
+                let closure = closure_identity(root.package);
+                root.macros
+                    .iter()
+                    .map(|entry| {
+                        let kind: u8 = match entry.kind {
+                            ProcMacroKind::CustomDerive => 0,
+                            ProcMacroKind::Attr => 1,
+                            ProcMacroKind::Bang => 2,
+                        };
+                        Hasher::new(IDENTITY)
+                            .id(&closure)
+                            .part(entry.name.as_bytes())
+                            .part(&[kind])
+                            .finish()
+                    })
+                    .collect()
+            })
+            .collect()
+    })[root][entry]
 }
 
 fn closure_identity(root: usize) -> ContentId {
@@ -873,7 +898,7 @@ fn closure_identity(root: usize) -> ContentId {
     for code in CODE {
         hasher.part(code.as_bytes());
     }
-    for at in closure_of(root) {
+    for &at in closure_of(root) {
         let package = &PACKAGES[at];
         hasher.part(package.name.as_bytes()).part(package.version.as_bytes());
         for (path, hash) in &actual[at].files {
@@ -889,31 +914,30 @@ fn closure_identity(root: usize) -> ContentId {
     hasher.finish()
 }
 
-/// What [`find`] found: the macros it gave expanders of, and each first difference of a
-/// library of a verified crate's name and version from the copy, with how many had it.
-struct Report {
-    found: u64,
-    missed: Vec<(String, u64)>,
-}
+/// How many closures were the verified copy, each counted once when it is first asked of.
+static VERIFIED: AtomicU64 = AtomicU64::new(0);
 
-static REPORT: Mutex<Report> = Mutex::new(Report { found: 0, missed: Vec::new() });
+/// Each first difference of a closure of a verified crate's name and version from the copy,
+/// with how many closures had it: written only on a miss.
+static MISSED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
 fn missed(why: String) {
-    let mut report = lock(&REPORT);
-    match report.missed.iter_mut().find(|it| it.0 == why) {
+    let mut missed = lock(&MISSED);
+    match missed.iter_mut().find(|it| it.0 == why) {
         Some(it) => it.1 += 1,
-        None => report.missed.push((why, 1)),
+        None => missed.push((why, 1)),
     }
 }
 
 /// What [`find`] found so far, for the daemon's log: `None` before it found or missed one.
 pub fn report() -> Option<String> {
-    let report = lock(&REPORT);
-    if report.found == 0 && report.missed.is_empty() {
+    let verified = VERIFIED.load(atomic::Ordering::Relaxed);
+    let missed = lock(&MISSED);
+    if verified == 0 && missed.is_empty() {
         return None;
     }
-    let mut said = format!("native proc macros: {} found", report.found);
-    for (why, count) in &report.missed {
+    let mut said = format!("native proc macros: {verified} libraries are verified copies");
+    for (why, count) in missed.iter() {
         said += &format!("; {count} not the verified copy, as {why}");
     }
     Some(said)

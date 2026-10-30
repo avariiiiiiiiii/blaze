@@ -151,6 +151,8 @@ mod units;
 use self::places::{row_location, source_location};
 mod promote;
 mod settled;
+mod spare;
+pub(crate) use spare::with_context;
 mod stable;
 use blaze_store as store;
 pub use stable::{block_place, function_place, lower_declared, static_place};
@@ -3030,9 +3032,7 @@ fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
 /// (`tier`), its IR for LLVM.
 fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produced> {
     let (body, env) = root_body(db, func)?;
-    if std::env::var("BLAZE_DUMP_MIR")
-        .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
-    {
+    if dump_mir_of().is_some_and(|want| FunctionSignature::of(db, func).name.as_str() == want) {
         dump_mir(body);
     }
     let signature = FunctionSignature::of(db, func);
@@ -3127,7 +3127,7 @@ fn instance_code(
             return compile_as(db, env, None, false, instance.checked, shim, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
-                if std::env::var_os("BLAZE_DUMP_CLIF").is_some() {
+                if dumps_clif() {
                     eprintln!("drop glue for {ty:?}\n{}", fx.builder.func.display());
                 }
                 Ok(())
@@ -3160,17 +3160,17 @@ fn instance_code(
         | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
     };
     let body = &*body;
-    let dump = std::env::var("BLAZE_DUMP_MIR").ok();
+    let dump = dump_mir_of();
     let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);
-            if dump.as_deref() == Some(signature.name.as_str()) {
+            if dump == Some(signature.name.as_str()) {
                 dump_mir(body);
             }
             (track_caller(db, func), signature.abi, signature.is_varargs())
         }
         _ => {
-            if dump.as_deref() == Some("{closure}") {
+            if dump == Some("{closure}") {
                 dump_mir(body);
             }
             (false, ExternAbi::Rust, false)
@@ -3421,6 +3421,33 @@ pub fn mir_opt_level() -> Option<MirOptLevel> {
 }
 
 pub const MIR_OPT: &str = "BLAZE_MIR_OPT";
+
+/// `BLAZE_DUMP_MIR`: the name of the function whose MIR is printed as it is compiled
+/// (`{closure}` for closures). These switches are read once: `std::env::var` takes the
+/// process's environment lock and allocates, and they are asked about once per function.
+fn dump_mir_of() -> Option<&'static str> {
+    static NAME: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("BLAZE_DUMP_MIR").ok());
+    NAME.as_deref()
+}
+
+/// `BLAZE_DUMP_CLIF`: print the IR of drop glue as it is built.
+fn dumps_clif() -> bool {
+    static SET: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_DUMP_CLIF").is_some());
+    *SET
+}
+
+/// `BLAZE_DUMP_TIER`: say why a compile above level 1 is not shown or given a body.
+pub(crate) fn dumps_tier() -> bool {
+    static SET: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_DUMP_TIER").is_some());
+    *SET
+}
+
+/// `BLAZE_CACHE_CHECK`: compile what the store has, to compare.
+pub(crate) fn checks_cache() -> bool {
+    static SET: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("BLAZE_CACHE_CHECK").is_some());
+    *SET
+}
 
 /// The MIR optimization level of the bodies of `krate`: [`mir_opt_level`] where it is asked
 /// for, else rustc's ([`rustc_mir_opt_level`]).
@@ -4774,8 +4801,10 @@ fn compile_as<'db>(
             let named = cg.named_slots().collect();
             let (source, variables) = described(&mut cg, env, body);
             let (wants, layouts) = cg.detach();
+            let func = std::mem::replace(&mut ctx.func, ir::Function::new());
+            spare::keep_context(ctx);
             return Ok(Produced::Pending(Pending {
-                func: ctx.func,
+                func,
                 wants,
                 named,
                 source,
@@ -4786,6 +4815,7 @@ fn compile_as<'db>(
         }
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
+    spare::keep_context(ctx);
     let (source, variables) = described(&mut cg, env, body);
     let (requests, layouts) = cg.finish();
     // What a build compiled, which a compile at a level above 1 is not part of.
@@ -4932,12 +4962,13 @@ fn build<'db>(
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<cranelift_codegen::Context> {
     let interner = DbInterner::new_with(cg.db, env.krate);
-    let mut ctx = cranelift_codegen::Context::new();
+    let layouts = Layouts::default();
+    let mut ctx = spare::context();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
     // Source locations are kept as distances from the first one set, and the distance of
     // the one just below it is taken for none at all.
     ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
-    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut builder_ctx = spare::builder();
     let aborts = cg.unit.map_or_else(|| panics_abort(cg.db, env.krate), |it| it.aborts);
     let compiling =
         cg.unit.map_or_else(|| debug_assertions(cg.db, env.krate), |it| it.debug_assertions);
@@ -4952,9 +4983,10 @@ fn build<'db>(
         infcx: interner.infer_ctxt().build(TypingMode::PostAnalysis),
         interner,
         builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
-        locals: ArenaMap::new(),
-        blocks: ArenaMap::new(),
-        layouts: Default::default(),
+        locals: ArenaMap::with_capacity(body.map_or(0, |it| it.locals.len())),
+        blocks: ArenaMap::with_capacity(body.map_or(0, |it| it.basic_blocks.len())),
+        layouts: &layouts,
+        core_panics: Vec::new(),
         glue: Default::default(),
         inner_pad: None,
         unwind_to: None,
@@ -4987,6 +5019,7 @@ fn build<'db>(
     let config = fx.cg.target_config();
     let guarded = fx.guarded;
     fx.builder.finalize(config);
+    spare::keep_builder(builder_ctx);
     if guarded && let Some(entry) = ctx.func.layout.entry_block() {
         // The slot a guarded call looks for an exception in starts empty.
         use cranelift_codegen::cursor::{Cursor as _, FuncCursor};
@@ -5072,7 +5105,9 @@ fn built_in_body(
     }
     let pointees = std::mem::take(&mut cg.pointees);
     let built_in = std::mem::take(&mut cg.built_in);
-    fragment::Inlinable::of(ctx.func, cg.finish().0, pointees, Vec::new(), built_in)
+    let func = std::mem::replace(&mut ctx.func, ir::Function::new());
+    spare::keep_context(ctx);
+    fragment::Inlinable::of(func, cg.finish().0, pointees, Vec::new(), built_in)
 }
 
 fn inlinable_cycle(
@@ -5134,15 +5169,16 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
     // Cranelift copies a symbol of the callee with the name it has among the callee's
     // names, which among the caller's is another symbol's.
     let ends = bodies.put.iter().skip(1).map(|it| it.insts).chain([ctx.func.dfg.num_insts()]);
+    let (mut dfs, mut order) = (cranelift_codegen::traversals::Dfs::new(), Vec::new());
     for (put, end) in bodies.put.iter().zip(ends) {
         let body = &inlined[put.body];
         // Cranelift makes the instructions of a body it inlines in the order it visits the
         // body's, and gives them no source location: an `offset`'s mark goes by that order,
         // where every instruction is the one it is made from (a return becomes a jump).
-        let order: Vec<ir::Inst> = cranelift_codegen::traversals::Dfs::new()
-            .pre_order_iter(body)
-            .flat_map(|block| body.layout.block_insts(block))
-            .collect();
+        order.clear();
+        order.extend(
+            dfs.pre_order_iter(body).flat_map(|block| body.layout.block_insts(block)),
+        );
         let made = |at: usize| ir::Inst::from_u32((put.insts + at) as u32);
         let in_order = order.len() <= end - put.insts
             && order.iter().enumerate().all(|(at, &it)| {
@@ -5191,9 +5227,28 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
     }
 }
 
-/// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
-/// (i128 corners, for one); that must cost us one function, not the process.
+/// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`). v2 keeps what it
+/// compiles in the back-end memo by the function's shape, which is its printed IR with names
+/// by place, so Cranelift's incremental cache would be a second key over the same IR (a
+/// serialization and hash of the whole function, and a lookup in v1's store) that the memo
+/// already missed on. It compiles with none.
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    emit_with(ctx, None)
+}
+
+/// [`emit`] for v1's build (`Backend::emit`), through Cranelift's incremental cache in v1's
+/// store when there is one.
+fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    emit_with(ctx, store::Store::global())
+}
+
+/// Runs Cranelift on a finished function, with `store` as its incremental cache. Cranelift
+/// panics on IR it has no lowering for (i128 corners, for one); that must cost us one function,
+/// not the process.
+fn emit_with(
+    ctx: &mut cranelift_codegen::Context,
+    store: Option<&'static store::Store>,
+) -> Result<Code> {
     if Target::current().is_wasm() {
         return emit_wasm(&ctx.func, Target::current().calls());
     }
@@ -5211,7 +5266,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
         isa = &**target_with_frame_pointer()?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match store::Store::global() {
+        match store {
             Some(store) => ctx
                 .compile_with_cache(isa, &mut IncrementalCache(store), &mut Default::default())
                 .map(drop),
@@ -5442,7 +5497,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             later: Vec::new(),
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store
-                .filter(|_| base.is_none() && std::env::var_os("BLAZE_CACHE_CHECK").is_none())
+                .filter(|_| base.is_none() && !checks_cache())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
                     std::sync::Arc::new(cached::Entries::new(
@@ -6377,7 +6432,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.mixed.is_none()
             && self.base.is_none()
             && !self.units()
-            && std::env::var_os("BLAZE_CACHE_CHECK").is_none()
+            && !checks_cache()
     }
 
     fn keeper(&mut self, settled: Option<Vec<Option<Instance>>>) -> later::Keeper<'_, 'db> {
@@ -8155,7 +8210,10 @@ struct FunctionCx<'cx, 'db> {
     locals: ArenaMap<LocalId, LocalSlot>,
     blocks: ArenaMap<BasicBlockId, ir::Block>,
     /// The layouts asked for so far: a body asks for that of the same few types many times.
-    layouts: std::cell::RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
+    layouts: &'cx Layouts<'db>,
+    /// The panic functions of core called so far, by name: resolving one walks core's modules
+    /// by name, and every checked `+` of the body calls one.
+    core_panics: Vec<(&'static str, Option<FunctionId>)>,
     /// Whether dropping each type asked about so far does anything.
     glue: std::cell::RefCell<FxHashMap<Ty<'db>, DropGlue>>,
     /// A landing pad that takes over from the cleanup block of `unwind_to` for the calls
@@ -8211,6 +8269,40 @@ struct FunctionCx<'cx, 'db> {
     suspended: Option<SuspendedState>,
     /// The locals an `async` body keeps in its future, and how far into it each is.
     held_at: Vec<(LocalId, u32)>,
+}
+
+/// The layouts a function's build asked for, each asked of the database once and then lent
+/// out as `&Layout` for the whole build. Lending an `Arc` per lookup, as before, wrote the
+/// reference count salsa's memo shares with every other thread compiling a function that uses
+/// the type: a shared cache line written on a read. A lookup is now one `FxHash` probe of an
+/// interned `Ty` (a pointer) and no write outside the thread.
+#[derive(Default)]
+struct Layouts<'db> {
+    of: std::cell::RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
+    /// The layout whose fields are a variant's, and the tag a value of it has (where, as what
+    /// and its value), by the variant and the arguments of its type: `None` for a variant the
+    /// type has no room for. Building one copies the variant's field offsets, which each
+    /// aggregate of the variant would otherwise do again.
+    variants: std::cell::RefCell<FxHashMap<(VariantId, GenericArgs<'db>), Option<VariantShape>>>,
+}
+
+/// A variant's layout and its tag, as [`FunctionCx::variant_shape`] gives them.
+type Tag = Option<(usize, types::Type, u128)>;
+
+struct VariantShape {
+    layout: Arc<Layout>,
+    tag: Tag,
+}
+
+impl<'db> Layouts<'db> {
+    /// `layout`, lent for as long as `self` lives.
+    fn lend<'a>(&'a self, layout: &Arc<Layout>) -> &'a Layout {
+        // SAFETY: `layout` is a value of `self.of` or `self.variants`. Neither map has an entry
+        // removed or replaced while `self` lives (both are only added to, through `entry`), so
+        // the `Arc` keeps the `Layout` it points to alive and where it is, however the map is
+        // rehashed, for all of `'a`.
+        unsafe { &*Arc::as_ptr(layout) }
+    }
 }
 
 /// Where an `async` body says where it left off, and what that says of its locals.
@@ -8485,9 +8577,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         glue
     }
 
-    fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
-        if let Some(layout) = self.layouts.borrow().get(&ty) {
-            return Ok(layout.clone());
+    fn layout(&self, ty: Ty<'db>) -> Result<&'cx Layout> {
+        let layouts: &'cx Layouts<'db> = self.layouts;
+        if let Some(layout) = layouts.of.borrow().get(&ty) {
+            return Ok(layouts.lend(layout));
         }
         let layout = self
             .cg
@@ -8503,8 +8596,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         // What is laid out at the least vector length is stored for the largest.
         let layout = sve::storage(layout);
-        self.layouts.borrow_mut().insert(ty, layout.clone());
-        Ok(layout)
+        let mut of = layouts.of.borrow_mut();
+        Ok(layouts.lend(of.entry(ty).or_insert(layout)))
     }
 
     /// The shape of a scalable vector type, `None` for any other.
@@ -10339,8 +10432,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// Field types can still be projections such as `<str as ToOwned>::Owned`.
+    /// Field types can still be projections such as `<str as ToOwned>::Owned`. Every place of
+    /// every statement asks this of its local and of each projection, and almost none is an
+    /// alias: one is given back as it is, as `structurally_normalize_ty` does, without making a
+    /// fulfillment context for it.
     fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+        if !matches!(ty.kind(), TyKind::Alias(..)) {
+            return ty;
+        }
         hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
             .structurally_normalize_ty(
                 &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
@@ -10723,10 +10822,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls the panic function core declares at `path` with pointer-sized `args`: the
     /// function itself, as any other call of it, or by its path when core isn't in the graph.
-    fn call_panic(&mut self, path: &[&str], args: &[Value]) -> Result<()> {
+    fn call_panic(&mut self, path: &[&'static str], args: &[Value]) -> Result<()> {
         let mut sig = self.cg.make_signature();
         sig.params.extend(args.iter().map(|_| AbiParam::new(ptr())));
-        let callee = match self.core_function(path) {
+        let callee = match self.core_panic(path) {
             Some(func) => {
                 let none = GenericArgs::new_from_slice(&[]);
                 self.cg.callee(InstanceDef::Fn(func), none, self.env, &sig)?
@@ -10736,6 +10835,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         self.invoke(callee, args);
         Ok(())
+    }
+
+    /// [`Self::core_function`] of a panic function, found once per function built: core's
+    /// panic functions each have a name of their own, which keys them.
+    fn core_panic(&mut self, path: &[&'static str]) -> Option<FunctionId> {
+        let name = *path.last()?;
+        if let Some(&(_, found)) = self.core_panics.iter().find(|it| it.0 == name) {
+            return found;
+        }
+        let found = self.core_function(path);
+        self.core_panics.push((name, found));
+        found
     }
 
     /// The function core declares at `path`, its modules then its name.
@@ -11136,7 +11247,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (self.variant_shape(variants[index].0.into(), args)?, &items[1..])
                 }
             },
-            _ => (Some((layout.clone(), None)), &items[..]),
+            _ => (Some((layout, None)), &items[..]),
         };
         let Some((variant, tag)) = shape else {
             unsupported!("a constant of a variant its type has no room for");
@@ -12442,7 +12553,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst: Value,
         variant: VariantId,
         args: GenericArgs<'db>,
-    ) -> Result<Option<Arc<Layout>>> {
+    ) -> Result<Option<&'cx Layout>> {
         let Some((layout, tag)) = self.variant_shape(variant, args)? else { return Ok(None) };
         if let Some((offset, ty, tag)) = tag {
             let value = self.iconst(ty, tag);
@@ -12458,10 +12569,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         variant: VariantId,
         args: GenericArgs<'db>,
-    ) -> Result<Option<(Arc<Layout>, Option<(usize, types::Type, u128)>)>> {
+    ) -> Result<Option<(&'cx Layout, Tag)>> {
+        let layouts: &'cx Layouts<'db> = self.layouts;
+        let lent = |shape: &Option<VariantShape>| {
+            shape.as_ref().map(|it| (layouts.lend(&it.layout), it.tag))
+        };
+        if let Some(shape) = layouts.variants.borrow().get(&(variant, args)) {
+            return Ok(lent(shape));
+        }
+        let shape = self.variant_shape_of(variant, args)?;
+        let mut variants = layouts.variants.borrow_mut();
+        Ok(lent(variants.entry((variant, args)).or_insert(shape)))
+    }
+
+    fn variant_shape_of(
+        &mut self,
+        variant: VariantId,
+        args: GenericArgs<'db>,
+    ) -> Result<Option<VariantShape>> {
         let db = self.cg.db;
         let adt: AdtId = variant.adt_id(db);
-        let layout = self.layout(Ty::new_adt(self.interner, adt, args))?;
+        let ty = Ty::new_adt(self.interner, adt, args);
+        let layout = self.layout(ty)?;
         let (tag, tag_encoding, tag_field) = match &layout.variants {
             Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
                 (tag, tag_encoding, tag_field)
@@ -12471,7 +12600,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     VariantId::EnumVariantId(variant) => variant.index(db) == index.0,
                     _ => true,
                 };
-                return Ok(inhabited.then_some((layout, None)));
+                let whole = || self.layouts.of.borrow()[&ty].clone();
+                return Ok(inhabited.then(|| VariantShape { layout: whole(), tag: None }));
             }
             Variants::Empty => return Ok(None),
         };
@@ -12493,8 +12623,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Some(((index - niche_variants.start.0) as u128).wrapping_add(*niche_start))
             }
         };
-        let layout = Arc::new(Layout::for_variant(&layout, RustcEnumVariantIdx(index)));
-        Ok(Some((layout, tag_value.map(|it| (offset, tag_ty, it)))))
+        let layout = Arc::new(Layout::for_variant(layout, RustcEnumVariantIdx(index)));
+        Ok(Some(VariantShape { layout, tag: tag_value.map(|it| (offset, tag_ty, it)) }))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
@@ -12840,18 +12970,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Branches to a call of core's `panic_const_*` when `cond` is set.
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
         let name = match op {
-            OverflowOp::Add => "add_overflow",
-            OverflowOp::Sub => "sub_overflow",
-            OverflowOp::Mul => "mul_overflow",
-            OverflowOp::Div => "div_overflow",
-            OverflowOp::Rem => "rem_overflow",
-            OverflowOp::Neg => "neg_overflow",
-            OverflowOp::Shl => "shl_overflow",
-            OverflowOp::Shr => "shr_overflow",
-            OverflowOp::DivByZero => "div_by_zero",
-            OverflowOp::RemByZero => "rem_by_zero",
+            OverflowOp::Add => "panic_const_add_overflow",
+            OverflowOp::Sub => "panic_const_sub_overflow",
+            OverflowOp::Mul => "panic_const_mul_overflow",
+            OverflowOp::Div => "panic_const_div_overflow",
+            OverflowOp::Rem => "panic_const_rem_overflow",
+            OverflowOp::Neg => "panic_const_neg_overflow",
+            OverflowOp::Shl => "panic_const_shl_overflow",
+            OverflowOp::Shr => "panic_const_shr_overflow",
+            OverflowOp::DivByZero => "panic_const_div_by_zero",
+            OverflowOp::RemByZero => "panic_const_rem_by_zero",
         };
-        let name = format!("panic_const_{name}");
         let panic_block = self.builder.create_block();
         let ok_block = self.builder.create_block();
         self.builder.set_cold_block(panic_block);
@@ -12859,7 +12988,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        self.call_panic(&["panicking", "panic_const", &name], &[location])?;
+        self.call_panic(&["panicking", "panic_const", name], &[location])?;
         self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
 
         self.builder.switch_to_block(ok_block);
@@ -14894,7 +15023,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some((body, hint)) = tier::seen_body(db, &instance, &self.env.store(), tracked) {
             if body.func.signature == *sig {
                 self.cg.declare_seen(id, &body, hint);
-            } else if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
+            } else if dumps_tier() {
                 eprintln!("tier: signature differs: {} vs {}", body.func.signature, sig);
             }
         }
@@ -19557,6 +19686,96 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// What `Layouts::lend` hands out is the layout an `Arc` clone of the map's entry would
+    /// have been, before the map grows and after: entries move when it rehashes, the layouts
+    /// behind them don't. Seeded layouts of every integer width, more than the map's first
+    /// capacities hold.
+    #[test]
+    fn a_lent_layout_is_the_entry_however_the_map_grows() {
+        use super::{Arc, Layout, Layouts, Primitive, Scalar};
+        use rustc_abi::Integer;
+        let dl = rustc_abi::TargetDataLayout::default();
+        let widths = [Integer::I8, Integer::I16, Integer::I32, Integer::I64, Integer::I128];
+        let layouts = Layouts::default();
+        let mut entries: rustc_hash::FxHashMap<u32, Arc<Layout>> = Default::default();
+        let mut lent = Vec::new();
+        let mut seed = 0x9e37_79b9_u32;
+        for key in 0..4096u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let int = widths[seed as usize % widths.len()];
+            let scalar = Scalar::Union { value: Primitive::Int(int, seed & 1 == 0) };
+            let entry = entries.entry(key).or_insert(Arc::new(Layout::scalar(&dl, scalar)));
+            lent.push((key, layouts.lend(entry)));
+        }
+        for (key, layout) in lent {
+            let cloned = entries[&key].clone();
+            assert!(std::ptr::eq(layout, &*cloned));
+            assert_eq!(*layout, *cloned);
+        }
+    }
+
+    /// The panic of each overflow check is named whole, as core declares it: `call_panic`
+    /// finds it by that name and keeps it by it.
+    #[test]
+    fn each_overflow_check_has_a_panic_of_its_own() {
+        let names = [
+            "panic_const_add_overflow",
+            "panic_const_sub_overflow",
+            "panic_const_mul_overflow",
+            "panic_const_div_overflow",
+            "panic_const_rem_overflow",
+            "panic_const_neg_overflow",
+            "panic_const_shl_overflow",
+            "panic_const_shr_overflow",
+            "panic_const_div_by_zero",
+            "panic_const_rem_by_zero",
+        ];
+        let distinct: rustc_hash::FxHashSet<_> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len());
+    }
+
+    /// A function compiled in a context the thread kept, whose register allocator and
+    /// dominator tree another function grew, gives the bytes a fresh context gives.
+    #[test]
+    fn a_kept_context_compiles_what_a_fresh_one_does() {
+        let isa = super::target().unwrap();
+        let build = |blocks: usize, by: i64| {
+            let mut sig = ir::Signature::new(isa.default_call_conv());
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let mut value = builder.block_params(entry)[0];
+            for _ in 0..blocks {
+                let next = builder.create_block();
+                let param = builder.append_block_param(next, types::I64);
+                value = builder.ins().imul_imm(value, by);
+                builder.ins().jump(next, &[value.into()]);
+                builder.switch_to_block(next);
+                value = param;
+            }
+            builder.ins().return_(&[value]);
+            builder.seal_all_blocks();
+            builder.finalize(isa.frontend_config());
+            func
+        };
+        let fresh = {
+            let mut context = cranelift_codegen::Context::for_function(build(2, 41));
+            super::emit(&mut context).unwrap()
+        };
+        super::with_context(build(64, 3), |context| super::emit(context).unwrap());
+        let kept = super::with_context(build(2, 41), |context| super::emit(context).unwrap());
+        assert_eq!(kept.bytes, fresh.bytes);
+        assert_eq!(kept.relocs.len(), fresh.relocs.len());
+        assert_eq!(kept.align, fresh.align);
+    }
 
     /// A `link_name` that starts with `\u{1}` is the object's symbol: the object writer's
     /// prefix comes off it, so that the symbol is not prefixed twice.

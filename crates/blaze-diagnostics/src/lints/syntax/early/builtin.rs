@@ -101,36 +101,33 @@ fn while_true(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emi
 /// `unsafe` blocks, traits, impls, `extern` blocks and functions, and
 /// `#[allow_internal_unsafe]` on a macro: `UnsafeCode`.
 fn unsafe_code(cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
-    let mut report = |range: TextRange, message: &str, note: Option<&str>| {
+    let mut report = |range: TextRange, message: &str| {
         if allows_unsafe(cx, tree.file, range) {
             return;
         }
-        let mut diag = Diag::lint("unsafe_code", message, cx.span(InFile::new(tree.file, range)));
-        if let Some(note) = note {
-            diag.note(note);
-        }
+        let diag = Diag::lint("unsafe_code", message, cx.span(InFile::new(tree.file, range)));
         out.push(emitted(cx, diag, Pass::Early, tree.ptr(node)));
     };
     if let Some(it) = ast::BlockExpr::cast(node.clone())
         && it.unsafe_token().is_some()
     {
-        report(range_of(node), "usage of an `unsafe` block", None);
+        report(range_of(node), "usage of an `unsafe` block");
     }
     if let Some(it) = ast::Trait::cast(node.clone())
         && it.unsafe_token().is_some()
     {
-        report(range_of(node), "declaration of an `unsafe` trait", None);
+        report(range_of(node), "declaration of an `unsafe` trait");
     }
     if let Some(it) = ast::Impl::cast(node.clone())
         && it.unsafe_token().is_some()
         && it.trait_().is_some()
     {
-        report(range_of(node), "implementation of an `unsafe` trait", None);
+        report(range_of(node), "implementation of an `unsafe` trait");
     }
     if let Some(it) = ast::ExternBlock::cast(node.clone())
         && it.unsafe_token().is_some()
     {
-        report(range_of(node), "usage of an `unsafe extern` block", None);
+        report(range_of(node), "usage of an `unsafe extern` block");
     }
     if (ast::MacroRules::can_cast(node.kind()) || ast::MacroDef::can_cast(node.kind()))
         && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
@@ -143,7 +140,6 @@ fn unsafe_code(cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode,
             report(
                 range,
                 "`allow_internal_unsafe` allows defining macros using unsafe without triggering the `unsafe_code` lint at their call site",
-                None,
             );
         }
     }
@@ -156,7 +152,7 @@ fn unsafe_code(cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode,
             Some(SyntaxKind::ASSOC_ITEM_LIST) => "implementation of an `unsafe` method",
             _ => "declaration of an `unsafe` function",
         };
-        report(range_of(node), message, None);
+        report(range_of(node), message);
     }
 }
 

@@ -22,7 +22,7 @@ use crate::{
             serialize_span_data_index_map,
         },
     },
-    process::ProcMacroServerProcess,
+    process::Claimed,
     transport::postcard,
 };
 
@@ -95,7 +95,7 @@ fn wrap_decode(err: io::Error) -> ServerError {
 }
 
 pub(crate) fn version_check(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
     callback: SubCallback<'_>,
 ) -> Result<u32, ServerError> {
     let request = BidirectionalMessage::Request(Request::ApiVersionCheck(ApiVersionCheck {}));
@@ -112,7 +112,7 @@ pub(crate) fn version_check(
 
 /// Enable support for rust-analyzer span mode if the server supports it.
 pub(crate) fn enable_rust_analyzer_spans(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
     callback: SubCallback<'_>,
 ) -> Result<SpanMode, ServerError> {
     let request = BidirectionalMessage::Request(Request::SetConfig(ServerConfig {
@@ -131,7 +131,7 @@ pub(crate) fn enable_rust_analyzer_spans(
 
 /// Finds proc-macros in a given dynamic library.
 pub(crate) fn find_proc_macros(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
     dylib_path: &AbsPath,
     callback: SubCallback<'_>,
 ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
@@ -149,7 +149,7 @@ pub(crate) fn find_proc_macros(
 
 pub(crate) fn expand(
     proc_macro: &ProcMacro,
-    process: &ProcMacroServerProcess,
+    process: &Claimed<'_>,
     subtree: tt::SubtreeView<'_>,
     attr: Option<tt::SubtreeView<'_>>,
     env: Vec<(String, String)>,
@@ -203,7 +203,7 @@ pub(crate) fn expand(
 }
 
 fn run_request(
-    srv: &ProcMacroServerProcess,
+    srv: &Claimed<'_>,
     msg: BidirectionalMessage,
     callback: SubCallback<'_>,
 ) -> Result<BidirectionalMessage, ServerError> {

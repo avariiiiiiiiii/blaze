@@ -5,6 +5,7 @@
 use salsa::{Cancelled, Database};
 
 use crate::setup::{Knobs, KnobsDatabase};
+use crate::sync::{mpsc, thread};
 
 #[salsa::tracked(returns(copy))]
 fn query_a(db: &dyn KnobsDatabase) -> u32 {
@@ -26,19 +27,25 @@ fn query_c(_db: &dyn KnobsDatabase) -> u32 {
 #[test]
 fn execute() {
     let db = Knobs::default();
-    let db2 = db.clone();
-    let db_signaler = db.clone();
-    let token = db.cancellation_token();
-
-    let t1 = std::thread::spawn(move || query_a(&db));
-    db_signaler.wait_for(1);
-    db2.signal_on_will_block(2);
-    let t2 = std::thread::spawn(move || query_a(&db2));
-    db_signaler.wait_for(2);
-    token.cancel();
-    db_signaler.signal(3);
-    let (r1, r2) = (t1.join(), t2.join());
-    let r1 = *r1.unwrap_err().downcast::<salsa::Cancelled>().unwrap();
-    assert!(matches!(r1, Cancelled::Local), "{r1:?}");
-    assert_eq!(r2.unwrap(), 1);
+    let db = &db;
+    thread::scope(|scope| {
+        let (token_tx, token_rx) = mpsc::channel();
+        let t1 = scope.spawn(move || {
+            token_tx.send(db.cancellation_token()).unwrap();
+            query_a(db)
+        });
+        let token = token_rx.recv().unwrap();
+        db.wait_for(1);
+        let t2 = scope.spawn(move || {
+            db.signal_on_will_block(2);
+            query_a(db)
+        });
+        db.wait_for(2);
+        token.cancel();
+        db.signal(3);
+        let (r1, r2) = (t1.join(), t2.join());
+        let r1 = *r1.unwrap_err().downcast::<salsa::Cancelled>().unwrap();
+        assert!(matches!(r1, Cancelled::Local), "{r1:?}");
+        assert_eq!(r2.unwrap(), 1);
+    });
 }

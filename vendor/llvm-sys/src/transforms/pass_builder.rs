@@ -80,3 +80,24 @@ extern "C" {
     );
     pub fn LLVMDisposePassBuilderOptions(Options: LLVMPassBuilderOptionsRef);
 }
+
+/// blaze: LLVM's pass builder, analysis managers, instrumentation and parsed pipelines kept for
+/// one target machine (wrappers/passes.cpp). Used by one thread at a time, with modules of one
+/// context, and disposed of before the target machine and the context.
+#[derive(Debug)]
+pub enum LLVMBlazeOpaquePasses {}
+pub type LLVMBlazePassesRef = *mut LLVMBlazeOpaquePasses;
+
+extern "C" {
+    pub fn LLVMBlazeCreatePasses(TM: LLVMTargetMachineRef) -> LLVMBlazePassesRef;
+    pub fn LLVMBlazeDisposePasses(Passes: LLVMBlazePassesRef);
+    /// Runs the pipeline `Pipeline` (`Length` bytes, no NUL needed) over `M`, as
+    /// [`LLVMRunPasses`] does with default options but `SLPVectorization`.
+    pub fn LLVMBlazeRunPasses(
+        Passes: LLVMBlazePassesRef,
+        M: LLVMModuleRef,
+        Pipeline: *const ::libc::c_char,
+        Length: usize,
+        SLPVectorization: LLVMBool,
+    ) -> LLVMErrorRef;
+}

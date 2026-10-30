@@ -4,6 +4,8 @@
 //! it. Only content is hashed, never a `FileId`, `Crate`, `SourceRootId` or other dense index: a
 //! file is named by its path, another input by its own content ID.
 
+use std::{io::Write as _, ops::Range};
+
 use blaze_ids::{ContentId, Hasher};
 use cfg::{CfgAtom, CfgOptions};
 use vfs::VfsPath;
@@ -24,9 +26,11 @@ pub const CFG_OPTIONS_DOMAIN: &str = "blaze v2 cfg options 1";
 /// The content ID of a set of cfg atoms: sorted by their bytes, so the order of the set does
 /// not matter.
 pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
-    let mut atoms: Vec<Vec<u8>> = Vec::new();
+    // Every atom encoded into one buffer, then sorted as byte strings.
+    let mut bytes = Vec::new();
+    let mut atoms: Vec<Range<usize>> = Vec::new();
     for atom in cfg {
-        let mut bytes = Vec::new();
+        let start = bytes.len();
         match atom {
             CfgAtom::Flag(name) => {
                 bytes.push(0);
@@ -38,13 +42,13 @@ pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
                 frame(&mut bytes, value.as_str());
             }
         }
-        atoms.push(bytes);
+        atoms.push(start..bytes.len());
     }
-    atoms.sort_unstable();
+    atoms.sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
     let mut hasher = Hasher::new(CFG_OPTIONS_DOMAIN);
     len(&mut hasher, atoms.len());
-    for atom in &atoms {
-        hasher.part(atom);
+    for atom in atoms {
+        hasher.part(&bytes[atom]);
     }
     hasher.finish()
 }
@@ -57,7 +61,7 @@ fn frame(bytes: &mut Vec<u8>, part: &str) {
 /// A path as content: whether it is on disk (0) or virtual (1), then its text.
 pub(crate) fn path_key(path: &VfsPath) -> Vec<u8> {
     let mut key = vec![if path.as_path().is_some() { 0 } else { 1 }];
-    key.extend_from_slice(path.to_string().as_bytes());
+    write!(key, "{path}").expect("writing to a Vec does not fail");
     key
 }
 
@@ -70,4 +74,25 @@ pub(crate) fn opt(hasher: &mut Hasher, part: Option<&str>) {
         None => hasher.update(&[0]),
         Some(part) => hasher.update(&[1]).part(part.as_bytes()),
     };
+}
+
+/// What [`opt`] hashes, appended to `out`.
+pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
+    match part {
+        None => out.push(0),
+        Some(part) => {
+            out.push(1);
+            frame(out, part);
+        }
+    }
+}
+
+/// `ContentId::of(domain, &buf[range])` for each range, hashed many at a time (BLAKE3's SIMD
+/// lanes over many small inputs, docs/v2/plan/design/hardware.md).
+pub(crate) fn hash_ranges(domain: &'static str, buf: &[u8], ranges: &[Range<usize>]) -> Vec<ContentId> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let inputs: Vec<&[u8]> = ranges.iter().map(|range| &buf[range.clone()]).collect();
+    ContentId::of_many(domain, &inputs)
 }

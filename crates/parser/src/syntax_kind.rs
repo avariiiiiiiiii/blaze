@@ -9,10 +9,14 @@ use crate::Edition;
 #[allow(unreachable_pub)]
 pub use self::generated::SyntaxKind;
 
+#[allow(unsafe_code)]
 impl From<u16> for SyntaxKind {
     #[inline]
     fn from(d: u16) -> SyntaxKind {
         assert!(d <= (SyntaxKind::__LAST as u16));
+        // SAFETY: `SyntaxKind` is `#[repr(u16)]` with no explicit discriminants
+        // (`generated.rs`), so its values are exactly `0..=__LAST`, which the assert above
+        // checks `d` is in. A value past `__LAST` would be an invalid enum, undefined behavior.
         unsafe { std::mem::transmute::<u16, SyntaxKind>(d) }
     }
 }

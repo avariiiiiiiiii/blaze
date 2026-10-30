@@ -28,14 +28,14 @@ use crate::{
 
 /// The kind of macro a call asks for: rustc's `MacroKind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Bang,
     Attr,
     Derive,
 }
 
 impl Kind {
-    fn of(macro_: hir::Macro, db: &dyn hir::db::HirDatabase) -> Kind {
+    pub(super) fn of(macro_: hir::Macro, db: &dyn hir::db::HirDatabase) -> Kind {
         match macro_.kind(db) {
             hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => Kind::Attr,
             hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => Kind::Derive,
@@ -55,7 +55,7 @@ impl Kind {
     }
 
     /// rustc's `MacroKind::descr`.
-    fn descr(self) -> &'static str {
+    pub(super) fn descr(self) -> &'static str {
         match self {
             Kind::Bang => "macro",
             Kind::Attr => "attribute macro",
@@ -321,7 +321,7 @@ fn is_after(cx: &Cx<'_, '_>, macro_: hir::Macro, node: &SyntaxNode, at: TextSize
 
 /// rustc's `guess_head_span` of a macro's `def_span`: a `macro_rules!` up to its `{`, a proc
 /// macro's signature.
-fn head_span(cx: &Cx<'_, '_>, macro_: hir::Macro) -> Option<Span> {
+pub(super) fn head_span(cx: &Cx<'_, '_>, macro_: hir::Macro) -> Option<Span> {
     let src = macro_.source(cx.db)?;
     let range = match &src.value {
         Either::Left(it) => {

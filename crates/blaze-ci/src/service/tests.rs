@@ -68,6 +68,7 @@ impl Sim {
                 }
                 Output::Update { run, id, check } => {
                     assert_eq!(*id, github_id(*run));
+                    assert_ne!(self.posted.get(run), Some(check), "an update that changes nothing");
                     self.posted.insert(*run, check.clone());
                 }
                 _ => {}
@@ -184,9 +185,8 @@ fn a_push_end_to_end() {
     assert_eq!(started.head.as_deref(), Some("ci/main"));
 
     let out = sim.step(Input::CheckedOut { job: started.job, result: Ok(root("c1")) });
-    let Some(Output::Save(state)) = out.iter().find(|it| matches!(it, Output::Save(_))) else {
-        panic!("no save in {out:?}")
-    };
+    assert!(out.contains(&Output::Save), "no save in {out:?}");
+    let state = sim.service.state();
     assert_eq!(state.checkouts["branch/main"].checkout, Checkout { commit: "c1".to_owned(), root: root("c1") });
     let sent = sends(&out);
     assert_eq!(sent.len(), 2);
@@ -233,7 +233,8 @@ fn a_push_end_to_end() {
 
     let kept = Kept { id: "snap-1".to_owned(), name: name.clone(), at: sim.now };
     let out = sim.step(Input::Snapshotted(Ok(kept.clone())));
-    assert!(matches!(&out[..], [Output::Save(state)] if state.snapshots == [kept.clone()]));
+    assert_eq!(out, [Output::Save]);
+    assert_eq!(sim.service.state().snapshots, [kept.clone()]);
 
     // Not due again within the interval.
     sim.now += 60;
@@ -416,7 +417,7 @@ fn three_tags_the_latest_wins() {
     let out = sim.step(Input::CheckedOut { job: v1.job, result: Ok(root("v1")) });
     let sent = sends(&out);
     assert!(matches!(&sent[..], [(_, _, Request::Build { .. })]));
-    assert!(!out.iter().any(|it| matches!(it, Output::Save(_))), "a tag's root is the job's own");
+    assert!(!out.iter().any(|it| matches!(it, Output::Save)), "a tag's root is the job's own");
     let out = sim.step(Input::Ended { job: sent[0].0, run: sent[0].1, ok: true });
     assert!(out.contains(&Output::Unpin { root: root("v1") }));
     assert!(out.iter().any(|it| matches!(it, Output::Snapshot { .. })), "a green release snapshots");
@@ -688,7 +689,7 @@ impl World {
                 Output::RemoveSnapshot { id } => {
                     self.queue(vec![Input::Removed { id, result: Ok(()) }]);
                 }
-                Output::Save(_) | Output::Log(_) => {}
+                Output::Save | Output::Log(_) => {}
             }
         }
     }
@@ -784,4 +785,53 @@ fn random_orders_complete_every_check_run_and_post_only_to_named_commits() {
         }
         assert_eq!(sim.service.train, Train::default(), "seed {seed}");
     }
+}
+
+/// The tail as it was found before only the end of the output was read.
+fn tail_of_whole(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let mut tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
+    if tail.len() > TAIL_BYTES {
+        let mut start = tail.len() - TAIL_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = format!("...{}", &tail[start..]);
+    }
+    tail.replace("```", "'''")
+}
+
+#[test]
+fn the_tail_of_a_test_output_is_the_tail_of_the_whole_output() {
+    let pieces: [&[u8]; 12] = [
+        b"\n",
+        b"\r\n",
+        b"\n\n\n\n\n\n\n\n",
+        b" ",
+        b"\t",
+        b"word",
+        b"```",
+        "\u{a0}".as_bytes(),
+        "é".as_bytes(),
+        b"\xc3",
+        b"\xff",
+        b"\r",
+    ];
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for round in 0..2000 {
+        let mut output = Vec::new();
+        for _ in 0..rng.below(400) {
+            output.extend_from_slice(pieces[rng.below(pieces.len())]);
+        }
+        if round % 3 == 0 {
+            for _ in 0..rng.below(200) {
+                output.extend_from_slice(pieces[rng.below(3)]);
+            }
+        }
+        assert_eq!(tail(&output), tail_of_whole(&output), "round {round}: {output:?}");
+    }
+    let long: Vec<u8> = (0..10_000).flat_map(|line| format!("line {line} of a long output\n").into_bytes()).collect();
+    assert_eq!(tail(&long), tail_of_whole(&long));
+    assert_eq!(tail(b""), tail_of_whole(b""));
 }

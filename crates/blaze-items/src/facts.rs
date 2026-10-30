@@ -46,8 +46,8 @@ use crate::{
     Fact, InterfaceHash, ItemId, ItemKey, NameHash, ScopeIndexKey, SimplifiedType,
     hash::{self, Unhashable},
     index::{
-        AnyImpl, ScopeEntry, entry, impl_interface, impl_self_ty, implements_value,
-        inherent_impls_of, name_hashes, resolve_trait, scope, trait_impls, traits_with,
+        AnyImpl, ScopeEntry, all_impls_value, entry, impl_interface, impl_self_ty,
+        implements_value, inherent_impls_of, name_hashes, resolve_trait, scope, traits_with,
     },
     key::{self, Resolved},
 };
@@ -613,10 +613,7 @@ fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<
             h.part(b"trait").update(&[check_orphan_rules(db, imp) as u8]);
             match self_ty {
                 Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?),
-                None => {
-                    let all = trait_impls(db, trait_).all().iter();
-                    h.part(b"blanket").id(&entry(db, all)?.value())
-                }
+                None => h.part(b"blanket").id(&all_impls_value(db, trait_)?),
             };
         }
         None => {

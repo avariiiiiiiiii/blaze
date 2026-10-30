@@ -8,12 +8,15 @@
 //! whole program it was compiled with. A callee's edit changes the key of every function that
 //! imported it, and of no other.
 
+use std::cell::RefCell;
+
 use blaze_ids::{ContentId, Hasher};
 use serde::{Deserialize, Serialize};
 
 use crate::InstanceKey;
 
-pub const IMPORTS_DOMAIN: &str = "blaze v2 imports 1";
+/// 2: the fields are hashed as fixed-width little-endian bytes, not as JSON.
+pub const IMPORTS_DOMAIN: &str = "blaze v2 imports 2";
 
 /// What a function's `#[inline]` asks, as rustc tells LLVM.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -24,16 +27,31 @@ pub enum Hint {
     Never,
 }
 
-/// An argument at a call site, as far as the caller's IR knows it.
+/// An argument at a call site, as far as the caller's IR knows it. 16 bytes.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Arg {
     Unknown,
-    /// An integer or pointer-free constant of `bits` bits.
-    Int { bits: u8, value: u128 },
+    /// An integer or pointer-free constant of `bits` bits, at most 64.
+    Int { bits: u8, value: u64 },
+}
+
+const _: () = assert!(size_of::<Arg>() == 16);
+
+impl Arg {
+    /// Its bytes in [`Imports::blob_key`]: a tag, the width and the value, 10 in all.
+    fn encode(self, out: &mut Vec<u8>) {
+        match self {
+            Arg::Unknown => out.extend_from_slice(&[0; 10]),
+            Arg::Int { bits, value } => {
+                out.extend_from_slice(&[1, bits]);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
 }
 
 /// What LLVM's function attribute inference says of a function, which its callers may be
-/// compiled knowing.
+/// compiled knowing. 6 bytes; [`Attrs::bits`] packs it in one.
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub struct Attrs {
     pub nounwind: bool,
@@ -44,7 +62,38 @@ pub struct Attrs {
     pub noreturn: bool,
 }
 
-/// A call site of a function.
+const _: () = assert!(size_of::<Attrs>() == 6);
+
+impl Attrs {
+    pub const NOUNWIND: u8 = 1 << 0;
+    pub const READONLY: u8 = 1 << 1;
+    pub const READNONE: u8 = 1 << 2;
+    pub const NORECURSE: u8 = 1 << 3;
+    pub const WILLRETURN: u8 = 1 << 4;
+    pub const NORETURN: u8 = 1 << 5;
+
+    pub fn bits(self) -> u8 {
+        u8::from(self.nounwind) * Attrs::NOUNWIND
+            | u8::from(self.readonly) * Attrs::READONLY
+            | u8::from(self.readnone) * Attrs::READNONE
+            | u8::from(self.norecurse) * Attrs::NORECURSE
+            | u8::from(self.willreturn) * Attrs::WILLRETURN
+            | u8::from(self.noreturn) * Attrs::NORETURN
+    }
+
+    pub fn from_bits(bits: u8) -> Attrs {
+        Attrs {
+            nounwind: bits & Attrs::NOUNWIND != 0,
+            readonly: bits & Attrs::READONLY != 0,
+            readnone: bits & Attrs::READNONE != 0,
+            norecurse: bits & Attrs::NORECURSE != 0,
+            willreturn: bits & Attrs::WILLRETURN != 0,
+            noreturn: bits & Attrs::NORETURN != 0,
+        }
+    }
+}
+
+/// A call site of a function. 64 bytes, its `args` on the heap.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Call {
     pub callee: InstanceKey,
@@ -53,6 +102,8 @@ pub struct Call {
     /// Per parameter of the callee: what every one of these call sites passes, if they agree.
     pub args: Vec<Arg>,
 }
+
+const _: () = assert!(size_of::<Call>() == 64);
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Summary {
@@ -94,12 +145,49 @@ pub struct Imports {
 }
 
 impl Imports {
-    /// The store's key of the code compiled for `key` with these imports.
+    /// The store's key of the code compiled for `key` with these imports: one BLAKE3 over
+    /// every field laid out in a buffer the thread reuses.
     pub fn blob_key(&self, key: InstanceKey) -> ContentId {
-        let bytes = serde_json::to_vec(self).expect("imports are plain data");
-        let mut hasher = Hasher::new(IMPORTS_DOMAIN);
-        hasher.id(&key.0).part(&bytes);
-        hasher.finish()
+        thread_local! {
+            static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        BYTES.with_borrow_mut(|bytes| {
+            bytes.clear();
+            self.encode(bytes);
+            let mut hasher = Hasher::new(IMPORTS_DOMAIN);
+            hasher.id(&key.0).update(bytes);
+            hasher.finish()
+        })
+    }
+
+    /// Every field, each list as its length then its elements at fixed widths, little-endian:
+    /// two different `Imports` never give the same bytes.
+    fn encode(&self, out: &mut Vec<u8>) {
+        let len = |n: usize| (n as u32).to_le_bytes();
+        let dead: usize = self.dead.iter().map(|it| 36 + 4 * it.1.len()).sum();
+        out.reserve(16 + 32 * self.imported.len() + 14 * self.constants.len() + 33 * self.callees.len() + dead);
+        out.extend_from_slice(&len(self.imported.len()));
+        for key in &self.imported {
+            out.extend_from_slice(&key.0.0);
+        }
+        out.extend_from_slice(&len(self.constants.len()));
+        for &(param, arg) in &self.constants {
+            out.extend_from_slice(&param.to_le_bytes());
+            arg.encode(out);
+        }
+        out.extend_from_slice(&len(self.callees.len()));
+        for (key, attrs) in &self.callees {
+            out.extend_from_slice(&key.0.0);
+            out.push(attrs.bits());
+        }
+        out.extend_from_slice(&len(self.dead.len()));
+        for (key, params) in &self.dead {
+            out.extend_from_slice(&key.0.0);
+            out.extend_from_slice(&len(params.len()));
+            for param in params {
+                out.extend_from_slice(&param.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -133,5 +221,49 @@ mod tests {
         for it in [constant, attrs, dead] {
             assert_ne!(it.blob_key(key(1)), base);
         }
+    }
+
+    #[test]
+    fn the_key_tells_apart_what_json_did() {
+        let int = |bits, value| Arg::Int { bits, value };
+        let all = [
+            Imports::default(),
+            Imports { constants: vec![(0, int(32, 7))], ..Imports::default() },
+            Imports { constants: vec![(0, int(64, 7))], ..Imports::default() },
+            Imports { constants: vec![(1, int(32, 7))], ..Imports::default() },
+            Imports { constants: vec![(0, Arg::Unknown)], ..Imports::default() },
+            Imports { constants: vec![(0, int(0, 0))], ..Imports::default() },
+            Imports { dead: vec![(key(2), vec![])], ..Imports::default() },
+            Imports { dead: vec![(key(2), vec![0])], ..Imports::default() },
+            Imports { dead: vec![(key(2), vec![]), (key(3), vec![])], ..Imports::default() },
+            Imports { callees: vec![(key(2), Attrs::default())], ..Imports::default() },
+            Imports { callees: vec![(key(2), Attrs { noreturn: true, ..Attrs::default() })], ..Imports::default() },
+            Imports { imported: vec![key(2), key(3)], ..Imports::default() },
+            Imports { imported: vec![key(3), key(2)], ..Imports::default() },
+        ];
+        let keys: Vec<ContentId> = all.iter().map(|it| it.blob_key(key(1))).collect();
+        for (at, one) in keys.iter().enumerate() {
+            assert!(keys[at + 1..].iter().all(|other| other != one), "{at}");
+        }
+        assert_ne!(all[1].blob_key(key(1)), all[1].blob_key(key(2)));
+        // The buffer the thread reuses holds nothing over.
+        assert_eq!(all[11].blob_key(key(1)), all[11].clone().blob_key(key(1)));
+        assert_eq!(keys[0], Imports::default().blob_key(key(1)));
+    }
+
+    #[test]
+    fn attrs_round_trip_through_their_bits() {
+        for bits in 0..64u8 {
+            assert_eq!(Attrs::from_bits(bits).bits(), bits);
+        }
+        let one = Attrs { readonly: true, willreturn: true, ..Attrs::default() };
+        assert_eq!(one.bits(), Attrs::READONLY | Attrs::WILLRETURN);
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(size_of::<Arg>(), 16);
+        assert_eq!(size_of::<Attrs>(), 6);
+        assert_eq!(size_of::<Call>(), 64);
     }
 }

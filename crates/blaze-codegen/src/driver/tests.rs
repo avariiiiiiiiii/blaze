@@ -86,6 +86,7 @@ impl Frontend for Program {
             },
             symbol: function.symbol.clone(),
             refs,
+            built_in: Vec::new(),
         })
     }
 
@@ -119,6 +120,10 @@ struct Prepared {
     refs: usize,
 }
 
+fn bcmp() -> Target {
+    Target::Extern("bcmp".to_owned())
+}
+
 fn code(prepared: &Prepared) -> Vec<u8> {
     let mut code = vec![prepared.body];
     code.extend(std::iter::repeat_n([0xe8, 0, 0, 0, 0], prepared.refs).flatten());
@@ -147,7 +152,7 @@ impl Prepare for Machine {
         &self,
         unit: &Unit,
         _: &Spec,
-        prepared: &Prepared,
+        prepared: &mut Prepared,
         refs: &crate::template::Refs,
     ) -> Result<(Summary, u8), CodegenError> {
         self.summarized.fetch_add(1, Ordering::Relaxed);
@@ -184,7 +189,7 @@ impl Prepare for Machine {
         imports: Option<(&Imports, &[Import<'_, u8>])>,
     ) -> Result<Emitted, CodegenError> {
         self.emitted.fetch_add(1, Ordering::Relaxed);
-        let relocs = (0..prepared.refs)
+        let mut relocs: Vec<Reloc> = (0..prepared.refs)
             .map(|at| Reloc {
                 at: 2 + 5 * at as u32,
                 kind: RelocKind::PcRel32,
@@ -192,6 +197,12 @@ impl Prepare for Machine {
                 addend: -4,
             })
             .collect();
+        // A release compile calls `bcmp` of its own accord, as LLVM does for a `memcmp`.
+        let mut extra = Vec::new();
+        if imports.is_some() {
+            relocs.push(Reloc { at: 0, kind: RelocKind::PcRel32, target: bcmp(), addend: -4 });
+            extra.push("bcmp".to_owned());
+        }
         let mut code = code(&prepared);
         // What it built in shows in its code, as an import's body would.
         for import in imports.map_or(&[][..], |it| it.1) {
@@ -209,7 +220,7 @@ impl Prepare for Machine {
             unwind: None,
             lines: Vec::new(),
         };
-        Ok(Emitted { function, side: None })
+        Ok(Emitted { function, side: None, extra })
     }
 
     fn masked(&self, _: &Unit, _: &Prepared, _: &crate::template::Refs) -> Option<Masked> {
@@ -428,6 +439,8 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
     assert_eq!(machine.summarized.load(Ordering::Relaxed), 5);
     assert_eq!(cold.functions.len(), 5);
     assert!(cold.functions.iter().all(|it| it.arch == Arch::X86_64));
+    // What the backend called of its own accord is kept by name, though no reference lists it.
+    assert!(cold.functions.iter().all(|it| it.relocs.iter().any(|r| r.target == bcmp())));
     store.keep(&cold.puts);
 
     let warm = Machine::default();

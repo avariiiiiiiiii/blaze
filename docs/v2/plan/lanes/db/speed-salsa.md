@@ -95,6 +95,10 @@ level, so readers never wait: this meets concurrency.md.
    CAS too, so a reader and a reuser can't both win. The intrusive LRU list becomes a CLOCK
    sweep over the shard's values. `durability` is stored only when it rises. Hit: a shard
    mutex (two RMWs on a shared line) and a store become nothing shared.
+   It is the only new unsafe code here. It goes in one module with a safe API
+   (`interned/table.rs`) with a `// SAFETY:` on every block. Today's locked map stays in the
+   tests as the safe reference, and the CAS protocol is model-checked under shuttle
+   ([unsafe.md](../../design/unsafe.md)).
 3. **Small fixes**, each a few lines: skip the `last_interned_at` store for immortal values
    (nothing reads it); store `durability` only when it rises; in `add_read`, skip the hash
    when the edge equals the last one recorded; `SyncTable` shards at

@@ -1,9 +1,10 @@
 //! The disk as one input: a [`Watcher`] watches a directory through [`Effect::Watch`] and
 //! turns each change the driver reports into a transaction on one head, by the disk.
 //!
-//! - Each report becomes a batch: every path in it is looked at ([`Effect::Stat`], then
-//!   [`Effect::ReadAll`] for a file), and once all are read the batch is committed, batches in
-//!   the order they were told, so a later read of a file wins.
+//! - Each report becomes a batch: every path in it is looked at ([`Effect::Stat`] and
+//!   [`Effect::ReadAll`], asked together so a batch costs one round trip, the read's bytes
+//!   kept only if the stat says a file), and once all are in the batch is committed, batches
+//!   in the order they were told, so a later read of a file wins.
 //! - The disk is the truth for the paths it reports, but not over a transaction made since:
 //!   a path whose head changed after the report (by anyone but this watcher) is not taken and
 //!   is named ([`Watched::Conflict`]).
@@ -26,7 +27,7 @@ use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Commit, FILE_DOMAIN, Mode, Op, Vfs,
+    Commit, Mode, Op, Vfs,
     tree::{NodeId, Tree, ancestors},
 };
 
@@ -37,8 +38,8 @@ fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
     tree.entry(root, path).map(|(node, mode)| (tree.id(node), mode))
 }
 
-/// How many tags a watcher uses: its watch, its listing, then one per path being read, reused
-/// in turn.
+/// How many tags a watcher uses: its watch, its listing, then two per path being looked at
+/// (its stat, then its read), reused in turn.
 const TAGS: u64 = 1 << 32;
 const LIST: u64 = 1;
 const FIRST_READ: u64 = 2;
@@ -76,6 +77,27 @@ struct Slot {
     /// What the head had at `path` when the change was reported.
     was: Seen,
     disk: Option<Disk>,
+    /// The stat said a file: the read decides.
+    file_seen: bool,
+    /// The read, in before the stat.
+    early: Option<Result<Vec<u8>, IoError>>,
+}
+
+impl Slot {
+    fn new(path: String, file: FileName, was: Seen, disk: Option<Disk>, file_seen: bool) -> Slot {
+        Slot { path, file, was, disk, file_seen, early: None }
+    }
+
+    /// Takes the read of a path the stat said is a file.
+    fn read(&mut self, read: Result<Vec<u8>, IoError>, out: &mut Vec<Watched>) {
+        self.disk = Some(match read {
+            Ok(bytes) => Disk::File(bytes),
+            Err(error) => {
+                out.push(Watched::Unreadable { path: self.path.clone(), error });
+                Disk::Unreadable
+            }
+        });
+    }
 }
 
 struct Batch {
@@ -98,8 +120,9 @@ pub struct Watcher {
     /// Batches in the order their changes were told; the first is number `first`.
     batches: VecDeque<Batch>,
     first: u64,
-    /// By tag: the batch's number and the slot in it being read.
-    reading: FxHashMap<Tag, (u64, usize)>,
+    /// By a path's stat tag (its read's is the next): the batch's number, the slot in it, and
+    /// how many of its two effects are still in flight.
+    reading: FxHashMap<Tag, (u64, usize, u8)>,
     next_tag: u64,
     /// What this watcher's commits left at each path, while batches told before them wait.
     ours: FxHashMap<String, Seen>,
@@ -208,23 +231,40 @@ impl Watcher {
             self.drain(vfs, &mut out, effects);
             return out;
         }
-        let (batch, at) = self.reading.remove(&completion.tag).expect("a path being read");
-        let slot = &mut self.batches[(batch - self.first) as usize].slots[at];
-        slot.disk = Some(match completion.done {
-            Done::Stat(None) => Disk::Gone,
-            Done::Stat(Some(meta)) if meta.dir => Disk::Dir,
-            Done::Stat(Some(_)) => {
-                effects.push(Effect::ReadAll { file: slot.file.clone(), tag: completion.tag });
-                self.reading.insert(completion.tag, (batch, at));
-                return out;
-            }
-            Done::Read(bytes) => Disk::File(bytes),
-            Done::Failed(error) => {
+        let offset = completion.tag.0 - self.tags - FIRST_READ;
+        let (stat, read) = (Tag(completion.tag.0 - (offset & 1)), offset & 1 == 1);
+        let looking = self.reading.get_mut(&stat).expect("a path being looked at");
+        let (number, at) = (looking.0, looking.1);
+        looking.2 -= 1;
+        if looking.2 == 0 {
+            self.reading.remove(&stat);
+        }
+        // A read after its batch committed, or after the stat settled the path, is not needed.
+        let Some(batch) = number.checked_sub(self.first).and_then(|it| self.batches.get_mut(it as usize))
+        else {
+            return out;
+        };
+        let slot = &mut batch.slots[at];
+        if slot.disk.is_some() {
+            return out;
+        }
+        match (read, completion.done) {
+            (false, Done::Stat(None)) => slot.disk = Some(Disk::Gone),
+            (false, Done::Stat(Some(meta))) if meta.dir => slot.disk = Some(Disk::Dir),
+            (false, Done::Stat(Some(_))) => match slot.early.take() {
+                Some(early) => slot.read(early, &mut out),
+                None => slot.file_seen = true,
+            },
+            (false, Done::Failed(error)) => {
                 out.push(Watched::Unreadable { path: slot.path.clone(), error });
-                Disk::Unreadable
+                slot.disk = Some(Disk::Unreadable);
             }
-            done => unreachable!("a read of {} completed with {done:?}", slot.file),
-        });
+            (true, Done::Read(bytes)) if slot.file_seen => slot.read(Ok(bytes), &mut out),
+            (true, Done::Failed(error)) if slot.file_seen => slot.read(Err(error), &mut out),
+            (true, Done::Read(bytes)) => slot.early = Some(Ok(bytes)),
+            (true, Done::Failed(error)) => slot.early = Some(Err(error)),
+            (_, done) => unreachable!("a look at {} completed with {done:?}", slot.file),
+        }
         self.drain(vfs, &mut out, effects);
         out
     }
@@ -250,13 +290,13 @@ impl Watcher {
         vfs.flush(effects);
     }
 
-    /// A tag for one path's read.
-    fn read_tag(&mut self, number: u64, at: usize) -> Tag {
-        let tag = Tag(self.tags + FIRST_READ + self.next_tag);
-        self.next_tag = (self.next_tag + 1) % (TAGS - FIRST_READ);
-        assert!(!self.reading.contains_key(&tag), "2^32 paths are being read at once");
-        self.reading.insert(tag, (number, at));
-        tag
+    /// The tags for one path's stat and read, `outstanding` of which are asked for.
+    fn look_tags(&mut self, number: u64, at: usize, outstanding: u8) -> (Tag, Tag) {
+        let stat = Tag(self.tags + FIRST_READ + self.next_tag);
+        self.next_tag = (self.next_tag + 2) % (TAGS - FIRST_READ);
+        assert!(!self.reading.contains_key(&stat), "2^31 paths are being looked at at once");
+        self.reading.insert(stat, (number, at, outstanding));
+        (stat, Tag(stat.0 + 1))
     }
 
     /// Where in `batches` the scan whose listing is in flight waits.
@@ -281,10 +321,11 @@ impl Watcher {
             let Some(path) = file.as_str().strip_prefix(&below) else { continue };
             let path = path.to_owned();
             on_disk.insert(path.clone());
-            let tag = self.read_tag(number, slots.len());
+            // The listing said a file: only its read is asked.
+            let (_, tag) = self.look_tags(number, slots.len(), 1);
             effects.push(Effect::ReadAll { file: file.clone(), tag });
             let was = seen(&vfs.tree, head, &path);
-            slots.push(Slot { path, file, was, disk: None });
+            slots.push(Slot::new(path, file, was, None, true));
         }
         for (path, node, mode) in vfs.tree.files(head, Mode::Regular, "") {
             if on_disk.contains(&path) {
@@ -292,7 +333,7 @@ impl Watcher {
             }
             let file = FileName::new(&format!("{below}{path}")).expect("a head's path is a name");
             let was = Some((vfs.tree.id(node), mode));
-            slots.push(Slot { path, file, was, disk: Some(Disk::Gone) });
+            slots.push(Slot::new(path, file, was, Some(Disk::Gone), false));
         }
         let batch = &mut self.batches[place];
         batch.slots = slots;
@@ -309,9 +350,10 @@ impl Watcher {
             let Some(path) = file.as_str().strip_prefix(&below) else { continue };
             let path = path.to_owned();
             let was = seen(&vfs.tree, head, &path);
-            let tag = self.read_tag(number, slots.len());
-            effects.push(Effect::Stat { file: file.clone(), tag });
-            slots.push(Slot { path, file, was, disk: None });
+            let (stat, read) = self.look_tags(number, slots.len(), 2);
+            effects.push(Effect::Stat { file: file.clone(), tag: stat });
+            effects.push(Effect::ReadAll { file: file.clone(), tag: read });
+            slots.push(Slot::new(path, file, was, None, false));
         }
         if !slots.is_empty() {
             self.batches.push_back(Batch { slots, scan: false, waiting: false });
@@ -350,7 +392,9 @@ impl Watcher {
                         deletes.push(slot.path.clone());
                     }
                     let mode = entry.filter(|_| is_file).map_or(Mode::Regular, |it| it.1);
-                    if now != Some((ContentId::of(FILE_DOMAIN, &bytes), mode)) {
+                    // Compared in place, not hashed: the commit hashes what it writes, once.
+                    let same = node.filter(|_| is_file).and_then(|it| tree.bytes(it)).is_some_and(|it| **it == *bytes);
+                    if !same {
                         writes.push((slot.path.clone(), bytes, mode));
                     }
                 }

@@ -1,0 +1,205 @@
+//! The items lane's hashes as the code generator asks for them, over fixtures: what an edit
+//! changes and what it keeps.
+
+#[path = "../tests/db.rs"]
+mod db;
+
+use base_db::SourceDatabase;
+use blaze_ids::ContentId;
+use blaze_items::{CodeHash, ItemId};
+use hir_def::{
+    FunctionId, ModuleDefId, TypeAliasId,
+    expr_store::Body as BodyStore,
+    nameres::crate_def_map,
+    signatures::{FunctionSignature, TypeAliasSignature},
+};
+use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
+use hir_ty_mir::mir::MirSpan;
+use test_fixture::WithFixture;
+
+use super::ItemHashes;
+use crate::v2::{Body, Hashes};
+use db::TestDB;
+
+fn hashes() -> ItemHashes {
+    ItemHashes::new(Box::new(|_| None))
+}
+
+/// The database of `//- minicore: {minicore}` and `text`, and the file `text` is, to edit.
+fn fixture(minicore: &str, text: &str) -> (TestDB, base_db::FileId) {
+    let (db, file) = TestDB::with_single_file(&format!("//- minicore: {minicore}\n{text}"));
+    let file = file.file_id(&db);
+    (db, file)
+}
+
+fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
+    crate_def_map(db, db.test_crate())
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
+        .collect()
+}
+
+#[track_caller]
+fn function(db: &TestDB, name: &str) -> FunctionId {
+    let found: Vec<FunctionId> = declarations(db)
+        .into_iter()
+        .filter_map(|def| match def {
+            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
+            _ => None,
+        })
+        .collect();
+    match found[..] {
+        [one] => one,
+        _ => panic!("{} functions named `{name}`", found.len()),
+    }
+}
+
+#[track_caller]
+fn alias(db: &TestDB, name: &str) -> TypeAliasId {
+    let found: Vec<TypeAliasId> = declarations(db)
+        .into_iter()
+        .filter_map(|def| match def {
+            ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
+            _ => None,
+        })
+        .collect();
+    match found[..] {
+        [one] => one,
+        _ => panic!("{} type aliases named `{name}`", found.len()),
+    }
+}
+
+#[track_caller]
+fn code(db: &TestDB, name: &str) -> CodeHash {
+    hashes()
+        .code(db, Body::Item(function(db, name).into()))
+        .unwrap_or_else(|e| panic!("the code of `{name}`: {e}"))
+}
+
+/// The content of the type alias `name` stands for.
+#[track_caller]
+fn ty(db: &TestDB, name: &str) -> ContentId {
+    let alias = alias(db, name);
+    hir_ty::attach_db(db, || {
+        let ty = db.ty(TyDefId::TypeAliasId(alias)).skip_binder();
+        hashes().ty(db, ty).unwrap_or_else(|e| panic!("the type `{name}`: {e}"))
+    })
+}
+
+const CALLS: &str = r#"
+pub struct Vec<T> { ptr: *const T, len: usize }
+pub type Bytes = Vec<u8>;
+pub type Words = Vec<u16>;
+pub type AlsoBytes = Bytes;
+pub fn callee() -> u32 { 1 }
+pub fn caller() -> u32 { callee() }
+"#;
+
+#[test]
+fn two_runs_of_one_source_give_one_key() {
+    let (a, _) = fixture("sized", CALLS);
+    let (b, _) = fixture("sized", CALLS);
+    let h = hashes();
+    for name in ["callee", "caller"] {
+        assert_eq!(
+            h.item(&a, ItemId::Function(function(&a, name))),
+            h.item(&b, ItemId::Function(function(&b, name))),
+        );
+        assert_eq!(code(&a, name), code(&b, name), "the code of `{name}`");
+    }
+    for name in ["Bytes", "Words"] {
+        assert_eq!(ty(&a, name), ty(&b, name), "the type `{name}`");
+    }
+    assert_eq!(ty(&a, "Bytes"), ty(&a, "Bytes"), "one run asked twice");
+}
+
+#[test]
+fn a_callee_body_edit_keeps_its_callers_code_and_an_interface_edit_does_not() {
+    let (mut db, file) = fixture("sized", CALLS);
+    let (callee, caller) = (code(&db, "callee"), code(&db, "caller"));
+
+    db.set_file_text(file, &CALLS.replace("{ 1 }", "{ 2 }"));
+    assert_ne!(code(&db, "callee"), callee, "the callee's body is its code");
+    assert_eq!(code(&db, "caller"), caller, "a caller takes its callee by its interface");
+
+    db.set_file_text(file, &CALLS.replace("pub fn callee", "pub(crate) fn callee"));
+    assert_ne!(code(&db, "caller"), caller, "a callee's interface is in its callers' code");
+}
+
+#[test]
+fn a_type_is_its_arguments_and_not_its_alias() {
+    let (db, _) = fixture("sized", CALLS);
+    assert_ne!(ty(&db, "Bytes"), ty(&db, "Words"));
+    assert_eq!(ty(&db, "Bytes"), ty(&db, "AlsoBytes"));
+}
+
+const DROPS: &str = r#"
+pub struct Inner(pub u32);
+pub struct Outer { pub inner: Inner }
+pub type Held = Outer;
+"#;
+
+#[test]
+fn a_drop_impl_of_a_fields_type_is_in_the_type() {
+    let (mut db, file) = fixture("sized, drop", DROPS);
+    let held = ty(&db, "Held");
+
+    db.set_file_text(file, &format!("{DROPS}pub fn unrelated() {{}}\n"));
+    assert_eq!(ty(&db, "Held"), held, "an item the type does not reach is not in it");
+
+    db.set_file_text(file, &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"));
+    assert_ne!(ty(&db, "Held"), held, "drop glue of `Outer` drops an `Inner`");
+}
+
+#[test]
+fn a_constant_is_its_value() {
+    let (db, _) = fixture("sized", CALLS);
+    let krate = db.test_crate();
+    let h = hashes();
+    let konst = |value: u128| {
+        hir_ty::attach_db(&db, || {
+            h.konst(&db, usize_const(&db, Some(value), krate)).unwrap_or_else(|e| panic!("{e}"))
+        })
+    };
+    assert_eq!(konst(1), konst(1));
+    assert_ne!(konst(1), konst(2));
+}
+
+const SPANNED: &str = r#"
+pub fn f(x: u32) -> u32 { x + 1 }
+"#;
+
+#[test]
+fn a_span_is_its_place_in_its_owner_and_formatting_keeps_it() {
+    let (mut db, file) = fixture("sized", SPANNED);
+    let h = hashes();
+    let at = |db: &TestDB| {
+        let owner = function(db, "f").into();
+        let root = BodyStore::of(db, owner).root_expr();
+        let start = h.span(db, owner, MirSpan::ExprId(root)).expect("a span");
+        let end = h.span(db, owner, MirSpan::ExprEnd(root)).expect("a span");
+        (owner, root, start, end)
+    };
+    let (owner, root, start, end) = at(&db);
+    assert_ne!(start.anchor, end.anchor, "an expression's start and end are in two tables");
+    let tables = ItemHashes::span_tables(&db, owner);
+    let (_, spans) = tables.iter().find(|(anchor, _)| *anchor == start.anchor).expect("its table");
+    assert_eq!(spans[start.index as usize], MirSpan::ExprId(root));
+
+    db.set_file_text(file, "\n// a comment\npub fn f(x: u32) -> u32 {\n    x  +  1\n}\n");
+    let (_, _, moved, moved_end) = at(&db);
+    assert_eq!((moved, moved_end), (start, end));
+}
+
+#[test]
+fn a_file_the_build_did_not_name_is_an_error() {
+    let (db, file) = fixture("sized", SPANNED);
+    let error = hashes().file_name(&db, file).expect_err("no name");
+    assert!(error.contains(&format!("{file:?}")), "{error}");
+    let named = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
+    assert_eq!(named.file_name(&db, file).as_deref(), Ok("src/lib.rs"));
+}

@@ -138,7 +138,7 @@ pub(crate) fn again(
         current_dir.to_owned(),
     );
     COMPARING.with(|it| it.set(false));
-    COUNTS.compared[crate::kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    COUNTS.compared[crate::kind_byte(kind) as usize].fetch_add(1, Ordering::Relaxed);
     let same = match (toolchain, &ours) {
         (Ok(theirs), Ok(ours)) => theirs == ours,
         (Err(theirs), Err(ours)) => {

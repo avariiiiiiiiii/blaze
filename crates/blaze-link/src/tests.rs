@@ -45,6 +45,7 @@ fn output(incremental: bool) -> Output {
         debug: Debug::None,
         live: None,
         tags: 1 << 32,
+        windows_subsystem: false,
         stack: None,
     }
 }

@@ -33,6 +33,7 @@ use std::{
 
 use blaze_api::{ApiError, Request, Response, ViewRef, client::Client};
 use blaze_vfs::{Op, View};
+use rustc_hash::FxHashMap;
 
 use crate::{
     CheckRun,
@@ -124,13 +125,25 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
     let mut service = Service::new(Settings::of(config), state, &mut out);
     let mut workers = BTreeMap::new();
     loop {
+        let mut changed = false;
         for output in out.drain(..) {
-            dispatch(config, &shared, &to_github, &mut workers, output);
+            dispatch(config, &shared, &to_github, &mut workers, &mut changed, output);
+        }
+        if changed && let Err(what) = save(&config.state, service.state()) {
+            log(&what);
         }
         let input = inputs.recv().map_err(|_| "every thread feeding the service ended".to_owned())?;
-        service.step(now(), input, &mut out);
+        let now = now();
+        service.step(now, input, &mut out);
+        for input in inputs.try_iter().take(MOST_STEPS - 1) {
+            service.step(now, input, &mut out);
+        }
     }
 }
+
+/// The most inputs the service takes before doing what they said: a burst of responses is
+/// stepped through at once, and the state it changed is written once (one fsync), not once each.
+const MOST_STEPS: usize = 1024;
 
 /// A post to GitHub.
 pub(crate) enum Post {
@@ -138,11 +151,13 @@ pub(crate) enum Post {
     Update { run: RunId, id: u64, check: CheckRun },
 }
 
+/// Does `output`; [`Output::Save`] only sets `changed`, so the state is written once for many.
 fn dispatch(
     config: &Config,
     shared: &Arc<Shared>,
     to_github: &mpsc::Sender<Post>,
     workers: &mut BTreeMap<JobId, mpsc::Sender<worker::Command>>,
+    changed: &mut bool,
     output: Output,
 ) {
     match output {
@@ -184,11 +199,7 @@ fn dispatch(
         Output::Update { run, id, check } => {
             let _ = to_github.send(Post::Update { run, id, check });
         }
-        Output::Save(state) => {
-            if let Err(what) = save(&config.state, &state) {
-                log(&what);
-            }
-        }
+        Output::Save => *changed = true,
         Output::Snapshot { name } => {
             let socket = config.daemon.socket.clone();
             let snapshot = config.snapshot.clone();
@@ -234,41 +245,67 @@ fn take_snapshot(socket: &Path, config: &SnapshotConfig, name: &str) -> Result<s
 
 /// Posts check runs in order, each tried [`GITHUB_RETRIES`] times more with backoff from
 /// `backoff`; a run that never posts is logged by name.
+///
+/// Whatever is waiting is taken at once, and an update with a later update of the same check
+/// run behind it is never sent: an update carries the run's whole state, so the later one says
+/// all of it. A run that goes queued, in progress and done while an earlier post is retried, or
+/// while its creation is answered, costs one request, not three.
 pub(crate) fn post(
     github: Arc<Mutex<impl Checks>>,
     posts: mpsc::Receiver<Post>,
     service: mpsc::Sender<Input>,
     backoff: Duration,
 ) {
-    for post in posts {
-        match post {
-            Post::Create { run, check } => {
-                let result = retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).create(&check));
-                let result = result.map_err(|error| {
-                    let what = format!(
-                        "creating check run {} on {} failed {} times: {error}",
-                        check.name,
-                        check.commit,
-                        GITHUB_RETRIES + 1
-                    );
-                    log(&what);
-                    what
-                });
-                let _ = service.send(Input::Created { run, result });
+    let mut waiting: Vec<Post> = Vec::new();
+    let mut last: FxHashMap<u64, usize> = FxHashMap::default();
+    while let Ok(first) = posts.recv() {
+        waiting.push(first);
+        waiting.extend(posts.try_iter());
+        last.clear();
+        for (at, post) in waiting.iter().enumerate() {
+            if let Post::Update { id, .. } = post {
+                last.insert(*id, at);
             }
-            Post::Update { run, id, check } => {
-                let result =
-                    retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).update(id, &check));
-                if let Err(error) = result {
-                    log(&format!(
-                        "updating check run {} ({id}, run {}) on {} to {:?} failed {} times: {error}",
-                        check.name,
-                        run.0,
-                        check.commit,
-                        check.status,
-                        GITHUB_RETRIES + 1
-                    ));
-                }
+        }
+        for (at, post) in waiting.drain(..).enumerate() {
+            if let Post::Update { id, .. } = &post
+                && last.get(id) != Some(&at)
+            {
+                continue;
+            }
+            send(&*github, post, &service, backoff);
+        }
+    }
+}
+
+/// One post, retried; a creation's id goes back to the service.
+fn send(github: &Mutex<impl Checks>, post: Post, service: &mpsc::Sender<Input>, backoff: Duration) {
+    match post {
+        Post::Create { run, check } => {
+            let result = retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).create(&check));
+            let result = result.map_err(|error| {
+                let what = format!(
+                    "creating check run {} on {} failed {} times: {error}",
+                    check.name,
+                    check.commit,
+                    GITHUB_RETRIES + 1
+                );
+                log(&what);
+                what
+            });
+            let _ = service.send(Input::Created { run, result });
+        }
+        Post::Update { run, id, check } => {
+            let result = retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).update(id, &check));
+            if let Err(error) = result {
+                log(&format!(
+                    "updating check run {} ({id}, run {}) on {} to {:?} failed {} times: {error}",
+                    check.name,
+                    run.0,
+                    check.commit,
+                    check.status,
+                    GITHUB_RETRIES + 1
+                ));
             }
         }
     }
@@ -289,9 +326,10 @@ fn retry<T>(backoff: Duration, mut attempt: impl FnMut() -> Result<T, GitHubErro
 }
 
 /// `ops` cut into requests of at most `most` bytes each, in order; always at least one, maybe
-/// empty. A file too large for one is written in pieces: a [`Op::Write`] of its start, then
-/// [`Op::Edit`]s appending the rest.
-pub(crate) fn batches(ops: &[Op], most: usize) -> Result<Vec<Vec<Op>>, String> {
+/// empty. Each op is moved into its batch, never copied. A file too large for one is written in
+/// pieces: a [`Op::Write`] of its start, which keeps the file's own buffer, then [`Op::Edit`]s
+/// appending the rest, the only bytes copied.
+pub(crate) fn batches(ops: Vec<Op>, most: usize) -> Result<Vec<Vec<Op>>, String> {
     let mut batches = vec![Vec::new()];
     let mut size = 0;
     let mut add = |op: Op, cost: usize, batches: &mut Vec<Vec<Op>>| {
@@ -303,26 +341,33 @@ pub(crate) fn batches(ops: &[Op], most: usize) -> Result<Vec<Vec<Op>>, String> {
         batches.last_mut().expect("one at least").push(op);
     };
     for op in ops {
+        let cost = match &op {
+            Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => path.len() + bytes.len() + OP_OVERHEAD,
+            Op::Delete { path } => path.len() + OP_OVERHEAD,
+            Op::Rename { from, to } => from.len() + to.len() + OP_OVERHEAD,
+        };
         match op {
-            Op::Write { path, bytes, mode } if path.len() + bytes.len() + OP_OVERHEAD > most => {
+            Op::Write { path, mut bytes, mode } if cost > most => {
                 let piece = most.checked_sub(path.len() + OP_OVERHEAD).filter(|it| *it > 0).ok_or_else(|| {
                     format!("the path {path} is too long for a request of the daemon's")
                 })?;
-                let mut pieces = bytes.chunks(piece);
-                let first = pieces.next().unwrap_or_default().to_vec();
-                let mut at = first.len() as u64;
-                add(Op::Write { path: path.clone(), bytes: first, mode: *mode }, most, &mut batches);
-                for piece in pieces {
-                    let edit = Op::Edit { path: path.clone(), at, len: 0, bytes: piece.to_vec() };
-                    at += piece.len() as u64;
+                let first = piece.min(bytes.len());
+                let mut at = first as u64;
+                let edits: Vec<Op> = bytes[first..]
+                    .chunks(piece)
+                    .map(|piece| {
+                        let edit = Op::Edit { path: path.clone(), at, len: 0, bytes: piece.to_vec() };
+                        at += piece.len() as u64;
+                        edit
+                    })
+                    .collect();
+                bytes.truncate(first);
+                add(Op::Write { path, bytes, mode }, most, &mut batches);
+                for edit in edits {
                     add(edit, most, &mut batches);
                 }
             }
-            Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => {
-                add(op.clone(), path.len() + bytes.len() + OP_OVERHEAD, &mut batches);
-            }
-            Op::Delete { path } => add(op.clone(), path.len() + OP_OVERHEAD, &mut batches),
-            Op::Rename { from, to } => add(op.clone(), from.len() + to.len() + OP_OVERHEAD, &mut batches),
+            op => add(op, cost, &mut batches),
         }
     }
     Ok(batches)

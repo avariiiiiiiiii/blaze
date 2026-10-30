@@ -20,7 +20,8 @@
 //! `compiler/rustc_expand/src/config.rs` (`StripUnconfigured`: what `cfg` removes before any
 //! lint sees it) (MIT or Apache-2.0).
 
-mod attrs;
+/// `pub(crate)` for its table of rustc's language features, which `crate::checks` reads too.
+pub(crate) mod attrs;
 mod check_cfg;
 mod delims;
 mod early;
@@ -66,18 +67,33 @@ pub(crate) enum Pass {
     Post,
 }
 
-/// A lint found by one of this module's parts, and when rustc emits it.
+/// A diagnostic found by one of this module's parts, and when rustc emits it.
 #[derive(Clone, Debug)]
 pub(crate) struct Emitted {
     pub(crate) found: Found,
     pub(crate) pass: Pass,
+    /// The node rustc's walk emits it at; with none, it comes before those of its pass that
+    /// have one (what resolution says as it runs, before the early lint pass).
+    pub(crate) place: Option<InFile<SyntaxNodePtr>>,
 }
 
 impl Emitted {
     /// The lint `diag` of `phase`, its level decided at `at`, emitted in `pass` as rustc's walk
     /// comes to `at`.
     pub(crate) fn new(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
-        Emitted { found: Found::lint(diag, phase, at), pass }
+        Emitted { found: Found::lint(diag, phase, at), pass, place: Some(at) }
+    }
+
+    /// `diag`, an error or warning that is no lint's, emitted in `pass` as rustc's walk comes
+    /// to `at` (E0783 of the early lint pass).
+    pub(crate) fn placed(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
+        Emitted { found: Found::new(diag, phase), pass, place: Some(at) }
+    }
+
+    /// `diag`, an error or warning that is no lint's, emitted in `pass` before the walk (the
+    /// label-shadowing warning of late resolution).
+    pub(crate) fn unplaced(diag: Diag, phase: Phase, pass: Pass) -> Emitted {
+        Emitted { found: Found::new(diag, phase), pass, place: None }
     }
 }
 
@@ -365,8 +381,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
     emitted.extend(attrs::lints(cx, &walk));
     let mut keyed: Vec<_> = emitted
         .into_iter()
-        .map(|Emitted { found, pass }| {
-            let place = found.lint_at.clone().map(|at| walk.place(cx, at, pass)).unwrap_or_default();
+        .map(|Emitted { found, pass, place }| {
+            let place = place.map(|at| walk.place(cx, at, pass)).unwrap_or_default();
             let rank = found.diag.lint_name().map_or(EARLY_PASSES.len(), pass_rank);
             ((found.phase, pass != Pass::PreExpansion, place, pass, rank), found)
         })

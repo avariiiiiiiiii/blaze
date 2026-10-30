@@ -37,6 +37,7 @@ use rustc_hash::FxHashMap;
 use crate::{Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag};
 
 const OP_FSYNC: u8 = 3;
+const OP_WRITE_FIXED: u8 = 5;
 const OP_POLL_ADD: u8 = 6;
 const OP_TIMEOUT: u8 = 11;
 const OP_ACCEPT: u8 = 13;
@@ -46,21 +47,71 @@ const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
 const OP_RECV: u8 = 27;
+const OP_SHUTDOWN: u8 = 34;
+const OP_RENAMEAT: u8 = 35;
 
+const SETUP_SQPOLL: u32 = 1 << 1;
 const SETUP_CQSIZE: u32 = 1 << 3;
 const SETUP_SUBMIT_ALL: u32 = 1 << 7;
 const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
-const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 const FEAT_SINGLE_MMAP: u32 = 1 << 0;
+const FEAT_NODROP: u32 = 1 << 1;
+const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
 const FEAT_EXT_ARG: u32 = 1 << 8;
 const ENTER_GETEVENTS: u32 = 1 << 0;
+const ENTER_SQ_WAKEUP: u32 = 1 << 1;
 const ENTER_EXT_ARG: u32 = 1 << 3;
+/// In the submission ring's flags: the kernel's thread sleeps, to be woken by an enter.
+const SQ_NEED_WAKEUP: u32 = 1 << 0;
+/// In the submission ring's flags: completions wait in the kernel for room, flushed by an
+/// enter that gets events.
+const SQ_CQ_OVERFLOW: u32 = 1 << 1;
 const OFF_SQ_RING: libc::off_t = 0;
 const OFF_SQES: libc::off_t = 0x1000_0000;
+/// How long the kernel's submission thread spins for work before it sleeps: an idle daemon
+/// burns nothing, a busy one makes no system call to submit.
+const SQ_THREAD_IDLE_MS: u32 = 50;
+
+const SQE_FIXED_FILE: u8 = 1 << 0;
+const SQE_IO_LINK: u8 = 1 << 2;
+const SQE_BUFFER_SELECT: u8 = 1 << 5;
 /// In an accept's `ioprio`: one request takes every connection until it is cancelled.
 const ACCEPT_MULTISHOT: u16 = 1 << 0;
+/// In a receive's `ioprio`: one request receives until it is cancelled or runs out of buffers.
+const RECV_MULTISHOT: u16 = 1 << 1;
+/// In an accept's file index: the kernel picks a free slot of the table's range for it.
+const FILE_INDEX_ALLOC: u32 = u32::MAX;
+/// In a completion's flags: it used the provided buffer named in the flags' upper half.
+const CQE_F_BUFFER: u32 = 1 << 0;
 /// In a completion's flags: the request goes on and will complete again.
 const CQE_F_MORE: u32 = 1 << 1;
+const CQE_BUFFER_SHIFT: u32 = 16;
+
+const REGISTER_FILES2: libc::c_uint = 13;
+const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
+const REGISTER_BUFFERS2: libc::c_uint = 15;
+const REGISTER_PBUF_RING: libc::c_uint = 22;
+const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
+const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
+
+/// The most slots of the table of registered files; fewer where `RLIMIT_NOFILE` is lower,
+/// which the kernel holds the table to.
+const TABLE: u32 = 1 << 16;
+/// Registered buffers for writes that bypass the page cache, each a piece of such a write.
+const DIRECT_BUFFERS: u16 = 4;
+const DIRECT_PIECE: usize = 1 << 20;
+/// A write at an offset of at least this many bytes, aligned to its file system's blocks,
+/// bypasses the page cache (`O_DIRECT`).
+const DIRECT_LEAST: usize = 1 << 20;
+/// The provided buffers a connection's receives take from, and the size of each.
+const RECV_BUFFERS: u16 = 64;
+const RECV_BUFFER: usize = 16 << 10;
+const RECV_GROUP: u16 = 0;
+/// Bytes received and not yet asked for, past which a connection stops receiving until they
+/// are taken.
+const INBOX: usize = 4 << 20;
+/// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
+const STATX_DIOALIGN: u32 = 0x2000;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
 /// driver until there is room.

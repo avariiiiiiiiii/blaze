@@ -13,7 +13,9 @@ use span::TextSize;
 mod change;
 mod content;
 mod editioned_file_id;
+mod files;
 mod input;
+mod table;
 pub mod target;
 #[cfg(test)]
 mod tests;
@@ -21,17 +23,16 @@ mod view;
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
-    hash::BuildHasherDefault,
     panic,
     str::FromStr as _,
-    sync::{Mutex, Once, atomic::AtomicUsize},
+    sync::{Once, atomic::AtomicUsize},
 };
 
 pub use crate::{
     change::FileChange,
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
     editioned_file_id::EditionedFileId,
+    files::Files,
     input::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
         CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CratesIdMap, CratesMap,
@@ -42,12 +43,10 @@ pub use crate::{
 };
 pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
-use dashmap::{DashMap, mapref::entry::Entry};
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::FxHashSet;
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
-use vfs::AbsPath;
 pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
@@ -78,518 +77,6 @@ macro_rules! impl_intern_key {
 pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
 pub const DEFAULT_PARSE_LRU_CAP: u16 = 128;
 pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
-
-#[derive(Debug, Default)]
-pub struct Files {
-    files: Arc<DashMap<vfs::FileId, FileText, BuildHasherDefault<FxHasher>>>,
-    /// The inputs of files that had text and lost it (bytes that are not UTF-8), kept so that
-    /// what read them reruns if they get text again.
-    without_text: Arc<DashMap<vfs::FileId, FileText, BuildHasherDefault<FxHasher>>>,
-    source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
-    /// The content IDs of each source root's files, from which its own is kept.
-    root_contents: Arc<DashMap<SourceRootId, RootContent, BuildHasherDefault<FxHasher>>>,
-    /// The source roots whose [`RootContent`] has each file.
-    in_roots: Arc<DashMap<vfs::FileId, Vec<SourceRootId>, BuildHasherDefault<FxHasher>>>,
-    /// Every path a source root has named, with its file: a path keeps its file for good.
-    by_path: Arc<DashMap<VfsPath, vfs::FileId, BuildHasherDefault<FxHasher>>>,
-    /// The blaze-vfs content ID each file was last set from by [`Files::set_view_root`].
-    view_ids: Arc<DashMap<vfs::FileId, ContentId, BuildHasherDefault<FxHasher>>>,
-    /// Where [`Files::set_view_root`] starts looking for an unused file ID.
-    next_file: Arc<Mutex<u32>>,
-    file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
-    included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
-    /// Which crate's `include_bytes!` or `include_str!` read which of those.
-    included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
-    /// Files an `include!` or a module declaration named that are not in the VFS, with the
-    /// source root of the file that names them.
-    included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
-    /// Which crate named which of those: a file is shared by crates through `#[path]`, so the
-    /// source root of the file naming one does not tell the crates that did.
-    sources_included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
-    /// Directories whose files are read from another directory: a checkout that is looked at
-    /// as the one it was loaded as with other contents.
-    views: Arc<std::sync::RwLock<Vec<View>>>,
-    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
-    env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
-    /// The variables `env!` has found unset, by the crate asking.
-    env_unset: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
-}
-
-#[derive(Debug)]
-struct View {
-    base: std::path::PathBuf,
-    over: std::path::PathBuf,
-    built: Vec<std::path::PathBuf>,
-}
-
-impl Files {
-    pub fn file_text(&self, file_id: vfs::FileId) -> FileText {
-        match self.files.get(&file_id) {
-            Some(text) => *text,
-            None => {
-                panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
-            }
-        }
-    }
-
-    /// Whether the file was loaded as text. A file of the VFS that is not UTF-8 has an id and
-    /// no text.
-    pub fn has_file_text(&self, file_id: vfs::FileId) -> bool {
-        self.files.contains_key(&file_id)
-    }
-
-    pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
-        self.set_text(db, file_id, Some(text), None);
-    }
-
-    pub fn set_file_text_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        file_id: vfs::FileId,
-        text: &str,
-        durability: Durability,
-    ) {
-        self.set_text(db, file_id, Some(text), Some(durability));
-    }
-
-    /// Sets the module the compiler appends to the crate root `file_id`'s text, see
-    /// [`FileText::appended_root_module`]. Writes nothing if it is that already.
-    pub fn set_appended_root_module(
-        &self,
-        db: &mut dyn SourceDatabase,
-        file_id: vfs::FileId,
-        module: Option<&'static str>,
-        durability: Durability,
-    ) {
-        let input = self.file_text(file_id);
-        if input.appended_root_module(&*db) == module {
-            return;
-        }
-        let content = FileText::content_of(input.text(&*db), module);
-        input.set_appended_root_module_field(db).with_durability(durability).to(module);
-        input.set_content_field(db).with_durability(durability).to(InputId(content));
-        let mut changed = Vec::new();
-        self.index_file(file_id, content, &mut changed);
-        self.write_root_contents(db, &changed);
-    }
-
-    /// Sets a file's text from outside a view: what it was set from by a view is forgotten.
-    fn set_text(
-        &self,
-        db: &mut dyn SourceDatabase,
-        file_id: vfs::FileId,
-        text: Option<&str>,
-        durability: Option<Durability>,
-    ) {
-        self.view_ids.remove(&file_id);
-        let text = text.map(|text| (text, ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes())));
-        let content = self.write_text(db, file_id, text, durability);
-        let mut changed = Vec::new();
-        self.index_file(file_id, content, &mut changed);
-        self.write_root_contents(db, &changed);
-    }
-
-    /// Sets the text of `file_id`, given with the blaze-vfs ID of its bytes, or that it has none
-    /// (`None`), with its content ID, and returns that ID. The source roots that have the file
-    /// are left to the caller.
-    fn write_text(
-        &self,
-        db: &mut dyn SourceDatabase,
-        file_id: vfs::FileId,
-        text: Option<(&str, ContentId)>,
-        durability: Option<Durability>,
-    ) -> ContentId {
-        let Some((text, file)) = text else {
-            // Nothing reads the text left behind: `file_text` no longer has the file.
-            if let Some((_, input)) = self.files.remove(&file_id) {
-                set(input.set_text_field(db), durability, Arc::from(""));
-                set(input.set_content_field(db), durability, InputId(FileText::no_text()));
-                self.without_text.insert(file_id, input);
-            }
-            return FileText::no_text();
-        };
-        let existing = match self.files.get(&file_id).map(|it| *it) {
-            Some(input) => Some(input),
-            None => self.without_text.remove(&file_id).map(|(_, input)| input),
-        };
-        match existing {
-            Some(input) => {
-                let content = FileText::content_of_file(file, input.appended_root_module(&*db));
-                set(input.set_text_field(db), durability, Arc::from(text));
-                if input.content(&*db) != content {
-                    set(input.set_content_field(db), durability, InputId(content));
-                }
-                self.files.insert(file_id, input);
-                content
-            }
-            None => {
-                let content = FileText::content_of_file(file, None);
-                let builder = FileText::builder(Arc::from(text), file_id, InputId(content));
-                let builder = match durability {
-                    Some(durability) => builder.durability(durability),
-                    None => builder,
-                };
-                self.files.insert(file_id, builder.new(&*db));
-                content
-            }
-        }
-    }
-
-    /// The content ID `file` has in a source root.
-    fn entry_content(&self, db: &dyn SourceDatabase, file: vfs::FileId) -> ContentId {
-        match self.files.get(&file).map(|it| *it) {
-            Some(input) => input.content(db),
-            None => FileText::no_text(),
-        }
-    }
-
-    /// Puts `content` as `file`'s in each source root that has it, adding to `changed` those
-    /// whose content ID it changes. Their inputs are written by [`Files::write_root_contents`].
-    fn index_file(&self, file: vfs::FileId, content: ContentId, changed: &mut Vec<SourceRootId>) {
-        let Some(roots) = self.in_roots.get(&file).map(|it| it.clone()) else { return };
-        for root in roots {
-            let Some(mut index) = self.root_contents.get_mut(&root) else { continue };
-            if index.set(file, content) && !changed.contains(&root) {
-                changed.push(root);
-            }
-        }
-    }
-
-    fn write_root_contents(&self, db: &mut dyn SourceDatabase, roots: &[SourceRootId]) {
-        for &root in roots {
-            let Some(index) = self.root_contents.get(&root) else { continue };
-            let (content, is_library) = (InputId(index.content()), index.is_library);
-            drop(index);
-            let Some(input) = self.source_roots.get(&root).map(|it| *it) else { continue };
-            if input.content_field(&*db) != content {
-                input
-                    .set_content_field(db)
-                    .with_durability(root_content_durability(is_library))
-                    .to(content);
-            }
-        }
-    }
-
-    /// The content of the source root `id` as `root` has it, noting which of its files and
-    /// paths it has.
-    fn index_root(&self, db: &dyn SourceDatabase, id: SourceRootId, root: &SourceRoot) -> RootContent {
-        if let Some(old) = self.root_contents.get(&id) {
-            for file in old.keys.keys() {
-                if let Some(mut roots) = self.in_roots.get_mut(file) {
-                    roots.retain(|it| *it != id);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        for file in root.iter() {
-            let Some(path) = root.path_for_file(&file) else { continue };
-            // A path two files were given is the last one's.
-            if root.file_for_path(path) != Some(&file) {
-                continue;
-            }
-            self.by_path.insert(path.clone(), file);
-            let mut roots = self.in_roots.entry(file).or_default();
-            if !roots.contains(&id) {
-                roots.push(id);
-            }
-            drop(roots);
-            files.push((file, path, self.entry_content(db, file)));
-        }
-        RootContent::new(root.is_library, files)
-    }
-
-    /// Has the files under `base` read from where they are under `over` from now on, but for
-    /// those under one of `built`: what a build writes is not part of a checkout. Nothing is
-    /// read again for it: whoever watches the disk does that.
-    pub fn set_view(
-        &self,
-        base: &std::path::Path,
-        over: &std::path::Path,
-        built: Vec<std::path::PathBuf>,
-    ) {
-        let mut views = self.views.write().unwrap_or_else(|it| it.into_inner());
-        views.retain(|it| it.base != base);
-        if base != over {
-            let (base, over) = (base.to_owned(), over.to_owned());
-            views.push(View { base, over, built });
-        }
-    }
-
-    /// Where the file known as `path` is read from.
-    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
-        let views = self.views.read().unwrap_or_else(|it| it.into_inner());
-        let over = views
-            .iter()
-            .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
-            .find_map(|it| Some(it.over.join(path.strip_prefix(&it.base).ok()?)));
-        over.unwrap_or_else(|| path.to_owned())
-    }
-
-    /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
-    /// first time it is asked for. Whoever watches the disk keeps it current with
-    /// [`Files::reload_included_file`].
-    pub fn included_file(
-        &self,
-        db: &dyn SourceDatabase,
-        krate: Crate,
-        path: &AbsPath,
-        durability: Durability,
-    ) -> IncludedFile {
-        if !self.included_by.contains_key(&(krate, path.to_path_buf())) {
-            self.included_by.insert((krate, path.to_path_buf()), ());
-        }
-        *self.included.entry(path.to_path_buf()).or_insert_with(|| {
-            let bytes = self.read_included(path);
-            let content = InputId(IncludedFile::content_of(bytes.as_deref()));
-            IncludedFile::builder(bytes, content).durability(durability).new(db)
-        })
-    }
-
-    /// The files outside the VFS that `krate` has read, with the bytes it read of each:
-    /// `None` for one that could not be read.
-    pub fn included_by(
-        &self,
-        db: &dyn SourceDatabase,
-        krate: Crate,
-    ) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
-        let paths = self.included_by.iter().filter(|it| it.key().0 == krate);
-        let paths: Vec<AbsPathBuf> = paths.map(|it| it.key().1.clone()).collect();
-        let read = |path: AbsPathBuf| {
-            let file = self.included.get(&path).map(|it| *it)?;
-            Some((path, file.bytes(db).clone()))
-        };
-        paths.into_iter().filter_map(read).collect()
-    }
-
-    fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
-        std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
-    }
-
-    /// Notes a file an `include!` or a module declaration names that the VFS has not: whoever
-    /// owns the VFS puts it in the source root, see [`Files::included_sources`].
-    pub fn include_source(&self, path: &AbsPath, root: SourceRootId, krate: Crate) {
-        self.included_sources.entry(path.to_path_buf()).or_insert(root);
-        if !self.sources_included_by.contains_key(&(krate, path.to_path_buf())) {
-            self.sources_included_by.insert((krate, path.to_path_buf()), ());
-        }
-    }
-
-    /// The crates that named each file of [`Files::included_sources`].
-    pub fn sources_included_by(&self) -> Vec<(Crate, AbsPathBuf)> {
-        self.sources_included_by.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
-        self.included_sources.iter().map(|it| (it.key().clone(), *it.value())).collect()
-    }
-
-    pub fn env_is_read(&self, krate: Crate, key: &str) {
-        if !self.env_read.contains_key(&(krate, key.to_owned())) {
-            self.env_read.insert((krate, key.to_owned()), ());
-        }
-    }
-
-    pub fn env_read(&self) -> Vec<(Crate, String)> {
-        self.env_read.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn env_is_unset(&self, krate: Crate, key: &str) {
-        self.env_unset.insert((krate, key.to_owned()), ());
-    }
-
-    pub fn env_unset(&self) -> Vec<(Crate, String)> {
-        self.env_unset.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn included_files(&self) -> Vec<AbsPathBuf> {
-        self.included.iter().map(|it| it.key().clone()).collect()
-    }
-
-    /// Whether the file on disk is what was read of it.
-    pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        *file.bytes(db) == self.read_included(path)
-    }
-
-    /// Reads the file again, and says whether it changed.
-    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        let bytes = self.read_included(path);
-        let changed = *file.bytes(db) != bytes;
-        if changed {
-            let content = InputId(IncludedFile::content_of(bytes.as_deref()));
-            file.set_bytes_field(db).to(bytes);
-            file.set_content_field(db).to(content);
-        }
-        changed
-    }
-
-    /// Source root of the file.
-    pub fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        let source_root = match self.source_roots.get(&source_root_id) {
-            Some(source_root) => source_root,
-            None => panic!(
-                "Unable to fetch `SourceRootInput` with `SourceRootId` ({source_root_id:?}); this is a bug"
-            ),
-        };
-
-        *source_root
-    }
-
-    pub fn set_source_root_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    ) {
-        let index = self.index_root(&*db, source_root_id, &source_root);
-        let content = InputId(index.content());
-        let content_durability = root_content_durability(source_root.is_library);
-        self.root_contents.insert(source_root_id, index);
-        match self.source_roots.entry(source_root_id) {
-            Entry::Occupied(occupied) => {
-                let input = *occupied.get();
-                input.set_source_root_field(db).with_durability(durability).to(source_root);
-                if input.content_field(&*db) != content {
-                    input.set_content_field(db).with_durability(content_durability).to(content);
-                }
-            }
-            Entry::Vacant(vacant) => {
-                let input = SourceRootInput::builder(source_root, content)
-                    .durability(durability)
-                    .content_durability(content_durability)
-                    .new(&*db);
-                vacant.insert(input);
-            }
-        };
-    }
-
-    pub fn file_source_root(
-        &self,
-        db: &dyn SourceDatabase,
-        id: vfs::FileId,
-    ) -> FileSourceRootInput {
-        let file_source_root = match self.file_source_roots.get(&id) {
-            Some(file_source_root) => file_source_root,
-            None => panic!(
-                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
-                self.path_for_file(db, id)
-                    .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
-            ),
-        };
-        *file_source_root
-    }
-
-    fn path_for_file(&self, db: &dyn SourceDatabase, id: vfs::FileId) -> Option<vfs::VfsPath> {
-        for source_root in &*self.source_roots {
-            let source_root = *source_root.value();
-            if let Some(path) = source_root.source_root(db).path_for_file(&id) {
-                return Some(path.clone());
-            }
-        }
-        None
-    }
-
-    pub fn set_file_source_root_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        id: vfs::FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    ) {
-        match self.file_source_roots.entry(id) {
-            Entry::Occupied(mut occupied) => {
-                occupied
-                    .get_mut()
-                    .set_source_root_id(db)
-                    .with_durability(durability)
-                    .to(source_root_id);
-            }
-            Entry::Vacant(vacant) => {
-                let file_source_root =
-                    FileSourceRootInput::builder(source_root_id).durability(durability).new(db);
-                vacant.insert(file_source_root);
-            }
-        };
-    }
-}
-
-/// The files of one source root as its content ID is made of them (see [`SourceRoot::DOMAIN`]).
-#[derive(Debug)]
-struct RootContent {
-    is_library: bool,
-    /// Each file's bucket and key (its path, encoded).
-    keys: FxHashMap<vfs::FileId, (usize, Box<[u8]>)>,
-    buckets: Vec<BTreeMap<Box<[u8]>, ContentId>>,
-    hashes: Vec<ContentId>,
-}
-
-impl RootContent {
-    fn new<'a>(
-        is_library: bool,
-        files: impl IntoIterator<Item = (vfs::FileId, &'a VfsPath, ContentId)>,
-    ) -> RootContent {
-        let mut buckets = vec![BTreeMap::new(); SourceRoot::BUCKETS];
-        let mut keys = FxHashMap::default();
-        for (file, path, content) in files {
-            let key: Box<[u8]> = content::path_key(path).into();
-            let bucket = RootContent::bucket(&key);
-            buckets[bucket].insert(key.clone(), content);
-            keys.insert(file, (bucket, key));
-        }
-        let hashes = buckets.iter().map(RootContent::bucket_hash).collect();
-        RootContent { is_library, keys, buckets, hashes }
-    }
-
-    fn bucket(key: &[u8]) -> usize {
-        ContentId::of(SourceRoot::PATH_DOMAIN, key).0[0] as usize % SourceRoot::BUCKETS
-    }
-
-    fn bucket_hash(bucket: &BTreeMap<Box<[u8]>, ContentId>) -> ContentId {
-        let mut hasher = Hasher::new(SourceRoot::BUCKET_DOMAIN);
-        content::len(&mut hasher, bucket.len());
-        for (key, content) in bucket {
-            hasher.part(key).id(content);
-        }
-        hasher.finish()
-    }
-
-    /// Sets the content ID of `file`, if the root has it; whether the root's changed.
-    fn set(&mut self, file: vfs::FileId, content: ContentId) -> bool {
-        let Some((bucket, key)) = self.keys.get(&file) else { return false };
-        let bucket = *bucket;
-        let Some(slot) = self.buckets[bucket].get_mut(key) else { return false };
-        if *slot == content {
-            return false;
-        }
-        *slot = content;
-        self.hashes[bucket] = RootContent::bucket_hash(&self.buckets[bucket]);
-        true
-    }
-
-    fn content(&self) -> ContentId {
-        let mut hasher = Hasher::new(SourceRoot::DOMAIN);
-        hasher.update(&[self.is_library as u8]);
-        for hash in &self.hashes {
-            hasher.id(hash);
-        }
-        hasher.finish()
-    }
-}
-
-/// A source root's content ID changes with its files' texts, so it is as durable as they are.
-fn root_content_durability(is_library: bool) -> Durability {
-    if is_library { Durability::HIGH } else { Durability::LOW }
-}
-
-fn set<S: Setter>(setter: S, durability: Option<Durability>, value: S::FieldTy) {
-    let setter = match durability {
-        Some(durability) => setter.with_durability(durability),
-        None => setter,
-    };
-    setter.to(value);
-}
 
 /// The set of roots for crates.io libraries.
 /// Files in libraries are assumed to never change.
@@ -702,8 +189,15 @@ impl FileText {
         hasher.finish()
     }
 
+    /// What [`FileText::content_of_file`] hashes under [`FileText::DOMAIN`], appended to `out`:
+    /// for hashing many in one batch.
+    pub(crate) fn content_bytes(file: &ContentId, appended_root_module: Option<&str>, out: &mut Vec<u8>) {
+        out.extend_from_slice(&file.0);
+        content::opt_bytes(out, appended_root_module);
+    }
+
     pub fn no_text() -> ContentId {
-        ContentId::of(FileText::NO_TEXT_DOMAIN, b"")
+        files::no_text()
     }
 
     pub fn text<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db Arc<str> {

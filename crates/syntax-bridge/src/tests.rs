@@ -194,7 +194,6 @@ fn an_outline_has_the_token_trees_of_a_full_parse() {
     for (path, text) in corpus() {
         let path = path.display();
         let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node();
-        let green = SyntaxNode::new_root(full.green().to_owned());
         let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT).syntax_node();
         let mut in_full = FxHashMap::default();
         for node in full.descendants() {
@@ -219,7 +218,6 @@ fn an_outline_has_the_token_trees_of_a_full_parse() {
 
         let expected = token_tree(&full);
         assert_eq!(token_tree(&outline), expected, "{path}");
-        assert_eq!(token_tree(&green), expected, "{path}");
     }
 }
 

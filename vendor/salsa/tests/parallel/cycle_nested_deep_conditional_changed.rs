@@ -74,10 +74,14 @@ fn the_test() {
         tracing::debug!("Starting new run");
 
         // This is a bit silly but it works around https://github.com/awslabs/shuttle/issues/192
-        static INITIALIZE: sync::Mutex<Option<(salsa::DatabaseImpl, Input)>> =
+        static INITIALIZE: sync::Mutex<Option<(std::sync::Arc<salsa::DatabaseImpl>, Input)>> =
             sync::Mutex::new(None);
 
-        fn get_db(f: impl FnOnce(&salsa::DatabaseImpl, Input)) -> (salsa::DatabaseImpl, Input) {
+        /// The database every thread shares, made and advanced to its second revision by the
+        /// first thread to ask, which runs `f` in the first revision.
+        fn get_db(
+            f: impl FnOnce(&salsa::DatabaseImpl, Input),
+        ) -> (std::sync::Arc<salsa::DatabaseImpl>, Input) {
             let mut shared = INITIALIZE.lock().unwrap();
 
             if let Some((db, input)) = shared.as_ref() {
@@ -92,6 +96,7 @@ fn the_test() {
 
             input.set_value(&mut db).to(1);
 
+            let db = std::sync::Arc::new(db);
             *shared = Some((db.clone(), input));
 
             (db, input)
@@ -103,7 +108,7 @@ fn the_test() {
                 query_a(db, input);
             });
 
-            query_a(&db, input)
+            query_a(&*db, input)
         });
         let t2 = thread::spawn(move || {
             let _span = tracing::info_span!("t2", thread_id = ?thread::current().id()).entered();
@@ -111,7 +116,7 @@ fn the_test() {
                 query_b(db, input);
             });
 
-            query_b(&db, input)
+            query_b(&*db, input)
         });
         let t3 = thread::spawn(move || {
             let _span = tracing::info_span!("t3", thread_id = ?thread::current().id()).entered();
@@ -119,7 +124,7 @@ fn the_test() {
                 query_d(db, input);
             });
 
-            query_d(&db, input)
+            query_d(&*db, input)
         });
         let t4 = thread::spawn(move || {
             let _span = tracing::info_span!("t4", thread_id = ?thread::current().id()).entered();
@@ -128,7 +133,7 @@ fn the_test() {
                 query_e(db, input);
             });
 
-            query_e(&db, input)
+            query_e(&*db, input)
         });
 
         let r_t1 = t1.join().unwrap();

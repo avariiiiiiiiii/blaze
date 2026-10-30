@@ -4,6 +4,7 @@
 
 use blaze_codegen::wasm::ValType;
 
+use super::leb::{self, uleb, uleb_len};
 use super::reader::Reader;
 
 /// 48 bytes on a 64-bit host: the piece and seven `u32` offsets into it. Reading a part walks
@@ -30,7 +31,7 @@ pub(super) type Sig<'a> = &'a [u8];
 pub(super) const NOTHING: Sig<'static> = &[0x60, 0, 0];
 
 /// Moves past one encoded function type, checking it, and says where it was.
-fn signature<'a>(r: &mut Reader<'a>, bytes: &'a [u8]) -> Result<Sig<'a>, String> {
+pub(super) fn signature<'a>(r: &mut Reader<'a>, bytes: &'a [u8]) -> Result<Sig<'a>, String> {
     let start = r.at();
     if r.u8()? != 0x60 {
         return Err("a type that is not a function type".to_owned());
@@ -45,6 +46,66 @@ fn signature<'a>(r: &mut Reader<'a>, bytes: &'a [u8]) -> Result<Sig<'a>, String>
 }
 
 const CHECKED: &str = "checked by Header::parse";
+
+/// A header from borrowed parts, for the functions the object reader takes out of C objects:
+/// the bytes [`blaze_codegen::wasm::Code::encode`] writes for a `Code` of these parts with no
+/// `__stack_pointer` places and no imports (an object names those through relocations and
+/// symbols). Nothing is decoded into a `Signature` and the code is one exact allocation.
+pub(super) struct Parts<'a> {
+    pub ty: Sig<'a>,
+    pub types: &'a [Sig<'a>],
+    pub type_fixups: &'a [(u32, u32)],
+    pub export: Option<&'a str>,
+}
+
+impl Parts<'_> {
+    fn header_len(&self) -> usize {
+        let types: usize = self.types.iter().map(|it| it.len()).sum();
+        let fixups: usize = self
+            .type_fixups
+            .iter()
+            .map(|&(at, which)| uleb_len(at.into()) + uleb_len(which.into()))
+            .sum();
+        let export = self.export.map_or(1, |it| 1 + uleb_len(it.len() as u64) + it.len());
+        // The two empty lists, the `__stack_pointer` places and the imports, are a 0 each.
+        self.ty.len()
+            + uleb_len(self.types.len() as u64)
+            + types
+            + uleb_len(self.type_fixups.len() as u64)
+            + fixups
+            + 2
+            + export
+    }
+
+    /// The function's code, the header and then `body`, and where `body` starts in it.
+    pub(super) fn encode(&self, body: &[u8]) -> (Vec<u8>, u32) {
+        let header = self.header_len();
+        let start = uleb_len(header as u64) + header;
+        let mut code = Vec::with_capacity(start + body.len());
+        uleb(&mut code, header as u64);
+        code.extend_from_slice(self.ty);
+        uleb(&mut code, self.types.len() as u64);
+        for ty in self.types {
+            code.extend_from_slice(ty);
+        }
+        uleb(&mut code, self.type_fixups.len() as u64);
+        for &(at, which) in self.type_fixups {
+            uleb(&mut code, at.into());
+            uleb(&mut code, which.into());
+        }
+        code.extend_from_slice(&[0, 0]);
+        match self.export {
+            None => code.push(0),
+            Some(name) => {
+                code.push(1);
+                leb::name(&mut code, name);
+            }
+        }
+        debug_assert_eq!(code.len(), start);
+        code.extend_from_slice(body);
+        (code, start as u32)
+    }
+}
 
 impl<'a> Header<'a> {
     /// Reads where the parts of `code`'s header are, checking every one of them.
@@ -221,6 +282,28 @@ mod tests {
         assert_eq!(header.export(), None);
         assert_eq!(header.type_fixups().count() + header.stack_pointer().count(), 0);
         assert_eq!(header.imports().count(), 0);
+    }
+
+    #[test]
+    fn parts_encode_as_codegen_does() {
+        let call = Signature { params: vec![ValType::V128], results: vec![] };
+        let ty = Signature { params: vec![ValType::I32], results: vec![ValType::F64] };
+        let body = [0x00, 0x0b];
+        let long = "x".repeat(200);
+        for export in [None, Some("_start"), Some(long.as_str())] {
+            let code = Code {
+                ty: ty.clone(),
+                types: vec![Signature::default(), call.clone()],
+                type_fixups: vec![(3, 1), (300, 0)],
+                export: export.map(str::to_owned),
+                ..Code::default()
+            };
+            let (ty, types) = (encoded(&ty), [encoded(&Signature::default()), encoded(&call)]);
+            let types = [types[0].as_slice(), types[1].as_slice()];
+            let parts =
+                Parts { ty: &ty, types: &types, type_fixups: &code.type_fixups, export };
+            assert_eq!(parts.encode(&body), code.encode(&body));
+        }
     }
 
     #[test]

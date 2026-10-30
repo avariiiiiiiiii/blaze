@@ -1,9 +1,11 @@
 //! The blocking calls behind the effects, for [`crate::threads::Threads`]'s threads and for what
 //! [`crate::uring::Uring`] does where it is submitted.
 
+#[cfg(unix)]
+use std::{fs::File, io::Write as _};
 use std::{
-    fs::{File, OpenOptions},
-    io::{self, Write as _},
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::UNIX_EPOCH,
@@ -29,6 +31,7 @@ pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
 
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
 /// it, and the directory synced, so the new name survives a crash.
+#[cfg(unix)]
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     make_parent(path)?;
     let temporary = temporary_next_to(path);
@@ -45,6 +48,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// `from` renamed to `to`, and `to`'s directory synced.
+#[cfg(unix)]
 pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Err(error) = std::fs::rename(from, to) {
         _ = std::fs::remove_file(from);
@@ -55,6 +59,7 @@ pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
 
 /// `from` renamed over `to`, made the new name durably; `from` is left as it was when the
 /// rename fails.
+#[cfg(unix)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     make_parent(to)?;
     std::fs::rename(from, to)?;
@@ -68,6 +73,16 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// `bytes` written at `at` of the file at `path`, which exists.
 pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
+    // As `uring.rs`'s `O_DIRECT`: a large aligned write stays out of the unified buffer cache;
+    // macOS keeps it coherent with cached and mapped pages.
+    #[cfg(target_os = "macos")]
+    if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: an open descriptor; the flag changes only how its writes use the cache.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     #[cfg(unix)]
     return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
     #[cfg(windows)]
@@ -94,13 +109,8 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("{}: permission bits {mode:o} are of Unix only", path.display()),
-    ))
-}
+#[cfg(windows)]
+pub(crate) use crate::iocp::files::{clone, map, rename, set_mode, write_atomically};
 
 #[cfg(unix)]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
@@ -108,11 +118,6 @@ fn sync_dir_of(path: &Path) -> io::Result<()> {
         Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
         _ => Ok(()),
     }
-}
-
-#[cfg(not(unix))]
-fn sync_dir_of(_: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 pub(crate) fn stat(path: &Path) -> io::Result<Option<Meta>> {
@@ -182,6 +187,7 @@ pub(crate) fn link(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `to` made sharing `from`'s blocks, or an error that says the file system cannot.
+#[cfg(unix)]
 pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     make_parent(to)?;
     clone_file(from, to).map_err(|error| match error.raw_os_error() {
@@ -208,7 +214,7 @@ fn refuses_sharing(code: i32) -> bool {
     matches!(code, libc::ENOTSUP | libc::EXDEV)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn refuses_sharing(_: i32) -> bool {
     false
 }
@@ -265,15 +271,15 @@ pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
     if at == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
+    // Page-cache huge pages for a file of 2 MiB or more, where the file system makes them:
+    // the TLB covers a pack in hundreds of entries rather than hundreds of thousands. Only
+    // advice; the bytes read are the same either way.
+    #[cfg(target_os = "linux")]
+    if len >= 2 << 20 {
+        // SAFETY: the mapping made above, its whole length.
+        unsafe { libc::madvise(at, len, libc::MADV_HUGEPAGE) };
+    }
     Ok(crate::Mapping(std::sync::Arc::new(Mapped { at: at.cast(), len })))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("{}: mapping a file is built on Unix only", path.display()),
-    ))
 }
 
 /// Pages mapped by [`map`], unmapped when the last [`crate::Mapping`] of them goes.
@@ -306,7 +312,7 @@ impl Drop for Mapped {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
 }

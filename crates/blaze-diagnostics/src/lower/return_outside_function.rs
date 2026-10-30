@@ -9,7 +9,10 @@ use syntax::{AstNode, TextRange, ast};
 use crate::{
     cx::{Cx, item_range},
     lints::code_fact,
-    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    lower::{
+        Found, Phase,
+        break_outside_of_loop::{ancestors, is_item},
+    },
     model::Diag,
 };
 
@@ -41,7 +44,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ReturnOutsideFunction) -> Vec<Foun
                 body = Some(it.with_value(range));
             }
         }
-        if ast::Item::can_cast(it.value.kind()) {
+        if is_item(it.value.kind()) {
             if let (Some(body), Some(item)) = (body, ast::Fn::cast(it.value.clone()))
                 && item.body().is_some()
             {

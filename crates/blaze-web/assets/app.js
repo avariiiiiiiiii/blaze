@@ -1,8 +1,7 @@
 // The build page (docs/web.md). It reads the websocket beside it, or with ?fixture=<file> a
 // snapshot (and with &records=<file> a CBOR sequence of records) from this directory.
-import { decode, decodeSequence } from "./cbor.js";
 import { parseSnapshot, isSnapshot } from "./snapshot.js";
-import { parseRecord } from "./records.js";
+import { parseFrame } from "./records.js";
 import { Model } from "./model.js";
 import { MainView, webgl2Missing } from "./mainview.js";
 import { CrateDag } from "./dag.js";
@@ -22,7 +21,8 @@ const SPREAD_MAX = 2000;
 const state = {
   model: null, view: null, began: null, rebuilt: [], unlisted: 0, analysis: null,
   pendingFlash: new Set(), flushTimer: 0, spreadBuild: null, litThisBuild: 0, dead: false,
-  connection: "connecting", ws: null, mouse: [0, 0], snapshots: 0, records: 0,
+  connection: "connecting", ws: null, mouse: [0, 0], snapshots: 0, records: 0, frames: 0,
+  viewAdded: [], viewEdges: 0, viewDirty: false, viewFrame: 0,
 };
 const tooltip = new Tooltip();
 let dag, search, treemap, timeline, editView;
@@ -96,6 +96,11 @@ function onSnapshot(bytes) {
   state.spreadBuild = null;
   state.litThisBuild = 0;
   state.pendingFlash.clear();
+  if (state.viewFrame) cancelAnimationFrame(state.viewFrame);
+  state.viewFrame = 0;
+  state.viewDirty = false;
+  state.viewAdded = [];
+  state.viewEdges = 0;
   const host = $("graph-canvas");
   if (state.view) {
     state.view.graph.destroy();
@@ -117,15 +122,17 @@ function onSnapshot(bytes) {
   state.snapshots++;
 }
 
-function onRecordBytes(bytes) {
-  let r;
+// A frame holds every record the server had at once, each read in order.
+function onFrame(bytes) {
+  let rs;
   try {
-    r = parseRecord(decode(bytes));
+    rs = parseFrame(bytes);
   } catch (e) {
     fatal("A record is malformed", e.message);
     return;
   }
-  onRecord(r);
+  state.frames++;
+  for (const r of rs) onRecord(r);
 }
 
 function onRecord(r) {
@@ -145,7 +152,7 @@ function onRecord(r) {
       state.litThisBuild = 0;
       state.model.current = ev.build;
       state.view.clearSpread();
-      state.view.restyleAll();
+      scheduleView();
       timeline.reset(ev);
       break;
     case "Functions": {
@@ -158,12 +165,11 @@ function onRecord(r) {
         return;
       }
       if (res.added.length || res.newEdges) {
-        state.view.addNodes(res.added, res.newEdges);
-        dag.invalidate();
+        for (const i of res.added) state.viewAdded.push(i);
+        state.viewEdges += res.newEdges;
         search.invalidate();
-      } else {
-        state.view.restyleAll();
       }
+      scheduleView();
       treemap.invalidate();
       dag.invalidate();
       state.litThisBuild += res.touched.length;
@@ -186,6 +192,28 @@ function onRecord(r) {
   status();
 }
 
+// The graph is drawn again once a frame, whatever the records of it changed: a cold build sends
+// hundreds of Functions records, and each would otherwise restyle and upload every point.
+function scheduleView() {
+  state.viewDirty = true;
+  if (!state.viewFrame) state.viewFrame = requestAnimationFrame(applyView);
+}
+
+// What the records since the last frame changed, to the graph; also called before anything
+// that reads the graph's points (a flash, the edit's spread, a selection).
+function applyView() {
+  if (state.viewFrame) cancelAnimationFrame(state.viewFrame);
+  state.viewFrame = 0;
+  if (!state.viewDirty || !state.view) return;
+  state.viewDirty = false;
+  const added = state.viewAdded;
+  const edges = state.viewEdges;
+  state.viewAdded = [];
+  state.viewEdges = 0;
+  if (added.length || edges) state.view.addNodes(added, edges);
+  else state.view.restyleAll();
+}
+
 // Functions and Rebuilt come in bursts: the glow and the edit's spread are worked out once a burst
 // has gone quiet, or every FLUSH_MS while one goes on.
 function scheduleFlush(ms = FLUSH_MS) {
@@ -196,6 +224,7 @@ function scheduleFlush(ms = FLUSH_MS) {
 
 function flush() {
   state.flushTimer = 0;
+  applyView();
   const build = state.began?.build ?? state.model.build;
   if (state.rebuilt.length) {
     state.analysis = analyseEdit(state.model, state.rebuilt, build);
@@ -215,6 +244,7 @@ function flush() {
 // ------------------------------------------------------------------ selection and hover
 let selected = null;
 function select(i, fromGraph) {
+  applyView();
   selected = i;
   if (i === null) {
     search.select(null);
@@ -340,7 +370,7 @@ function connect() {
     queue = queue.then(async () => {
       if (state.dead) return;
       if (!zipped) {
-        onRecordBytes(bytes);
+        onFrame(bytes);
         return;
       }
       let snapshot;
@@ -383,16 +413,7 @@ async function runFixture(name, recordsName) {
   let snap, records = [];
   try {
     snap = await fetchHere(name, "the fixture");
-    if (recordsName) {
-      const items = decodeSequence(await fetchHere(recordsName, "the records"));
-      records = items.map((v, i) => {
-        try {
-          return parseRecord(v);
-        } catch (e) {
-          throw new Error(`item ${i}: ${e.message}`);
-        }
-      });
-    }
+    if (recordsName) records = parseFrame(await fetchHere(recordsName, "the records"));
   } catch (e) {
     fatal("The fixture could not be read", e.message);
     return;
@@ -413,6 +434,7 @@ window.blazePage = {
   get dead() { return state.dead; },
   get snapshots() { return state.snapshots; },
   get records() { return state.records; },
+  get frames() { return state.frames; },
   get nodes() { return state.model?.n ?? 0; },
   get connection() { return state.connection; },
   showTab, select: (i) => select(i, false),

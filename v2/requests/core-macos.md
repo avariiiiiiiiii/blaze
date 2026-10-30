@@ -66,3 +66,29 @@ reaps; `threads.rs` and `kqueue.rs` changed with it, io_uring told). Request 2 k
 the footprint watch is always on and holds the limit, the rlimit is extra.
 
 > forwarded to core: request 3 is not applied yet; `process.rs` line 135 still sets `pre_exec(limit_self)` on macOS.
+
+## 4. `F_NOCACHE` for large aligned `WriteAt`s on macOS (`fs.rs`)
+
+- What: in `fs::write_at`, on macOS, when `at` and `bytes.len()` are multiples of 4 KiB and
+  `bytes.len()` is at least 1 MiB, set `fcntl(file, F_NOCACHE, 1)` on the descriptor it just
+  opened, before `write_all_at`. This is the same rule `uring.rs` uses for `O_DIRECT`, as
+  `plan/design/hardware.md`'s IO row asks for pack writes.
+
+  ```rust
+  #[cfg(target_os = "macos")]
+  if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
+      use std::os::fd::AsRawFd as _;
+      // SAFETY: an open descriptor; the flag changes only how its writes use the cache.
+      if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
+          return Err(io::Error::last_os_error());
+      }
+  }
+  ```
+
+- Where: `crates/blaze-core/src/fs.rs`, `write_at`. Every driver's `WriteAt` on macOS comes
+  through it: the kqueue file threads and `Threads`, via `threads::run`.
+- Why: a large pack write then doesn't push the daemon's hot pages out of the unified buffer
+  cache. The bytes on disk and what any reader or mapping sees are the same; macOS keeps an
+  `F_NOCACHE` write coherent with cached and mapped pages. So the choice is dispatch, not a
+  fallback. The trade-off is `O_DIRECT`'s, which the plan has settled: a pack mapped right
+  after it is written faults its pages in from disk.

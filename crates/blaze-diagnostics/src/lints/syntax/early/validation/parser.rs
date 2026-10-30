@@ -11,34 +11,59 @@
 //! `BreakWithLabelAndLoop`) (MIT or Apache-2.0).
 
 use hir::{HirFileId, InFile};
-use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange,
-    ast::{self},
-};
+use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange, TextSize, ast};
 
-use super::{edition_at, emit, span};
+use super::{edition_at, emitted, span};
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Pass, Tree, Walk},
-    model::{Applicability, Diag},
+    model::{Applicability, Diag, Span},
 };
 
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut out = Vec::new();
-    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return out };
-    let Some(root) = walk.tree(HirFileId::from(root)) else { return out };
-    let crate_at = root.ptr(&root.root);
-    let parsed = walk.files().chain(walk.trees.iter().filter(|it| !it.in_file()));
-    for tree in parsed {
-        for node in tree.root.descendants() {
-            if let Some(param) = ast::Param::cast(node.clone()) {
-                varargs_without_pattern(cx, tree, &param, crate_at, &mut out);
-            } else if let Some(expr) = ast::BreakExpr::cast(node) {
-                break_with_label_and_loop(cx, tree, &expr, crate_at, &mut out);
-            }
+/// A lint the parser buffered, keyed by where rustc's parser comes to it: files before
+/// expansions, then the walk's order of trees, then the offset in the tree.
+struct Hit {
+    key: (bool, u32, TextSize),
+    emitted: Emitted,
+}
+
+/// The parser's lints, gathered as [`super::lints`] passes over each node and put in the
+/// parser's order at the end. Hits are rare, so sorting them costs nothing next to the walk.
+pub(super) struct Parsed {
+    crate_at: Option<InFile<SyntaxNodePtr>>,
+    hits: Vec<Hit>,
+}
+
+impl Parsed {
+    pub(super) fn new(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Parsed {
+        let crate_at = cx
+            .krate
+            .root_module(cx.db)
+            .as_source_file_id(cx.db)
+            .and_then(|it| walk.tree(HirFileId::from(it)))
+            .map(|tree| tree.ptr(&tree.root));
+        Parsed { crate_at, hits: Vec::new() }
+    }
+
+    /// Checks `node` of `tree`, the `index`th tree of the walk: one `kind` read for any node
+    /// that is neither a parameter nor a `break`.
+    pub(super) fn check(&mut self, cx: &Cx<'_, '_>, tree: &Tree, index: u32, node: &SyntaxNode) {
+        let Some(crate_at) = self.crate_at else { return };
+        let found = match node.kind() {
+            SyntaxKind::PARAM => varargs_without_pattern(cx, tree, node, crate_at),
+            SyntaxKind::BREAK_EXPR => break_with_label_and_loop(cx, tree, node, crate_at),
+            _ => return,
+        };
+        if let Some(emitted) = found {
+            let key = (!tree.in_file(), index, node.text_range().start());
+            self.hits.push(Hit { key, emitted });
         }
     }
-    out
+
+    pub(super) fn finish(mut self) -> impl Iterator<Item = Emitted> {
+        self.hits.sort_by_key(|it| it.key);
+        self.hits.into_iter().map(|it| it.emitted)
+    }
 }
 
 /// `varargs_without_pattern`: a `...` parameter with no pattern where rustc's parser asks for
@@ -47,20 +72,17 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
 fn varargs_without_pattern(
     cx: &Cx<'_, '_>,
     tree: &Tree,
-    param: &ast::Param,
+    param: &SyntaxNode,
     crate_at: InFile<SyntaxNodePtr>,
-    out: &mut Vec<Emitted>,
-) {
-    let first = param
-        .syntax()
-        .children_with_tokens()
-        .find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR);
-    let Some(NodeOrToken::Token(dots)) = first else { return };
+) -> Option<Emitted> {
+    // Most parameters start with their pattern: the first element read decides.
+    let first = param.children_with_tokens().find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR);
+    let Some(NodeOrToken::Token(dots)) = first else { return None };
     if dots.kind() != T![...] {
-        return;
+        return None;
     }
-    let Some(list) = param.syntax().parent().filter(|it| it.kind() == SyntaxKind::PARAM_LIST) else { return };
-    let Some(item) = list.parent().filter(|it| it.kind() == SyntaxKind::FN) else { return };
+    let list = param.parent().filter(|it| it.kind() == SyntaxKind::PARAM_LIST)?;
+    let item = list.parent().filter(|it| it.kind() == SyntaxKind::FN)?;
     let required = match item.parent().map(|it| it.kind()) {
         Some(SyntaxKind::EXTERN_ITEM_LIST) => false,
         Some(SyntaxKind::ASSOC_ITEM_LIST) => {
@@ -70,7 +92,7 @@ fn varargs_without_pattern(
         _ => true,
     };
     if !required {
-        return;
+        return None;
     }
     let span = span(cx, tree, dots.text_range());
     let mut diag = Diag::lint("varargs_without_pattern", "missing pattern for `...` argument", span.clone());
@@ -80,7 +102,7 @@ fn varargs_without_pattern(
         "_: ...",
         Applicability::MachineApplicable,
     );
-    emit(cx, diag, Pass::Buffered, crate_at, tree.ptr(param.syntax()), out);
+    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(param)))
 }
 
 /// `break_with_label_and_loop`: `break 'label` whose value is an unlabeled `loop`, `while`,
@@ -88,12 +110,12 @@ fn varargs_without_pattern(
 fn break_with_label_and_loop(
     cx: &Cx<'_, '_>,
     tree: &Tree,
-    expr: &ast::BreakExpr,
+    node: &SyntaxNode,
     crate_at: InFile<SyntaxNodePtr>,
-    out: &mut Vec<Emitted>,
-) {
-    let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr()) else { return };
-    let unlabeled = |node: &syntax::SyntaxNode| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
+) -> Option<Emitted> {
+    let expr = ast::BreakExpr::cast(node.clone())?;
+    let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr()) else { return None };
+    let unlabeled = |node: &SyntaxNode| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
     let confusable = match &value {
         ast::Expr::LoopExpr(it) => unlabeled(it.syntax()),
         ast::Expr::WhileExpr(it) => unlabeled(it.syntax()),
@@ -102,7 +124,7 @@ fn break_with_label_and_loop(
         _ => false,
     };
     if !confusable {
-        return;
+        return None;
     }
     let value_range = value.syntax().text_range();
     let span = span(cx, tree, TextRange::new(break_.text_range().start(), value_range.end()));
@@ -118,9 +140,9 @@ fn break_with_label_and_loop(
         vec![(left, "(".to_owned()), (right, ")".to_owned())],
         Applicability::MachineApplicable,
     );
-    emit(cx, diag, Pass::Buffered, crate_at, tree.ptr(expr.syntax()), out);
+    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(node)))
 }
 
-fn span_at(cx: &Cx<'_, '_>, tree: &Tree, offset: syntax::TextSize) -> crate::model::Span {
+fn span_at(cx: &Cx<'_, '_>, tree: &Tree, offset: TextSize) -> Span {
     span(cx, tree, TextRange::empty(offset))
 }

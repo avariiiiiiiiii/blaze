@@ -1,7 +1,8 @@
 //! A simple query to collect tall locals (upvars) a closure use.
 
 use base_db::SourceDatabase;
-use hir_expand::mod_path::PathKind;
+use hir_expand::mod_path::{ModPath, PathKind};
+use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -17,12 +18,6 @@ use crate::{
 pub struct Upvars(Box<[BindingId]>);
 
 impl Upvars {
-    fn new(upvars: &FxHashSet<BindingId>) -> Upvars {
-        let mut upvars = upvars.iter().copied().collect::<Box<[_]>>();
-        upvars.sort_unstable();
-        Upvars(upvars)
-    }
-
     #[inline]
     pub fn contains(&self, local: BindingId) -> bool {
         self.0.binary_search(&local).is_ok()
@@ -112,14 +107,19 @@ pub fn upvars_mentioned_impl(
 ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
     let store = ExpressionStore::of(db, owner);
     store.expr_roots().next()?;
-    let resolver = owner.resolver(db);
+    // Most bodies have no closure: they need no resolver and no walk.
+    if !store.exprs().any(|(_, expr)| matches!(expr, Expr::Closure { .. })) {
+        return None;
+    }
     let mut visitor = UpvarsMentionedVisitor {
         db,
-        resolver,
+        resolver: owner.resolver(db),
         owner,
         store,
+        binding_names: store.bindings().map(|(_, binding)| *binding.name.symbol()).collect(),
         closures_map: FxHashMap::default(),
         current_closure: None,
+        mentioned: Vec::new(),
     };
     visitor.on_exprs(store.expr_roots());
     let mut result = visitor.closures_map;
@@ -136,18 +136,25 @@ struct UpvarsMentionedVisitor<'db> {
     resolver: Resolver<'db>,
     owner: ExpressionStoreOwnerId,
     store: &'db ExpressionStore,
+    /// The names of the store's bindings: a path that is none of them names no local.
+    binding_names: FxHashSet<Symbol>,
     closures_map: FxHashMap<ExprId, Upvars>,
-    current_closure: Option<(ExprId, FxHashSet<BindingId>)>,
+    /// The closure being walked, and where its upvars start in `mentioned`.
+    current_closure: Option<(ExprId, usize)>,
+    /// The upvars of every closure being walked, outermost first: one buffer for the body
+    /// where each closure had a set.
+    mentioned: Vec<BindingId>,
 }
 
 impl UpvarsMentionedVisitor<'_> {
     fn resolve_maybe_upvar(&mut self, expr: ExprId, path: &Path) {
-        let Some((current_closure, upvars)) = &mut self.current_closure else { return };
+        let Some((current_closure, _)) = self.current_closure else { return };
 
         if let Path::BarePath(mod_path) = path
         && matches!(mod_path.kind, PathKind::Plain | PathKind::SELF)
         // `self` is length zero.
         && mod_path.segments().len() <= 1
+        && self.may_name_binding(mod_path)
         {
             // Could be a variable.
             let guard = self.resolver.update_to_inner_scope(self.db, self.owner, expr);
@@ -157,18 +164,44 @@ impl UpvarsMentionedVisitor<'_> {
                 self.store.expr_or_pat_path_hygiene(expr.into()),
             );
             if let Some(ValueNs::LocalBinding(local)) = resolution
-                && self.store.binding_owner(local) != Some(*current_closure)
+                && self.store.binding_owner(local) != Some(current_closure)
             {
-                upvars.insert(local);
+                self.mentioned.push(local);
             }
             self.resolver.reset_to_guard(guard);
         }
+    }
+
+    /// Whether `path`, of one segment at most, may resolve to a local: the resolver finds one
+    /// only by its name, so a name no binding of the store has needs no resolving.
+    fn may_name_binding(&self, path: &ModPath) -> bool {
+        let name = match path.segments() {
+            _ if path.is_self() => sym::self_,
+            [name] => *name.symbol(),
+            _ => return true,
+        };
+        self.binding_names.contains(&name)
+    }
+
+    /// Sorts and dedups the upvars `mentioned` has from `start` on.
+    fn sort_dedup_from(&mut self, start: usize) {
+        let upvars = &mut self.mentioned[start..];
+        upvars.sort_unstable();
+        let mut kept = 0;
+        for i in 0..upvars.len() {
+            if kept == 0 || upvars[kept - 1] != upvars[i] {
+                upvars[kept] = upvars[i];
+                kept += 1;
+            }
+        }
+        self.mentioned.truncate(start + kept);
     }
 }
 
 impl StoreVisitor for UpvarsMentionedVisitor<'_> {
     fn on_expr(&mut self, expr: ExprId) {
-        match &self.store[expr] {
+        let store = self.store;
+        match store.expr(expr) {
             Expr::Path(path) => {
                 self.resolve_maybe_upvar(expr, path);
                 self.on_path(path);
@@ -183,24 +216,35 @@ impl StoreVisitor for UpvarsMentionedVisitor<'_> {
             } => {
                 self.on_pats(args);
                 arg_types.iter().for_each(|arg_ty| self.on_type_opt(*arg_ty));
-                self.on_type_opt(*ret_type);
+                self.on_type_opt(ret_type);
 
-                let mut old_current_closure =
-                    self.current_closure.replace((expr, FxHashSet::default()));
-                self.on_expr(*body_expr);
-                let closure_upvars = self.current_closure.take().unwrap().1;
-                if !closure_upvars.is_empty() {
-                    self.closures_map.insert(expr, Upvars::new(&closure_upvars));
-                    // All nested closure's upvars are also upvars of the parent closure.
-                    if let Some((current_closure, upvars)) = &mut old_current_closure {
-                        upvars.extend(closure_upvars.iter().copied().filter(|local| {
-                            self.store.binding_owner(*local) != Some(*current_closure)
-                        }));
-                    }
+                let start = self.mentioned.len();
+                let outer = self.current_closure.replace((expr, start));
+                self.on_expr(body_expr);
+                self.current_closure = outer;
+
+                self.sort_dedup_from(start);
+                if self.mentioned.len() > start {
+                    self.closures_map.insert(expr, Upvars(self.mentioned[start..].into()));
                 }
-                self.current_closure = old_current_closure;
+                match outer {
+                    // All nested closure's upvars are also upvars of the parent closure, but
+                    // those the parent binds.
+                    Some((outer_closure, _)) => {
+                        let mut kept = start;
+                        for i in start..self.mentioned.len() {
+                            let local = self.mentioned[i];
+                            if store.binding_owner(local) != Some(outer_closure) {
+                                self.mentioned[kept] = local;
+                                kept += 1;
+                            }
+                        }
+                        self.mentioned.truncate(kept);
+                    }
+                    None => self.mentioned.truncate(start),
+                }
             }
-            _ => self.store.visit_expr_children(expr, self),
+            _ => store.visit_expr_children(expr, self),
         }
     }
 

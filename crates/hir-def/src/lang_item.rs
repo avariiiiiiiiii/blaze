@@ -2,9 +2,12 @@
 //!
 //! This attribute to tell the compiler about semi built-in std library
 //! features, such as Fn family of traits.
+use std::sync::OnceLock;
+
 use base_db::SourceDatabase;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
+use rustc_hash::FxHashMap;
 use stdx::impl_from;
 
 use crate::{
@@ -145,7 +148,6 @@ impl LangItems {
     where
         T: Into<AttrDefId> + Into<LangItemTarget> + Copy,
     {
-        let _p = tracing::info_span!("collect_lang_item").entered();
         if let Some(lang_item) = AttrFlags::lang_item(db, item.into()) {
             self.assign_lang_item(lang_item, item.into());
         }
@@ -388,16 +390,10 @@ macro_rules! language_item_table {
                 $( self.$resolve_manually = self.$resolve_manually.or(other.$resolve_manually); )*
             }
 
+            /// Sets the lang item `name` names to `target`, unless `target` is not of its kind.
             fn assign_lang_item(&mut self, name: Symbol, target: LangItemTarget) {
-                match name {
-                    $(
-                        _ if name == $module::$name => {
-                            if let LangItemTarget::$target(target) = target {
-                                self.$lang_item = Some(target);
-                            }
-                        }
-                    )*
-                    _ => {}
+                if let Some(which) = LangItemEnum::from_symbol(&name) {
+                    self.set(which, target);
                 }
             }
 
@@ -451,8 +447,35 @@ macro_rules! language_item_table {
                 }
             }
 
+            /// The lang item `#[lang = "symbol"]` declares: one Fx hash of the symbol's pointer
+            /// and a probe, where a chain of compares took one per lang item before it.
             #[inline]
             pub fn from_symbol(symbol: &Symbol) -> Option<Self> {
+                static BY_SYMBOL: OnceLock<FxHashMap<Symbol, LangItemEnum>> = OnceLock::new();
+                BY_SYMBOL
+                    .get_or_init(|| {
+                        let mut table = FxHashMap::with_capacity_and_hasher(
+                            Self::SYMBOLS.len(),
+                            Default::default(),
+                        );
+                        // A symbol named twice keeps its first lang item, as the chain of
+                        // compares did.
+                        for &(symbol, which) in Self::SYMBOLS {
+                            table.entry(symbol).or_insert(which);
+                        }
+                        table
+                    })
+                    .get(symbol)
+                    .copied()
+            }
+
+            /// Each lang item with the symbol of its `#[lang = ".."]`, in declaration order.
+            const SYMBOLS: &[(Symbol, LangItemEnum)] = &[ $( ($module::$name, Self::$lang_item), )* ];
+
+            /// [`Self::from_symbol`] as a chain of compares, the reference its table is checked
+            /// against.
+            #[cfg(test)]
+            fn from_symbol_by_compare(symbol: &Symbol) -> Option<Self> {
                 match symbol {
                     $( _ if *symbol == $module::$name => Some(Self::$lang_item), )*
                     _ => None,
@@ -779,4 +802,47 @@ language_item_table! { LangItems =>
     DerefMut_deref_mut,            FunctionId;
     Index_index,                   FunctionId;
     IndexMut_index_mut,            FunctionId;
+}
+
+#[cfg(test)]
+mod tests {
+    use intern::{Symbol, sym};
+    use salsa::plumbing::FromId;
+
+    use super::{LangItemEnum, LangItems};
+    use crate::{StructId, TraitId};
+
+    #[test]
+    fn symbol_table_matches_compares() {
+        let mut symbols: Vec<Symbol> = LangItemEnum::SYMBOLS.iter().map(|&(it, _)| it).collect();
+        symbols.extend(
+            ["sized", "copy", "drop", "Default", "Debug", "", "not a lang item"].map(Symbol::intern),
+        );
+        symbols.extend([sym::Default, sym::Output, sym::Item, sym::call, sym::fmt]);
+        for symbol in &symbols {
+            assert_eq!(
+                LangItemEnum::from_symbol(symbol),
+                LangItemEnum::from_symbol_by_compare(symbol),
+                "{symbol:?}"
+            );
+        }
+        assert_eq!(LangItemEnum::from_symbol(&sym::sized), Some(LangItemEnum::Sized));
+        assert_eq!(LangItemEnum::from_symbol(&Symbol::intern("not a lang item")), None);
+    }
+
+    #[test]
+    fn assign_keeps_to_the_kind() {
+        let trait_ = TraitId::from_id(salsa::Id::from_bits(5));
+        let struct_ = StructId::from_id(salsa::Id::from_bits(6));
+        let mut items = LangItems::default();
+        items.assign_lang_item(sym::sized, struct_.into());
+        assert_eq!(items, LangItems::default());
+        items.assign_lang_item(sym::sized, trait_.into());
+        items.assign_lang_item(Symbol::intern("not a lang item"), trait_.into());
+        items.assign_lang_item(sym::phantom_data, struct_.into());
+        let mut expected = LangItems::default();
+        expected.Sized = Some(trait_);
+        expected.PhantomData = Some(struct_);
+        assert_eq!(items, expected);
+    }
 }

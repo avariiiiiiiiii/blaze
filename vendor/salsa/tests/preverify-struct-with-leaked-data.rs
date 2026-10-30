@@ -82,7 +82,6 @@ fn test_leaked_inputs_ignored() {
     let result_in_rev_2 = function(&db, input);
     db.assert_logs(expect![[r#"
         [
-            "DidSetCancellationFlag",
             "WillCheckCancellation",
             "WillCheckCancellation",
             "DidValidateMemoizedValue { database_key: counter_field(Id(80)) }",

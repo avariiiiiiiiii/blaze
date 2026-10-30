@@ -12,7 +12,7 @@
 //! `OVERLAPPED`, its bytes, the handle it is on) is the request's, and the request is dropped
 //! only once its completion is taken from the port, never before.
 
-mod files;
+pub(crate) mod files;
 mod net;
 mod process;
 mod sys;
@@ -1358,9 +1358,8 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The file effects, one after another, end as on the threads driver, but for what
-    /// Windows does here and the threads driver cannot: a clone on ReFS, and a mode Windows
-    /// keeps (asked for after the script, alone).
+    /// The file effects, one after another, end as on the threads driver (a mode Windows keeps
+    /// is asked for after the script, alone).
     #[test]
     fn files_end_as_on_threads() {
         let file = name("vfs/journal");
@@ -1408,13 +1407,10 @@ mod tests {
         };
         let (ours, theirs) = (dir("files"), dir("files-threads"));
         let mut iocp = Iocp::new(&ours, 2).unwrap();
-        let mut ran = script(&mut iocp);
+        let ran = script(&mut iocp);
         let threads = script(&mut Threads::new(&theirs, 2));
-        // The threads driver shares no blocks on Windows; this one does on ReFS, and names the
-        // file system it cannot on.
-        assert_eq!(threads[8], "failed");
+        // Shared blocks on ReFS; elsewhere an error naming the file system.
         assert!(ran[8] == "failed" || ran[8] == format!("{:?}", Done::Cloned), "{}", ran[8]);
-        ran[8] = threads[8].clone();
         assert_eq!(ran, threads);
         assert_eq!(ran[5], format!("{:?}", Done::Read(b"onet".to_vec())));
         assert_eq!(ran[3], format!("{:?}", Done::Read(b"etw".to_vec())));

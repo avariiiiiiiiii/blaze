@@ -7,7 +7,7 @@ use object::pe::{self, ImageNtHeaders64};
 use object::read::pe::{ExportTarget, Import as PeImport, ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 
 use super::coff::{Aligned, ImportName, words};
-use super::image::{self, Buf, Tables, alignment, pdb_name};
+use super::image::{self, Buf, Image, Tables, alignment, pdb_name};
 use super::{DEBUG, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, TLS_DIR, TLS_INDEX, rank, writer};
 use crate::model::{
     Apply, Bind, Binding, Class, Counts, Data, Directive, Export, Function, GotEntry, Group, Holds, Import, Library,
@@ -56,6 +56,7 @@ fn import(name: &str, library: u32, version: &str) -> Import {
         version: Some(version.into()),
         kind: SymbolKind::Function,
         weak: false,
+        wasm: None,
     }
 }
 
@@ -557,6 +558,35 @@ fn crt_tls_directory_is_used_when_defined() {
 
     f.set(&Class::Rodata, crt(tdata + 8, tdata + 16));
     f.fails("_tls_used");
+    f.set(&Class::Rodata, crt(tdata, tdata + 24));
+    f.fails("_tls_used");
+}
+
+/// As tlssup.obj lays it out: `_tls_start` in `.tls`, the thread-locals, then `_tls_end`, a byte
+/// in `.tls$ZZZ` past the range; and an incremental image's room after it.
+#[test]
+fn crt_tls_range_ends_before_its_end_marker() {
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+        (Class::Rodata, Data::Bytes(vec![0; 40])),
+        (Class::Tdata, Data::Bytes(vec![5; 17])),
+    ];
+    let mut f = Fixture::new(exe(), pieces, &Counts::default());
+    let (text, rodata, tdata) = (f.at(&Class::Text), f.at(&Class::Rodata), f.at(&Class::Tdata));
+    f.entry = Some(text);
+    f.tls = Some(Tls { addr: tdata, init: 17, size: 17 + 0x1_0000, align: 8 });
+    f.symbols = vec![("_tls_used", rodata)];
+    let mut directory = Buf::default();
+    for value in [tdata, tdata + 16, 0, 0] {
+        directory.u64(value);
+    }
+    directory.u32(0);
+    directory.u32(0);
+    f.set(&Class::Rodata, directory.0);
+    let image = f.image().unwrap();
+    let aligned = Aligned::new(&image);
+    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(rodata), 40));
 }
 
 #[test]
@@ -793,6 +823,41 @@ fn base_relocation_blocks_encode() {
     expected.u16(0xa008);
     expected.u16(0);
     assert_eq!(reloc, &expected.0);
+}
+
+#[test]
+fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
+    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; 0x40000]))];
+    let mut f = Fixture::new(exe(), pieces, &Counts::default());
+    let data = f.at(&Class::Data);
+    // Dense pages, sparse pages, duplicates, and an odd count per page (a pad entry), unsorted.
+    let mut rebase: Vec<u64> = (0..0x2000).map(|it| data + it * 8).collect();
+    rebase.extend((0..20).map(|it| data + 0x20000 + it * 0x1800));
+    rebase.extend([data + 0x3f000, data + 0x3f000, data + 0x10, data + 0x3fff8]);
+    rebase.reverse();
+    f.rebase = rebase;
+    let extra = [data + 0x3f008, data + 0x18, data + 0x25000];
+    let whole = f.placed(|placed| image::relocations(Image::of(placed), &extra, usize::MAX)).unwrap();
+    for piece in [1, 2, 7, 512, 4096] {
+        let split = f.placed(|placed| image::relocations(Image::of(placed), &extra, piece)).unwrap();
+        assert_eq!(split, whole, "pieces of {piece}");
+    }
+    let threads = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let one = threads.install(|| f.placed(|placed| image::relocations(Image::of(placed), &extra, 7))).unwrap();
+    assert_eq!(one, whole);
+
+    let mut blocks = 0;
+    let mut at = 0;
+    while at < whole.len() {
+        let size = u32_at(&whole, at + 4) as usize;
+        assert!(size >= 8 && size.is_multiple_of(4));
+        assert_eq!(u32_at(&whole, at) % 0x1000, 0);
+        at += size;
+        blocks += 1;
+    }
+    assert_eq!(at, whole.len());
+    // The 16 pages of the dense run, the 20 sparse ones, 0x25000 and 0x3f000.
+    assert_eq!(blocks, 16 + 20 + 1 + 1);
 }
 
 // Inputs.

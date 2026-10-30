@@ -1,7 +1,9 @@
 //! `cargo tree`, made by blaze with no cargo: `src/ops/cargo_tree/` of cargo 1.101.0
 //! (cad07cf8e5), on the workspace blaze-metadata resolves and blaze-resolve's feature
 //! resolver. It prints what cargo prints, line for line; `harness/own_tree.py` holds it to
-//! that.
+//! that. [`query::Tree`] is the same over the database's load (blaze-units' `load`).
+
+#![forbid(unsafe_code)]
 
 mod format;
 mod graph;
@@ -11,8 +13,8 @@ use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_manifest::Workspace;
-use blaze_metadata::{Asked, Read, Resolved};
 use blaze_manifest::config::schema::FeatureUnification;
+use blaze_metadata::{Asked, Read};
 use blaze_resolve::resolver::{
     CliFeatures, CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets,
     ResolveBehavior, members_with_features,

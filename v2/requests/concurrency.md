@@ -8,6 +8,8 @@ Paths: `crates/blaze-cas/src/remote.rs`, and `Store::take_fetched`/`put` in
 `blaze_cas::remote` yet, so the signature changes below break no caller. C1 is a memory bound,
 so do it even if you skip the rest.
 
+> forwarded to concurrency: C1-C8 below.
+
 ### C1. Server: bound the answers queued from one batch (remote.rs `Server::serve`, ~line 677)
 
 - Now: `serve` answers every whole ask in `peer.buffer`. `QUEUED_MOST` is only checked in
@@ -20,6 +22,8 @@ so do it even if you skip the rest.
     drain (`serve` ends in `pump`; `pump` already holds the `Recv` back while over the bound).
 - Test: put 4 values of 40 MiB each, send 4 asks in one receive, and check that at most two
   frames are queued before the first `Done::Sent`. All 4 still arrive, in order.
+
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
 
 ### C2. Server: one `Vec` and one send per batch of small answers
 
@@ -38,6 +42,8 @@ so do it even if you skip the rest.
 - Test: 100 asks in one receive (half missing, half 1 KiB values) give exactly one
   `Effect::Send`. It decodes to 100 frames in ask order.
 
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
+
 ### C3. Client: one send per turn of fetches (`impl Remote for Client`, ~line 503)
 
 - Now: `fetch` pumps at once, so the first ask of a turn is sent alone. The asks of the turn's
@@ -48,12 +54,16 @@ so do it even if you skip the rest.
   `waiting.push_back` as now.
 - Test: 24 fetches with one `effects` `Vec` give exactly one `Effect::Send` of 24 × 40 bytes.
 
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
+
 ### C4. Client: adopt the driver's receive `Vec` (`Client::complete`, `Role::Recv`, ~line 381)
 
 - Change: `Done::Read(bytes)` →
   `if up.buffer.is_empty() { up.buffer = bytes } else { up.buffer.extend_from_slice(&bytes) }`.
 - Saves a copy of every answer that arrives in one receive, and of the first receive of a long
   one. The existing split-at-N tests cover it.
+
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
 
 ### C5. Client: hand a long first frame on without a copy (`take_answers`, ~line 439)
 
@@ -70,6 +80,8 @@ so do it even if you skip the rest.
     `(tag, len)`, then move.
 - Test: the 10 MiB answer test checks that the completion's `Vec` pointer equals the buffer's
   before the take.
+
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
 
 ### C6. Store: one hash and no decode copy per fetched value (lib.rs `take_fetched`, ~line 2160; `put`, ~line 781)
 
@@ -91,6 +103,8 @@ so do it even if you skip the rest.
 - Test: the existing fetch tests (kept, bad hash, missing, I/O failure). Add a fetched External
   value (4 MiB or more), read back the same after a reopen.
 
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
+
 ### C7. Wire version 2: answers in any order within a batch (no head-of-line blocking)
 
 - Now: answers come in ask order, so a large value delays every answer asked after it.
@@ -110,11 +124,15 @@ so do it even if you skip the rest.
 - Test: ask for a 10 MiB value, then 3 small ones in one send. The small answers complete
   before the large one. An answer for an unasked key fails the connection.
 
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
+
 ### C8. `Client::complete` and `close` append to a caller's `Vec`
 
 - Change: `complete(&mut self, completion, effects, answers: &mut Vec<Completion>)`, and the
   same for `close`. This drops an allocation per completion that answers something. The
   callers are the tests only.
+
+> forwarded to concurrency: `crates/blaze-cas/` is lane concurrency's now (this file's title); lane concurrency is still running.
 
 ### Still needs core
 
@@ -122,3 +140,5 @@ so do it even if you skip the rest.
 - With K1, the server sends a `Form::Raw` record's bytes from the pack mapping: zero copies in
   user space.
 - With K2, a long value lands with one copy across receives.
+
+> forwarded to core: K1 and K2 (`v2/requests/core.md`).

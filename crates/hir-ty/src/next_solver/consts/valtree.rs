@@ -1,7 +1,6 @@
-use std::{borrow::Cow, fmt, hash::Hash, num::NonZero};
+use std::{borrow::Cow, fmt, hash::Hash, marker::PhantomData, num::{NonZero, NonZeroU32}};
 
 use hir_def::{AdtId, VariantId};
-use intern::{Interned, InternedRef, impl_internable};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_type_ir::{GenericTypeVisitable, TypeFoldable, TypeVisitable, inherent::IntoKind};
@@ -12,7 +11,7 @@ use crate::{
     db::HirDatabase,
     layout::Layout,
     mir::{IsSigned, pad16},
-    next_solver::{Const, Consts, TyKind, WorldExposer},
+    next_solver::{Const, Consts, TyKind, WorldExposer, interner::table},
     utils::detect_variant_from_bytes,
 };
 
@@ -325,14 +324,22 @@ impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'d
     }
 }
 
+/// Every interned [`ValTree`], kept whole: [`ValTree::inner`] hands out a reference.
+static VALTREES: table::Values<ValTreeKind<'static>> = table::Values::new("valtrees");
+
+/// A value tree: its row in [`VALTREES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct ValTree<'db> {
-    interned: InternedRef<'db, ValTreeInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
+
+const _: () = assert!(size_of::<Option<ValTree<'static>>>() == 4);
 
 impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(VALTREES.name(), self.index.get()).is_continue() {
             self.inner().generic_visit_with(visitor);
         }
     }
@@ -360,16 +367,6 @@ impl<'db> TypeFoldable<DbInterner<'db>> for ValTree<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub(in super::super) struct ValTreeInterned(ValTreeKind<'static>);
-
-impl_internable!(gc; ValTreeInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<ValTree<'static>>();
-};
-
 impl<'db> IntoKind for ValTree<'db> {
     type Kind = ValTreeKind<'db>;
 
@@ -381,24 +378,38 @@ impl<'db> IntoKind for ValTree<'db> {
 impl<'db> ValTree<'db> {
     #[inline]
     pub fn new(kind: ValTreeKind<'db>) -> Self {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
         let kind = unsafe { std::mem::transmute::<ValTreeKind<'db>, ValTreeKind<'static>>(kind) };
-        Self { interned: Interned::new_gc(ValTreeInterned(kind)) }
+        Self::at(VALTREES.intern(kind))
     }
 
     #[inline]
     pub fn inner(&self) -> &ValTreeKind<'db> {
-        let inner = &self.interned.0;
+        // SAFETY: a `ValTree` is a row of `VALTREES`.
+        let inner = unsafe { VALTREES.get(self.index) };
+        // SAFETY: as in `new`.
         unsafe { std::mem::transmute::<&ValTreeKind<'static>, &ValTreeKind<'db>>(inner) }
     }
 
     pub fn from_scalar_int(_interner: DbInterner<'db>, i: ScalarInt) -> Self {
         ValTree::new(ValTreeKind::Leaf(i))
     }
+
+    #[inline]
+    pub(in super::super) fn at(index: NonZeroU32) -> Self {
+        ValTree { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(in super::super) fn row(self) -> NonZeroU32 {
+        self.index
+    }
 }
 
 impl std::fmt::Debug for ValTree<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.interned.fmt(f)
+        self.inner().fmt(f)
     }
 }
 

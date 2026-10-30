@@ -3,18 +3,19 @@
 //! the strongly connected components of the constraint graph.
 
 use super::{
-    bitset::BitSet,
+    bitset::{BitMatrix, iter_words},
     intervals::IntervalSet,
     regions::{Regions, Rv},
     relation::Csr,
 };
 
 /// The points each region holds at, and the universal regions it outlives: one value for each
-/// strongly connected component of the outlives graph, whose regions hold the same.
+/// strongly connected component of the outlives graph, whose regions hold the same. The
+/// universals are a bit matrix, a row of `universals / 64` words per component.
 pub(super) struct RegionValues {
     scc: Vec<u32>,
     points: Vec<IntervalSet>,
-    universals: Vec<BitSet>,
+    universals: BitMatrix,
 }
 
 impl RegionValues {
@@ -27,7 +28,7 @@ impl RegionValues {
     }
 
     pub(super) fn universals_of(&self, rv: Rv) -> impl Iterator<Item = usize> + '_ {
-        self.universals[self.scc[rv] as usize].iter()
+        iter_words(self.universals.row(self.scc[rv] as usize))
     }
 }
 
@@ -40,17 +41,19 @@ pub(super) fn infer(
     points: usize,
     live: Vec<IntervalSet>,
 ) -> RegionValues {
-    // `sup: sub` makes `sup` hold what `sub` does: an edge from `sup` to `sub`.
-    let edges = Csr::build(
-        count,
-        (0..count).flat_map(|sup| {
-            regions.outlives.subs_of(count, sup).map(move |sub| (sup as u32, sub as u32))
-        }),
-    );
+    // `sup: sub` makes `sup` hold what `sub` does: an edge from `sup` to `sub`, appended in
+    // `sup` order, so no sort.
+    let mut edges = Csr::with_capacity(count, regions.outlives.len());
+    for sup in 0..count {
+        for sub in regions.outlives.subs_of(count, sup) {
+            edges.push(sub as u32);
+        }
+        edges.end_node();
+    }
     let (scc, sccs) = strongly_connected(&edges);
     // Tarjan's algorithm numbers a component after every component it reaches.
     let mut values = vec![IntervalSet::default(); sccs];
-    let mut universals = vec![BitSet::new(regions.universals.len()); sccs];
+    let mut universals = BitMatrix::new(sccs, regions.universals.len());
     for (rv, it) in live.into_iter().enumerate() {
         values[scc[rv] as usize].union(&it);
     }
@@ -62,15 +65,12 @@ pub(super) fn infer(
         if points > 0 {
             values[at].insert_range(0, points - 1);
         }
-        universals[at].insert(index);
+        universals.insert(at, index);
     }
-    let mut members: Vec<Vec<u32>> = vec![Vec::new(); sccs];
-    for rv in 0..count {
-        members[scc[rv] as usize].push(rv as u32);
-    }
+    let members = Csr::build(sccs, scc.iter().enumerate().map(|(rv, &at)| (at, rv as u32)));
     let mut seen = vec![u32::MAX; sccs];
     for at in 0..sccs {
-        for &rv in &members[at] {
+        for &rv in members.of(at) {
             for &sub in edges.of(rv as usize) {
                 let from = scc[sub as usize] as usize;
                 if from == at || seen[from] == at as u32 {
@@ -80,8 +80,7 @@ pub(super) fn infer(
                 debug_assert!(from < at);
                 let (done, rest) = values.split_at_mut(at);
                 rest[0].union(&done[from]);
-                let (done, rest) = universals.split_at_mut(at);
-                rest[0].union(&done[from]);
+                universals.union_rows(at, from);
             }
         }
     }

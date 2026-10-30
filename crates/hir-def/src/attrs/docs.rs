@@ -17,14 +17,14 @@ use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
     AstId, ExpandTo, HirFileId, InFile, MacroCallId,
-    attrs::{AstPathExt, expand_cfg_attr_with_doc_comments},
+    attrs::expand_cfg_attr_with_doc_comments,
     mod_path::ModPath,
     span_map::SpanMap,
 };
 use span::AstIdMap;
 use syntax::{
     AstNode, SyntaxNode,
-    ast::{self, IsString},
+    ast::{self, HasAttrs, IsString},
 };
 use thin_vec::ThinVec;
 use tt::{TextRange, TextSize};
@@ -701,7 +701,7 @@ fn extend_with_attrs<'a, 'db>(
             match attr {
                 Either::Right(doc_comment) => result.extend_with_doc_comment(doc_comment, indent),
                 Either::Left((attr, _)) => match attr {
-                    ast::Meta::KeyValueMeta(attr) if attr.path().is1("doc") => {
+                    ast::Meta::KeyValueMeta(attr) if super::path_is(attr.path(), "doc") => {
                         if let Some(value) = attr.expr() {
                             if let ast::Expr::Literal(value) = &value
                                 && let ast::LiteralKind::String(value) = value.kind()
@@ -739,6 +739,79 @@ fn extend_with_attrs<'a, 'db>(
             ControlFlow::Continue(())
         },
     );
+}
+
+/// The node holding `owner`'s inner attributes and inner doc comments.
+/// `HasAttrs::inner_attributes_node` leaves an outline's unparsed fn body (#1294) out when its
+/// text can't start with `#`, and an inner doc comment (`//!`, `/*!`) is a comment to that check:
+/// such a body is entered here when it may start with one.
+pub(super) fn inner_docs_node(owner: &ast::AnyHasAttrs) -> Option<SyntaxNode> {
+    if let Some(node) = owner.inner_attributes_node() {
+        return Some(node);
+    }
+    let body = ast::Fn::cast(owner.syntax().clone())?.body()?;
+    if !body.syntax().is_lazy() {
+        return None;
+    }
+    let (tree, at) = body.syntax().flat()?;
+    if !block_may_start_with_inner_doc(&tree.source()[tree.range(at)]) {
+        return None;
+    }
+    Some(body.stmt_list()?.syntax().clone())
+}
+
+/// Whether the text of a block, its `{` included, may start with an inner doc comment or an
+/// inner attribute after whitespace and other comments, as the parser takes a body's leading
+/// run of them: false only when it surely does not.
+fn block_may_start_with_inner_doc(block: &str) -> bool {
+    let Some(mut rest) = block.strip_prefix('{') else { return true };
+    loop {
+        rest = rest
+            .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
+        if let Some(comment) = rest.strip_prefix("//") {
+            if comment.starts_with('!') {
+                return true;
+            }
+            match comment.find('\n') {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            if comment.starts_with('!') {
+                return true;
+            }
+            match block_comment_len(comment) {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else {
+            return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
+        }
+    }
+}
+
+/// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
+/// closes it, nested comments included as the lexer counts them.
+fn block_comment_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut at) = (1usize, 0);
+    while at + 1 < bytes.len() {
+        match (bytes[at], bytes[at + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    None
 }
 
 pub(crate) fn extract_docs<'a, 'db>(
@@ -829,7 +902,36 @@ mod tests {
 
     use crate::test_db::TestDB;
 
-    use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
+    use super::{DocCommentKind, Docs, Indent, IsInnerDoc, block_may_start_with_inner_doc};
+
+    #[test]
+    fn a_block_may_start_with_inner_docs() {
+        for maybe in [
+            "{ //! inner docs\n x }",
+            "{ /*! inner docs */ x }",
+            "{//!}",
+            "{ // a comment\n //! inner }",
+            "{ /* a /* nested */ comment */ /*! inner */ }",
+            "{ #![allow(unused)] }",
+            "{ \u{2028} x }",
+            "{ /* unterminated ",
+            "{ // no newline",
+            "not a block",
+            "{",
+        ] {
+            assert!(block_may_start_with_inner_doc(maybe), "{maybe:?}");
+        }
+        for not in [
+            "{}",
+            "{ let x = 1; //! late }",
+            "{ // not //! docs\n x }",
+            "{ /// outer docs\n x }",
+            "{ /** outer docs */ x }",
+            "{ /* //! */ x }",
+        ] {
+            assert!(!block_may_start_with_inner_doc(not), "{not:?}");
+        }
+    }
 
     #[test]
     fn docs() {

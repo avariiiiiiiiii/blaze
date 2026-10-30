@@ -69,7 +69,6 @@ trait HasOptionInput {
 trait Db: HasOptionInput + salsa::Database {}
 
 #[salsa::db]
-#[derive(Clone)]
 struct Database {
     storage: salsa::Storage<Self>,
     logger: Logger,
@@ -153,7 +152,6 @@ fn revalidate_no_changes() {
 
     db.assert_logs(expect![[r#"
         [
-            "salsa_event(DidSetCancellationFlag)",
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(100)) })",
             "salsa_event(DidValidateMemoizedValue { database_key: query_d(Id(180)) })",
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(101)) })",
@@ -185,7 +183,6 @@ fn revalidate_with_change_after_output_read() {
 
     db.assert_logs(expect![[r#"
         [
-            "salsa_event(DidSetCancellationFlag)",
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(100)) })",
             "salsa_event(WillExecute { database_key: query_d(Id(180)) })",
             "salsa_event(WillExecute { database_key: query_b(Id(80)) })",

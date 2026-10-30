@@ -63,10 +63,14 @@ fn initial(_db: &dyn salsa::Database, _id: salsa::Id, _input: Input) -> CycleVal
 fn the_test() {
     crate::sync::check(move || {
         // This is a bit silly but it works around https://github.com/awslabs/shuttle/issues/192
-        static INITIALIZE: sync::Mutex<Option<(salsa::DatabaseImpl, Input)>> =
+        static INITIALIZE: sync::Mutex<Option<(std::sync::Arc<salsa::DatabaseImpl>, Input)>> =
             sync::Mutex::new(None);
 
-        fn get_db(f: impl FnOnce(&salsa::DatabaseImpl, Input)) -> (salsa::DatabaseImpl, Input) {
+        /// The database every thread shares, made and advanced to its second revision by the
+        /// first thread to ask, which runs `f` in the first revision.
+        fn get_db(
+            f: impl FnOnce(&salsa::DatabaseImpl, Input),
+        ) -> (std::sync::Arc<salsa::DatabaseImpl>, Input) {
             let mut shared = INITIALIZE.lock().unwrap();
 
             if let Some((db, input)) = shared.as_ref() {
@@ -81,6 +85,7 @@ fn the_test() {
 
             input.set_value(&mut db).to(2);
 
+            let db = std::sync::Arc::new(db);
             *shared = Some((db.clone(), input));
 
             (db, input)
@@ -91,19 +96,19 @@ fn the_test() {
                 query_a(db, input);
             });
 
-            query_a(&db, input)
+            query_a(&*db, input)
         });
         let t2 = thread::spawn(|| {
             let (db, input) = get_db(|db, input| {
                 query_b(db, input);
             });
-            query_b(&db, input)
+            query_b(&*db, input)
         });
         let t3 = thread::spawn(|| {
             let (db, input) = get_db(|db, input| {
                 query_c(db, input);
             });
-            query_c(&db, input)
+            query_c(&*db, input)
         });
 
         let r_t1 = t1.join().unwrap();

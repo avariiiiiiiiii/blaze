@@ -1,0 +1,66 @@
+# Requests from `diagnostics-items-resolve`
+
+## 1. `hir::MacroError` should carry the expansion error, not only its text (db-expand / hir)
+
+Where: `crates/hir/src/diagnostics.rs` (`MacroError`, built in `emit_def_diagnostic` and
+`collect_macro_call`), `crates/hir-expand/src/lib.rs` (`ExpandErrorKind`), `crates/mbe`.
+
+What: give `MacroError` the `MacroCallId` and the `ExpandErrorKind` itself (or an enum of the kinds
+blaze lowers: compile_error with its string, proc macro panic with its message, recursion overflow,
+mbe match failure, definition with parse errors, other), instead of `message: String` and
+`kind: &'static str`. For an mbe match failure, the matcher's account of the best failure as rustc's
+`CollectTrackerAndEmitter` keeps it (`rustc_expand/src/mbe/diagnostics.rs`): the token it failed
+at (or end of input), the remaining matcher's description and range (rustc's "while trying to match
+meta-variable `$a:ident`" note) and whether adding a comma makes a rule match (the "missing comma
+here" help).
+
+Why: `lower/macro_error.rs` now tells the kind from the rendered text and the range, so a failure
+whose span mbe puts on the open delimiter or the macro name gives "no rules of `m!` match this
+call", not rustc's "no rules expected `x`"; and the note and comma help, which every rustc
+`no rules expected` has, can't be given at all.
+
+## 2. Run `macro_def_error::check` on every local `macro_rules!` (diagnostics-items)
+
+Where: `crates/blaze-diagnostics/src/lower/mod.rs` or the items checks.
+
+What: call `lower::macro_def_error::check(cx, InFile<&ast::Macro>)` for each local `macro_rules!`
+that hir does not report a `MacroDefError` for (or for all of them, and have
+`AnyDiagnostic::MacroDefError` lower to nothing).
+
+Why: mbe accepts definitions rustc refuses: no rules at all (`macro_rules! f {}`), an invalid
+fragment specifier (`$x:id`), duplicate bindings, empty repetitions; hir only reports what mbe
+refuses, so those give no error today.
+
+## 3. Builtin macros' errors in rustc's words (db-expand)
+
+Where: `crates/hir-expand/src/builtin/fn_macro.rs`, `builtin/derive_macro.rs`.
+
+What: the `ExpandError::other` texts of `env!`, `include!`, `concat!`, `format_args!`, the builtin
+derives and the rest as `rustc_builtin_macros` gives them (e.g. "environment variable `X` not
+defined at compile time" with its help).
+
+Why: `lower/macro_error.rs` gives them as "blaze can't expand macro `x`: {text}", an error naming
+what, but not rustc's.
+
+## 4. A parse error of a token stream in rustc's words (diagnostics-items / parse)
+
+Where: `crates/blaze-diagnostics/src/lower/parse.rs`.
+
+What: expose the translation of rust-analyzer's parser errors to rustc's (`parser_error`,
+`expected_one`, `expected_item`) over a syntax tree that is not a file, so a macro expansion's
+parse errors can use it.
+
+Why: `lower/macro_expansion_parse_error.rs` gives rustc's "expected expression, found `x`" for an
+expression, type or pattern and rust-analyzer's text for the rest; rustc's "macro expansion
+ignores `x` and any tokens following" needs the fragment parse's leftovers, which rust-analyzer's
+parser wraps in an `ERROR` node with no message.
+
+## 5. Whether cargo invoked the compile (diagnostics / blaze-api)
+
+Where: `crates/blaze-diagnostics` `Options`.
+
+What: a flag for rustc's `was_invoked_from_cargo()`.
+
+Why: E0432/E0433's "you might be missing a crate named `x`" help reads "if you wanted to use a
+crate named `x`, use `cargo add x` to add it to your `Cargo.toml`" under cargo;
+`lower/unresolved_import.rs` gives the non-cargo text.

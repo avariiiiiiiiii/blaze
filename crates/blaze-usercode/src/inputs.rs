@@ -4,20 +4,21 @@
 //! database ([`ViewInputs`]), which records each as an edge of the query that checks them.
 //!
 //! The machine's files are the one thing of user code read outside a view: they are hashed
-//! once per change of what `stat` says of them, and a file that is there and can't be read
-//! is an error naming it, never left out.
+//! once per change of what `stat` says of them, in one table every check of the process shares
+//! ([`Files`]), and a file that is there and can't be read is an error naming it, never left
+//! out.
 
 use std::{
-    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, io,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_query::{Cancelled, Cx};
 
-use crate::trace::{DIRECTORY, Inputs, listing};
+use crate::trace::{DIRECTORY, Inputs, listing, os_bytes};
 
 /// What a traced path that is neither a file nor a directory hashes as.
 pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
@@ -74,54 +75,39 @@ impl Stamp {
             }
         }
     }
-}
 
-/// The machine's files as they are, and an environment.
-pub struct Disk {
-    env: Vec<(OsString, OsString)>,
-    files: HashMap<PathBuf, (Stamp, [u8; 32])>,
-}
-
-impl Disk {
-    pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
-        Disk { env, files: HashMap::new() }
-    }
-
-    /// The same files, cached, with another environment: one `Disk` serves every check of a
-    /// daemon.
-    pub fn set_env(&mut self, env: Vec<(OsString, OsString)>) {
-        self.env = env;
+    fn bytes(&self) -> [u8; 56] {
+        let mut out = [0; 56];
+        out[..8].copy_from_slice(&self.len.to_le_bytes());
+        out[8..24].copy_from_slice(&self.modified.to_le_bytes());
+        out[24..40].copy_from_slice(&self.changed.to_le_bytes());
+        out[40..48].copy_from_slice(&self.inode.to_le_bytes());
+        out[48..].copy_from_slice(&self.device.to_le_bytes());
+        out
     }
 }
 
-fn missing(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-        || error.raw_os_error() == Some(NOT_A_DIRECTORY)
-}
+/// The hashes of the machine's files, each under its path and what `stat` said of it when it
+/// was hashed. Append-only: a lookup takes no lock and writes nothing shared, a file is hashed
+/// outside any lock, and an edit adds an entry under its new stamp rather than changing one.
+pub struct Files(Sharded<[u8; 32]>);
 
-#[cfg(unix)]
-const NOT_A_DIRECTORY: i32 = libc::ENOTDIR;
-#[cfg(not(unix))]
-const NOT_A_DIRECTORY: i32 = 267;
-
-/// The BLAKE3 hash of what `reader` reads.
-pub fn hash_reader(mut reader: impl io::Read) -> io::Result<[u8; 32]> {
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0; 1 << 16];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(*hasher.finalize().as_bytes()),
-            Ok(n) => _ = hasher.update(&buffer[..n]),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
+impl Files {
+    pub fn new() -> Files {
+        Files(Sharded::new())
     }
-}
 
-impl Inputs for Disk {
-    type Error = Unreadable;
+    /// The one table of the process.
+    pub fn shared() -> &'static Files {
+        static FILES: OnceLock<Files> = OnceLock::new();
+        FILES.get_or_init(Files::new)
+    }
 
-    fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+    fn key(path: &Path, stamp: &Stamp) -> ContentId {
+        Hasher::new("blaze v2 disk stamp 1").part(os_bytes(path.as_os_str())).part(&stamp.bytes()).finish()
+    }
+
+    fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
         let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
@@ -138,19 +124,107 @@ impl Inputs for Disk {
             return Ok(Some(SPECIAL));
         }
         let stamp = Stamp::of(&meta);
-        if let Some((seen, hash)) = self.files.get(path)
-            && *seen == stamp
-        {
-            return Ok(Some(*hash));
+        let key = Files::key(path, &stamp);
+        if let Some(found) = self.0.find(&key) {
+            return Ok(Some(*self.0.get(found)));
         }
         let file = std::fs::File::open(path).map_err(unreadable)?;
         let hash = hash_reader(file).map_err(unreadable)?;
         // A file changed while it was read is hashed again at its next check.
         let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
         if after == Some(stamp) {
-            self.files.insert(path.to_owned(), (stamp, hash));
+            self.0.intern(key, || hash);
         }
         Ok(Some(hash))
+    }
+}
+
+impl Default for Files {
+    fn default() -> Files {
+        Files::new()
+    }
+}
+
+/// An environment, sorted by name, each name once (the first, as `getenv` finds it).
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct Env(Vec<(OsString, OsString)>);
+
+impl Env {
+    pub fn new(mut vars: Vec<(OsString, OsString)>) -> Env {
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        vars.dedup_by(|later, first| later.0 == first.0);
+        Env(vars)
+    }
+
+    pub fn get(&self, name: &OsStr) -> Option<&OsStr> {
+        let at = self.0.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
+        Some(&self.0[at].1)
+    }
+
+    pub fn vars(&self) -> &[(OsString, OsString)] {
+        &self.0
+    }
+}
+
+/// The machine's files and an environment, as one check sees them: what [`Files`] it hashes
+/// with and what [`Env`] it answers from, both shared.
+#[derive(Clone, Copy)]
+pub struct Now<'a> {
+    pub files: &'a Files,
+    pub env: &'a Env,
+}
+
+/// The machine's files as they are, through [`Files::shared`], and an environment of its own.
+#[derive(Clone)]
+pub struct Disk {
+    files: &'static Files,
+    env: Env,
+}
+
+impl Disk {
+    pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
+        Disk { files: Files::shared(), env: Env::new(env) }
+    }
+
+    /// The same files with another environment.
+    pub fn set_env(&mut self, env: Vec<(OsString, OsString)>) {
+        self.env = Env::new(env);
+    }
+
+    pub fn now(&self) -> Now<'_> {
+        Now { files: self.files, env: &self.env }
+    }
+}
+
+fn missing(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+        || error.raw_os_error() == Some(NOT_A_DIRECTORY)
+}
+
+#[cfg(unix)]
+const NOT_A_DIRECTORY: i32 = libc::ENOTDIR;
+#[cfg(not(unix))]
+const NOT_A_DIRECTORY: i32 = 267;
+
+/// The BLAKE3 hash of what `reader` reads.
+pub fn hash_reader(mut reader: impl io::Read) -> io::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 1 << 16];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(*hasher.finalize().as_bytes()),
+            Ok(n) => _ = hasher.update(&buffer[..n]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+impl Inputs for Now<'_> {
+    type Error = Unreadable;
+
+    fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        self.files.file(path)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -176,13 +250,35 @@ impl Inputs for Disk {
     }
 
     fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+        self.env.get(name).map(OsStr::to_owned)
     }
 
     fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        let mut all = self.env.clone();
-        all.sort();
-        all
+        self.env.vars().to_vec()
+    }
+}
+
+impl Inputs for Disk {
+    type Error = Unreadable;
+
+    fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        self.now().file(path)
+    }
+
+    fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        self.now().dir(path)
+    }
+
+    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
+        self.now().names(path)
+    }
+
+    fn env(&mut self, name: &OsStr) -> Option<OsString> {
+        self.now().env(name)
+    }
+
+    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
+        self.now().env_all()
     }
 }
 
@@ -205,13 +301,19 @@ impl From<Unreadable> for ViewError {
     }
 }
 
-/// The plain BLAKE3 hashes of a view's files, by their content ID: shared by every check.
+/// The plain BLAKE3 hashes of a view's files, by their content ID: shared by every check, as
+/// [`Files`] is.
 #[derive(Default)]
-pub struct Hashes(HashMap<ContentId, [u8; 32]>);
+pub struct Hashes(Sharded<[u8; 32]>);
 
 impl Hashes {
-    fn of(&mut self, id: ContentId, bytes: &[u8]) -> [u8; 32] {
-        *self.0.entry(id).or_insert_with(|| *blake3::hash(bytes).as_bytes())
+    fn of(&self, id: ContentId, bytes: &[u8]) -> [u8; 32] {
+        if let Some(found) = self.0.find(&id) {
+            return *self.0.get(found);
+        }
+        let hash = *blake3::hash(bytes).as_bytes();
+        self.0.intern(id, || hash);
+        hash
     }
 }
 
@@ -221,8 +323,8 @@ impl Hashes {
 pub struct ViewInputs<'a, 'db> {
     pub cx: &'a mut Cx<'db>,
     pub root: &'a Path,
-    pub disk: &'a mut Disk,
-    pub hashes: &'a mut Hashes,
+    pub now: Now<'a>,
+    pub hashes: &'a Hashes,
 }
 
 impl ViewInputs<'_, '_> {
@@ -245,7 +347,7 @@ impl Inputs for ViewInputs<'_, '_> {
     type Error = ViewError;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.disk.file(path)?) };
+        let Some(name) = self.in_view(path) else { return Ok(self.now.file(path)?) };
         if !name.is_empty()
             && let Some(file) = self.cx.file(&name)?
         {
@@ -255,12 +357,12 @@ impl Inputs for ViewInputs<'_, '_> {
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.disk.dir(path)?) };
+        let Some(name) = self.in_view(path) else { return Ok(self.now.dir(path)?) };
         Ok(self.cx.dir(&name)?.map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0)))))
     }
 
     fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.disk.names(path)?) };
+        let Some(name) = self.in_view(path) else { return Ok(self.now.names(path)?) };
         Ok(self.cx.dir(&name)?.map(|entries| {
             let mut names: Vec<(OsString, bool)> =
                 entries.into_iter().map(|(name, dir)| (OsString::from(name), dir)).collect();
@@ -270,11 +372,11 @@ impl Inputs for ViewInputs<'_, '_> {
     }
 
     fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.disk.env(name)
+        self.now.env(name)
     }
 
     fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        self.disk.env_all()
+        self.now.env_all()
     }
 }
 
@@ -313,6 +415,43 @@ mod tests {
             }
             std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_environment_has_each_name_once_as_getenv_finds_it() {
+        let env = Env::new(vec![("B".into(), "2".into()), ("A".into(), "1".into()), ("B".into(), "3".into())]);
+        let expected = vec![(OsString::from("A"), OsString::from("1")), (OsString::from("B"), OsString::from("2"))];
+        assert_eq!(env.vars(), expected.as_slice());
+        assert_eq!(env.get(OsStr::new("B")), Some(OsStr::new("2")));
+        assert_eq!(env.get(OsStr::new("C")), None);
+    }
+
+    #[test]
+    fn every_check_shares_one_table_and_an_edit_is_a_new_entry() {
+        let dir = std::env::temp_dir().join(format!("blaze-files-test-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a");
+        std::fs::write(&path, b"one").unwrap();
+        let files = Files::new();
+        let (one, two) = (Env::new(vec![("X".into(), "1".into())]), Env::default());
+        let hashes: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|n| {
+                    let (files, env, path) = (&files, if n % 2 == 0 { &one } else { &two }, &path);
+                    scope.spawn(move || Now { files, env }.file(path).unwrap())
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert!(hashes.iter().all(|it| *it == Some(*blake3::hash(b"one").as_bytes())));
+        assert_eq!(files.0.len(), 1);
+        std::fs::write(&path, b"two, longer").unwrap();
+        let mut now = Now { files: &files, env: &one };
+        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(files.0.len(), 2);
+        assert_eq!(now.env(OsStr::new("X")), Some("1".into()));
         _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -21,12 +21,19 @@ fn str_of<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 /// What the resolve and its graph read of one package.
-pub(crate) struct Read {
+pub struct Read {
     pub summary: Summary,
     /// The crate name of its library, `-` as `_`.
     pub lib: Option<InternedString>,
     pub proc_macro_lib: bool,
     pub any_proc_macro: bool,
+    /// Whether it has a build script, without which its build dependencies are not built.
+    pub build_script: bool,
+    /// The `required-features` of each of its binaries.
+    pub bins: Vec<Vec<String>>,
+    /// `package.license` and `package.repository`.
+    pub license: Option<String>,
+    pub repository: Option<String>,
 }
 
 fn package_source(package: &Value) -> Result<SourceId> {
@@ -108,6 +115,17 @@ pub(crate) fn read(package: &Value) -> Result<Read> {
         },
         proc_macro_lib: lib.is_some_and(|it| kinds(it).iter().any(|k| k == "proc-macro")),
         any_proc_macro: targets.iter().any(|it| kinds(it).iter().any(|k| k == "proc-macro")),
+        build_script: targets.iter().any(|it| kinds(it).iter().any(|k| k == "custom-build")),
+        bins: targets
+            .iter()
+            .filter(|it| kinds(it).iter().any(|k| k == "bin"))
+            .map(|it| {
+                let required = it["required-features"].as_array().into_iter().flatten();
+                required.filter_map(Value::as_str).map(str::to_owned).collect()
+            })
+            .collect(),
+        license: package["license"].as_str().map(str::to_owned),
+        repository: package["repository"].as_str().map(str::to_owned),
     })
 }
 

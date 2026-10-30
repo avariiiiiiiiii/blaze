@@ -1,0 +1,122 @@
+//! What a change reaches ([`Front::reach`](crate::serve::work::Front::reach)), building
+//! nothing: each member crate's items' hashes ([`blaze_items::crate_hashes`]) before and after,
+//! the items whose hashes differ with the facts that changed (a function's signature, a type's
+//! layout, a body's code), the functions that would compile again, and the tests that reach
+//! code that changed, from what the last compile of each test binary recorded.
+
+use std::collections::BTreeSet;
+
+use blaze_api::{FactRead, Reach, ReachedItem};
+use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
+use blaze_units::schema::Unit;
+use hir_ty::db::HirDatabase;
+
+use super::Job;
+use crate::serve::work::Failed;
+
+/// A member crate's unit, by what it is in every view: its package, target and mode.
+fn same(a: &Unit, b: &Unit) -> bool {
+    a.pkg_id == b.pkg_id && a.target.name == b.target.name && a.target.kind == b.target.kind && a.mode == b.mode
+}
+
+/// The facts of an item that differ from `old` to `new`, each with what it says.
+pub(crate) fn changed_facts(key: ItemKey, old: Option<&ItemHashes>, new: Option<&ItemHashes>) -> Vec<(Fact, String)> {
+    let mut facts = Vec::new();
+    let kind = new.or(old).map(|it| it.kind);
+    let added = old.is_none();
+    let removed = new.is_none();
+    let what = |part: &str| match (added, removed) {
+        (true, _) => format!("its {part}: added"),
+        (_, true) => format!("its {part}: removed"),
+        _ => format!("its {part} changed"),
+    };
+    if kind == Some(ItemKind::Fn) && old.map(|it| it.interface) != new.map(|it| it.interface) {
+        facts.push((Fact::Signature(key), what("signature")));
+    }
+    if old.and_then(|it| it.layout) != new.and_then(|it| it.layout) {
+        facts.push((Fact::Layout(key), what("layout")));
+    }
+    if old.and_then(|it| it.code) != new.and_then(|it| it.code) {
+        facts.push((Fact::Code(key), what("code")));
+    }
+    facts
+}
+
+fn path(db: &dyn HirDatabase, key: ItemKey) -> Option<String> {
+    match blaze_items::resolve(db, key)? {
+        Resolved::Item(id) => Some(blaze_items::key::path(db, id)),
+        _ => None,
+    }
+}
+
+pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Result<Reach, Failed> {
+    let before = from.lowered.snapshot();
+    let after = to.lowered.snapshot();
+    let old_db: &dyn HirDatabase = &before;
+    let new_db: &dyn HirDatabase = &after;
+    let mut items = Vec::new();
+    let mut compiled = BTreeSet::new();
+    let mut changed_code: BTreeSet<CodeHash> = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    for (at, unit) in to.units().graph.units.iter().enumerate() {
+        let Ok(package) = to.package(unit) else { continue };
+        if !package.is_member || unit.is_std {
+            continue;
+        }
+        let Some(new_krate) = to.lowered.krate(at) else { continue };
+        let old_krate = from
+            .units()
+            .graph
+            .units
+            .iter()
+            .position(|it| same(it, unit))
+            .and_then(|it| from.lowered.krate(it));
+        if to.cancelled() {
+            return Err(Failed::Again);
+        }
+        let new: &HashColumns = blaze_items::crate_hashes(new_db, new_krate);
+        let empty = HashColumns::default();
+        let old: &HashColumns = match old_krate {
+            Some(krate) => blaze_items::crate_hashes(old_db, krate),
+            None => &empty,
+        };
+        for key in new.changed_since(old) {
+            if !seen.insert(key) {
+                continue;
+            }
+            let (was, now) = (old.get(key), new.get(key));
+            let facts = changed_facts(key, was.as_ref(), now.as_ref());
+            if facts.is_empty() {
+                continue;
+            }
+            let name = path(new_db, key).or_else(|| path(old_db, key)).unwrap_or_else(|| format!("{:?}", key.0));
+            if was.and_then(|it| it.code) != now.and_then(|it| it.code) {
+                if let Some(code) = was.and_then(|it| it.code) {
+                    changed_code.insert(code);
+                }
+                if now.is_some_and(|it| it.kind == ItemKind::Fn && it.code.is_some()) {
+                    compiled.insert(name.clone());
+                }
+            }
+            items.push(ReachedItem {
+                path: name,
+                facts: facts.into_iter().map(|(fact, what)| FactRead { key: fact.key(), what }).collect(),
+            });
+        }
+    }
+    let made = from.made.lock().unwrap_or_else(|it| it.into_inner());
+    let mut tests = BTreeSet::new();
+    for done in made.values() {
+        for test in &done.tests {
+            if test.outside || test.reached.iter().any(|it| changed_code.contains(it)) {
+                tests.insert(test.name.clone());
+            }
+        }
+    }
+    Ok(Reach {
+        changes: changes.to_vec(),
+        items,
+        compiled: compiled.into_iter().collect(),
+        tests: tests.into_iter().collect(),
+    })
+}

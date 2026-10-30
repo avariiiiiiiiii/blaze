@@ -22,6 +22,7 @@ test = false
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
+memmap2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

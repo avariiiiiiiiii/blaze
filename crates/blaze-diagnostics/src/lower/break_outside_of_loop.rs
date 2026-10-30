@@ -1,14 +1,16 @@
-//! E0268, E0267, E0571, E0695 and E0696: a `break` or `continue` with no loop or labeled block
-//! to leave, one inside a closure or a coroutine, a `break` with a value out of a `while` or
-//! `for` loop, an unlabeled one inside a labeled block, and a `continue` to a labeled block.
+//! E0268, E0267, E0571, E0590, E0695 and E0696: a `break` or `continue` with no loop or labeled
+//! block to leave, one inside a closure or a coroutine, a `break` with a value out of a `while`
+//! or `for` loop, an unlabeled one in a `while` loop's condition or inside a labeled block, and
+//! a `continue` to a labeled block.
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/loops.rs` (`CheckLoopVisitor`: the stack of
 //! contexts a body is visited with, `require_label_in_labeled_block`, `require_break_cx`,
-//! `report_outside_loop_error`) and `compiler/rustc_hir_typeck/src/diagnostics.rs`
+//! `report_outside_loop_error`), `compiler/rustc_hir_typeck/src/diagnostics.rs`
 //! (`OutsideLoop`, `BreakInsideClosure`, `BreakInsideCoroutine`, `BreakNonLoop`,
-//! `UnlabeledInLabeledBlock`, `ContinueLabeledBlock`) (MIT or Apache-2.0). The stack is rebuilt
-//! from the syntax: from the body the `break` is in down to it, as rustc's visitor pushes it
-//! on the HIR that `rustc_ast_lowering` makes of it.
+//! `UnlabeledInLabeledBlock`, `UnlabeledCfInWhileCondition`, `ContinueLabeledBlock`) and
+//! `compiler/rustc_ast_lowering/src/expr.rs` (`lower_loop_destination`, the loop scope) (MIT or
+//! Apache-2.0). The stack is rebuilt from the syntax: from the body the `break` is in down to
+//! it, as rustc's visitor pushes it on the HIR that `rustc_ast_lowering` makes of it.
 
 use hir::InFile;
 use syntax::{
@@ -63,15 +65,25 @@ fn diagnostic(cx: &Cx<'_, '_>, d: &hir::BreakOutsideOfLoop, node: &InFile<Syntax
         return Some(diag);
     }
     if d.bad_value_break {
+        if label.is_none() && matches!(target(cx, node, None), Some(Target::WhileCondition)) {
+            let mut diag = Diag::error(
+                Some("E0590"),
+                "`break` or `continue` with no label in the condition of a `while` loop",
+                span.clone(),
+            );
+            diag.span_label(span, format!("unlabeled `{name}` in the condition of a `while` loop"));
+            return Some(diag);
+        }
         return break_non_loop(cx, node);
     }
     if !d.is_break
         && let Some(label) = &label
-        && let Some(ast::Expr::BlockExpr(block)) = target_loop(&node.value, Some(label))
+        && let Some(to) = target_loop(cx, node, Some(label))
+        && let ast::Expr::BlockExpr(block) = &to.value
     {
         let mut diag = Diag::error(Some("E0696"), "`continue` pointing to a labeled block", span.clone());
         diag.span_label(span, "labeled blocks cannot be `continue`'d");
-        diag.span_label(cx.span(node.with_value(item_range(block.syntax()))), "labeled block the `continue` points to");
+        diag.span_label(cx.span(to.with_value(item_range(block.syntax()))), "labeled block the `continue` points to");
         return Some(diag);
     }
     match required(&stack, d.is_break)? {
@@ -170,8 +182,8 @@ fn break_non_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Diag> {
     let break_expr = ast::BreakExpr::cast(node.value.clone())?;
     let value = break_expr.expr()?;
     let break_label = break_expr.lifetime().map(|it| it.text().to_string());
-    let target = target_loop(&node.value, break_label.as_deref())?;
-    let (kind, head_end, loop_label) = match &target {
+    let target = target_loop(cx, node, break_label.as_deref())?;
+    let (kind, head_end, loop_label) = match &target.value {
         ast::Expr::WhileExpr(it) => {
             ("while", it.condition()?.syntax().text_range().end(), label_of(it.label()))
         }
@@ -181,14 +193,14 @@ fn break_non_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Diag> {
         _ => return None,
     };
     let span = cx.span(node.with_value(break_expr.syntax().text_range()));
-    let head = TextRange::new(item_range(target.syntax()).start(), head_end);
+    let head = target.with_value(TextRange::new(item_range(target.value.syntax()).start(), head_end));
     let mut diag = Diag::error(
         Some("E0571"),
         format!("`break` with value from a `{kind}` loop"),
         span.clone(),
     );
     diag.span_label(span.clone(), "can only break with a value inside `loop` or breakable block");
-    diag.span_label(cx.span(node.with_value(head)), format!("you can't `break` with a value in a `{kind}` loop"));
+    diag.span_label(cx.span(head), format!("you can't `break` with a value in a `{kind}` loop"));
     let suggestion = match &break_label {
         Some(label) => format!("break {label}"),
         None => "break".to_owned(),
@@ -227,22 +239,41 @@ fn label_of(label: Option<ast::Label>) -> Option<String> {
 
 /// The loop a `break` at `node` leaves: the innermost one when it has no label, else the loop
 /// or labeled block with its label, within the closure, coroutine, constant or body it is in
-/// (rustc's loop scope, which `with_new_scopes` starts again, and its label ribs).
-fn target_loop(node: &SyntaxNode, label: Option<&str>) -> Option<ast::Expr> {
-    let mut child = node.clone();
-    for ancestor in node.ancestors().skip(1) {
-        if ast::ClosureExpr::can_cast(ancestor.kind()) || ast::Item::can_cast(ancestor.kind()) {
+/// (rustc's loop scope, which `with_new_scopes` starts again, and its label ribs). None for
+/// one with no label in a `while` loop's condition, which leaves no loop
+/// (`LoopIdError::UnlabeledCfInWhileCondition`).
+fn target_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, label: Option<&str>) -> Option<InFile<ast::Expr>> {
+    match target(cx, node, label)? {
+        Target::Loop(it) => Some(it),
+        Target::WhileCondition => None,
+    }
+}
+
+enum Target {
+    Loop(InFile<ast::Expr>),
+    WhileCondition,
+}
+
+fn target(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, label: Option<&str>) -> Option<Target> {
+    let chain = ancestors(cx, node);
+    for (i, ancestor) in chain.iter().enumerate().skip(1) {
+        let child = &chain[i - 1].value;
+        let kind = ancestor.value.kind();
+        if ast::ClosureExpr::can_cast(kind) || is_item(kind) || ast::ConstArg::can_cast(kind) {
             return None;
         }
-        let in_body = |body: Option<ast::BlockExpr>| body.is_some_and(|it| it.syntax() == &child);
-        let found = match ast::Expr::cast(ancestor.clone()) {
+        let in_body = |body: Option<ast::BlockExpr>| body.is_some_and(|it| it.syntax() == child);
+        let found = match ast::Expr::cast(ancestor.value.clone()) {
             Some(ast::Expr::LoopExpr(it)) if in_body(it.loop_body()) => {
                 Some((label_of(it.label()), false, ast::Expr::LoopExpr(it)))
             }
-            Some(ast::Expr::WhileExpr(it))
-                if in_body(it.loop_body())
-                    || it.condition().is_some_and(|it| it.syntax() == &child) =>
-            {
+            Some(ast::Expr::WhileExpr(it)) if it.condition().is_some_and(|it| it.syntax() == child) => {
+                if label.is_none() {
+                    return Some(Target::WhileCondition);
+                }
+                Some((label_of(it.label()), false, ast::Expr::WhileExpr(it)))
+            }
+            Some(ast::Expr::WhileExpr(it)) if in_body(it.loop_body()) => {
                 Some((label_of(it.label()), false, ast::Expr::WhileExpr(it)))
             }
             Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => {
@@ -257,23 +288,27 @@ fn target_loop(node: &SyntaxNode, label: Option<&str>) -> Option<ast::Expr> {
                 Some((label_of(it.label()), true, ast::Expr::BlockExpr(it)))
             }
             Some(ast::Expr::ArrayExpr(it))
-                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == &child) =>
+                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == child) =>
             {
                 return None;
             }
-            _ if ast::ConstArg::can_cast(ancestor.kind()) => return None,
             _ => None,
         };
         if let Some((own, is_block, expr)) = found {
             match label {
-                None if !is_block => return Some(expr),
-                Some(label) if own.as_deref() == Some(label) => return Some(expr),
+                None if !is_block => return Some(Target::Loop(ancestor.with_value(expr))),
+                Some(label) if own.as_deref() == Some(label) => return Some(Target::Loop(ancestor.with_value(expr))),
                 _ => {}
             }
         }
-        child = ancestor;
     }
     None
+}
+
+/// Whether a node of `kind` is an item, a body's owner: not a macro call, which the syntax
+/// tree counts as one.
+pub(crate) fn is_item(kind: SyntaxKind) -> bool {
+    ast::Item::can_cast(kind) && kind != SyntaxKind::MACRO_CALL
 }
 
 fn same_file(node: &InFile<SyntaxNode>, block: &InFile<TextSize>) -> bool {
@@ -360,7 +395,7 @@ fn base(node: &InFile<SyntaxNode>, child: &SyntaxNode) -> Option<Context> {
     {
         return Some(Context::AnonConst);
     }
-    if ast::Item::can_cast(value.kind()) {
+    if is_item(value.kind()) {
         return Some(Context::Normal);
     }
     None

@@ -17,7 +17,7 @@ use hir_ty::{
     layout::layout_of_adt_query,
     method_resolution::{InherentImpls, TraitImpls},
     next_solver::{DbInterner, GenericArgs, SimplifiedType},
-    traits::is_inherent_impl_coherent,
+    traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
 };
 use rustc_type_ir::inherent::GenericArgs as _;
 use test_fixture::WithFixture;
@@ -407,4 +407,42 @@ fn impl_tables_keep_the_order_impls_are_found_in() {
         expected.sort();
         assert_eq!(found, expected);
     });
+}
+
+const AUTO: &str = r#"
+#![feature(auto_traits, negative_impls)]
+pub trait T {}
+pub auto trait Au {}
+pub struct A;
+pub struct B;
+pub struct C<X>(X);
+impl T for A {}
+impl !Au for B {}
+impl<X: T> T for C<X> {}
+"#;
+
+/// The checks of `implements_traits_unique` share an inference context, one probe each: the
+/// answers are those of one `implements_trait_unique` at a time, a trait asked twice included.
+#[test]
+fn implements_traits_unique_answers_as_one_at_a_time() {
+    let (db, _) = single_file(AUTO);
+    let traits = [trait_named(&db, "T"), trait_named(&db, "Au"), trait_named(&db, "T")];
+    for name in ["A", "B", "C"] {
+        let s = struct_named(&db, name);
+        hir_ty::attach_db(&db, || {
+            let ty = db.ty(s.into()).instantiate_identity().skip_norm_wip();
+            let env = ParamEnvAndCrate {
+                param_env: db.trait_environment(GenericDefId::AdtId(s.into())),
+                krate: krate(&db),
+            };
+            let one_at_a_time: Vec<bool> =
+                traits.iter().map(|&it| implements_trait_unique(ty, &db, env, it)).collect();
+            assert_eq!(implements_traits_unique(ty, &db, env, &traits), one_at_a_time, "{name}");
+            match name {
+                "A" => assert_eq!(one_at_a_time, [true, true, true]),
+                "B" => assert_eq!(one_at_a_time, [false, false, false]),
+                _ => {}
+            }
+        });
+    }
 }

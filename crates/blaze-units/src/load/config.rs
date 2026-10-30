@@ -71,12 +71,14 @@ pub(crate) struct ConfigRead {
     pub env: Vec<(String, String)>,
     pub command: String,
     pub cli: Vec<String>,
+    /// `-Z`, as given: cargo's `CliUnstable`, which decides what manifests may say.
+    pub unstable: Vec<String>,
     pub snapshot: Snapshot,
     pub warnings: Vec<String>,
 }
 
 impl Versioned for Result<ConfigRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 2");
 }
 
 pub(crate) struct ConfigChain;
@@ -84,7 +86,7 @@ pub(crate) struct ConfigChain;
 impl Query for ConfigChain {
     const KIND: QueryKind = QueryKind(0x6015);
     const NAME: &'static str = "cargo config";
-    const PRODUCER: ContentId = producer("blaze v2 cargo config 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo config 2");
     type Key = ConfigOf;
     type Value = Cbor<Result<ConfigRead, LoadError>>;
 
@@ -93,15 +95,22 @@ impl Query for ConfigChain {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {
-        let (cwd, env, command, cli) = match key {
+        let (cwd, env, command, cli, unstable) = match key {
             ConfigOf::View => match cx.get::<Asking>(&())?.get() {
-                Ok(asked) => (asked.cwd.clone(), asked.env.clone(), asked.command_name().to_owned(), asked.config.clone()),
+                Ok(asked) => (
+                    asked.cwd.clone(),
+                    asked.env.clone(),
+                    asked.command_name().to_owned(),
+                    asked.config.clone(),
+                    asked.unstable.clone(),
+                ),
                 Err(error) => return Ok(Cbor(Err(error))),
             },
-            ConfigOf::Fixed { cwd, env, .. } => (cwd.clone(), env.clone(), "build".to_owned(), Vec::new()),
+            ConfigOf::Fixed { cwd, env, .. } => (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new()),
         };
         let fill = Fill { config: key, own: None };
-        let mut read = ConfigRead { cwd, env, command, cli, snapshot: Snapshot::default(), warnings: Vec::new() };
+        let mut read =
+            ConfigRead { cwd, env, command, cli, unstable, snapshot: Snapshot::default(), warnings: Vec::new() };
         let (loaded, used) = run_over(cx, Snapshot::default(), &fill, |_, files| {
             Ok(build(&read, files).map(|config| config.take_warnings()))
         })?;
@@ -124,6 +133,7 @@ impl Query for ConfigChain {
 pub(crate) fn build(read: &ConfigRead, files: Rc<dyn Files>) -> anyhow::Result<Config> {
     let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), files)?;
     config.start(&read.command, &read.cli)?;
+    config.cli_unstable(&read.unstable)?;
     config.ensure_loaded()?;
     Ok(config)
 }
